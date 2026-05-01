@@ -1,32 +1,30 @@
 ; =============================================================================
 ; SukiOS - Multiboot2 x86_64 Higher-Half Bootstrap (4KB Pages)
-; Reference: OSDev Wiki - Multiboot2, Setting Up Long Mode, GCC Cross-Compiler
+; Reference: OSDev Wiki - Multiboot2, Setting Up Long Mode
 ;
 ; Memory layout:
-;   Bootstrap:  VMA = LMA = KERNEL_PHYS (~0x100000), 32-bit accessible
+;   Bootstrap:  VMA = LMA = KERNEL_PHYS (0x100000), 32-bit accessible
 ;   Kernel:     VMA = KERNEL_VIRT (0xFFFFFFFF80000000), 64-bit only
 ;   Page tables: 7 tables at 0x70000-0x76FFF (28KB)
 ;
-;   Identity map:   0x00000000 - 0x003FFFFF (4MB, 4KB pages)
-;   Higher-half map: KERNEL_VIRT - KERNEL_VIRT+2MB → KERNEL_LMA - KERNEL_LMA+2MB
-;
-; Compile: nasm -f elf64 boot.asm -o boot.o
+;   Identity map:   0x00000000 - 0x003FFFFF (4MB)
+;   Higher-half map: KERNEL_VIRT+ -> KERNEL_LMA+  (2MB)
 ; =============================================================================
 
-; ===== Multiboot2 Constants =====
+; ===== Multiboot2 常量 =====
 MB2_MAGIC       equ 0xE85250D6
-MB2_ARCH        equ 0                   ; i386 (GRUB compatible)
+MB2_ARCH        equ 0                   ; i386（兼容 x86_64）
 MB2_TAG_END     equ 0
 
-; ===== Address Constants =====
-KERNEL_PHYS     equ 0x100000            ; Physical load address (1MB)
-KERNEL_VIRT     equ 0xFFFFFFFF80000000  ; Virtual base (higher-half)
-BOOTSTRAP_MAX   equ 0x10000             ; 64KB reserved for bootstrap
+; ===== 地址常量 =====
+KERNEL_PHYS     equ 0x100000            ; 物理加载地址 (1MB)
+KERNEL_VIRT     equ 0xFFFFFFFF80000000  ; 虚拟基址（高半区）
+BOOTSTRAP_MAX   equ 0x10000             ; Bootstrap 预留空间 (64KB)
 KERNEL_LMA      equ KERNEL_PHYS + BOOTSTRAP_MAX  ; 0x110000
 
-; ===== Page Table Addresses (7 tables, 0x70000-0x76FFF) =====
-; Identity mapping chain: PML4[0] -> PDPTE_A -> PD_A -> PT_A
-; Higher-half mapping chain: PML4[511] -> PDPTE_B -> PD_B -> PT_B
+; ===== 页表地址（7 张表，0x70000-0x76FFF） =====
+; Identity 链: PML4[0] -> PDPTE_A -> PD_A -> PT_A
+; Higher-half 链: PML4[511] -> PDPTE_B[510] -> PD_B[0] -> PT_B
 PML4_ADDR       equ 0x70000
 PDPTE_A_ADDR    equ 0x71000
 PD_A_ADDR       equ 0x72000
@@ -35,7 +33,7 @@ PDPTE_B_ADDR    equ 0x74000
 PD_B_ADDR       equ 0x75000
 PT_B_ADDR       equ 0x76000
 
-; ===== GDT Flags =====
+; ===== GDT 标志 =====
 PRESENT         equ (1 << 7)
 NOT_SYS         equ (1 << 4)
 EXEC            equ (1 << 3)
@@ -45,7 +43,7 @@ SZ_32           equ (1 << 6)
 LONG_MODE       equ (1 << 5)
 
 ; =============================================================================
-; Multiboot2 Header (must be within first 32KB, 8-byte aligned)
+; Multiboot2 Header（必须在 32KB 以内，8 字节对齐）
 ; =============================================================================
 section .multiboot align=8
 
@@ -64,8 +62,8 @@ end_tag_end:
 multiboot_header_end:
 
 ; =============================================================================
-; 64-bit GDT (in bootstrap, physical address, accessible in both modes)
-; Reference: AMD64 APM Vol.2 4.8.1-4.8.2, OSDev "Setting Up Long Mode"
+; Bootstrap GDT（物理地址，32/64 位模式下均可访问）
+; 仅用于进入 64 位长模式，后续由 EarlyKernel/gdt.c 设置正式 GDT。
 ; =============================================================================
 section .bootstrap_rodata align=16
 
@@ -91,46 +89,39 @@ gdt64:
 
 .pointer:
     dw $ - gdt64 - 1                  ; GDT size - 1
-    dq gdt64                          ; GDT base (physical address)
+    dq gdt64                          ; GDT base（物理地址）
 
 ; =============================================================================
-; Bootstrap Data: Virtual address pointers for kernel_main and stack_top
-; These are at physical addresses (identity mapped), accessible from both modes.
-; The linker fills in the 64-bit virtual addresses (R_X86_64_64 relocations).
+; Bootstrap 数据：kernel_main 和 stack_top 的虚拟地址
+; 在身份映射区域，32/64 位均可访问。
 ; =============================================================================
 section .bootstrap_data align=8
 
 extern kernel_main
 
 kernel_main_ptr:
-    dq kernel_main                    ; Virtual address of kernel_main
+    dq kernel_main                    ; kernel_main 虚拟地址
 stack_top_ptr:
-    dq stack_top                      ; Virtual address of BSS stack top
+    dq stack_top                      ; BSS 栈顶虚拟地址
 
 ; =============================================================================
-; 32-bit Bootstrap Code
-; GRUB entry state (Multiboot2 spec 3.3):
-;   EAX = 0x36D76289 (magic), EBX = MBI physical address
-;   CS/DS/ES/FS/GS/SS = 32-bit segments, CR0.PG=0, CR0.PE=1
+; 32 位 Bootstrap 代码
+; GRUB 入口状态（Multiboot2 spec 3.3）：
+;   EAX = 0x36D76289 (magic), EBX = MBI 物理地址
+;   CS/DS/ES/FS/GS/SS = 32 位段, CR0.PG=0, CR0.PE=1
 ; =============================================================================
 section .bootstrap_text align=16
 bits 32
 global _start
 
 _start:
-    ; === 调试：写 '1' 到 VGA ===
-    mov  word [0xB8000], 0x0F31
-
-    ; Temporary stack (above page tables, within identity-mapped range)
+    ; 临时栈（页表上方，身份映射范围内）
     mov  esp, 0x78000
-    push ebx                          ; Save MBI address
-    push eax                          ; Save magic
-
-    ; === 调试：写 '2' ===
-    mov  word [0xB8002], 0x0F32
+    push ebx                          ; 保存 MBI 地址
+    push eax                          ; 保存 magic
 
     ; ---------------------------------------------------------------
-    ; Step 1: Initialize page tables (clear all 7 tables, 28KB)
+    ; 步骤 1: 初始化页表（清零 7 张表，28KB）
     ; ---------------------------------------------------------------
     mov  edi, PML4_ADDR
     mov  ecx, 7 * 4096 / 4           ; 7168 dwords
@@ -138,20 +129,16 @@ _start:
     rep  stosd
 
     ; ---------------------------------------------------------------
-    ; Step 2: Identity mapping - virtual 0-4MB -> physical 0-4MB
-    ; Chain: PML4[0] -> PDPTE_A -> PD_A -> PT_A (1024 x 4KB pages)
-    ; Reference: OSDev "Setting Up Long Mode" - Setting up the Paging
+    ; 步骤 2: Identity mapping - virtual 0-4MB -> physical 0-4MB
+    ; 链: PML4[0] -> PDPTE_A -> PD_A -> PT_A (1024 x 4KB pages)
     ; ---------------------------------------------------------------
     mov  dword [PML4_ADDR],          PDPTE_A_ADDR | 0x03
     mov  dword [PDPTE_A_ADDR],       PD_A_ADDR | 0x03
     mov  dword [PD_A_ADDR],          PT_A_ADDR | 0x03
 
-    ; === 调试：写 '3' ===
-    mov  word [0xB8004], 0x0F33
-
-    ; Fill PT_A: 1024 entries mapping 0x00000 - 0x3FFFFF
+    ; 填充 PT_A: 映射 0x00000 - 0x3FFFFF
     mov  edi, PT_A_ADDR
-    mov  eax, 0x03                    ; Physical 0x0, Present + RW
+    mov  eax, 0x03                    ; 物理地址 0x0, Present + RW
     mov  ecx, 1024
 .fill_pt_a:
     mov  [edi], eax
@@ -161,28 +148,22 @@ _start:
     jnz  .fill_pt_a
 
     ; ---------------------------------------------------------------
-    ; Step 3: Higher-half mapping - KERNEL_VIRT -> KERNEL_LMA
-    ; Chain: PML4[511] -> PDPTE_B[510] -> PD_B[0] -> PT_B (512 x 4KB = 2MB)
+    ; 步骤 3: Higher-half mapping - KERNEL_VIRT -> KERNEL_LMA
+    ; 链: PML4[511] -> PDPTE_B[510] -> PD_B[0] -> PT_B (512 x 4KB = 2MB)
     ;
-    ; 虚拟地址 0xFFFFFFFF80000000 的页表索引分解（经 Python 验证）：
+    ; 虚拟地址 0xFFFFFFFF80000000 页表索引分解（Python 验证）：
     ;   PML4[511]  (bits 47:39) = 511
-    ;   PDPTE[510] (bits 38:30) = 510    ← 关键！
+    ;   PDPTE[510] (bits 38:30) = 510
     ;   PD[0]      (bits 29:21) = 0
     ;   PT[0]      (bits 20:12) = 0
-    ;
-    ; Virtual:   0xFFFFFFFF80000000 + i*4096
-    ; Physical:  KERNEL_LMA + i*4096  (= 0x110000 + i*4096)
     ; ---------------------------------------------------------------
     mov  dword [PML4_ADDR + 511*8],      PDPTE_B_ADDR | 0x03
     mov  dword [PDPTE_B_ADDR + 510*8],   PD_B_ADDR | 0x03
     mov  dword [PD_B_ADDR],              PT_B_ADDR | 0x03
 
-    ; === 调试：写 '4' ===
-    mov  word [0xB8006], 0x0F34
-
-    ; Fill PT_B: 512 entries mapping KERNEL_LMA to KERNEL_LMA+2MB
+    ; 填充 PT_B: 映射 KERNEL_LMA 到 KERNEL_LMA+2MB
     mov  edi, PT_B_ADDR
-    mov  eax, KERNEL_LMA | 0x03      ; Physical 0x110000, Present + RW
+    mov  eax, KERNEL_LMA | 0x03
     mov  ecx, 512
 .fill_pt_b:
     mov  [edi], eax
@@ -192,25 +173,20 @@ _start:
     jnz  .fill_pt_b
 
     ; ---------------------------------------------------------------
-    ; Step 4: Enable PAE (CR4.PAE = bit 5)
-    ; Long mode requires PAE paging
+    ; 步骤 4: 启用 PAE（CR4.PAE = bit 5）
     ; ---------------------------------------------------------------
     mov  eax, cr4
     or   eax, (1 << 5)
     mov  cr4, eax
 
     ; ---------------------------------------------------------------
-    ; Step 5: Load PML4 into CR3
+    ; 步骤 5: 加载 PML4 到 CR3
     ; ---------------------------------------------------------------
     mov  eax, PML4_ADDR
     mov  cr3, eax
 
-    ; === 调试：写 '5' ===
-    mov  word [0xB8008], 0x0F35
-
     ; ---------------------------------------------------------------
-    ; Step 6: Enable Long Mode (EFER.LME = bit 8)
-    ; Reference: AMD64 APM Vol.2 15.5.1
+    ; 步骤 6: 启用 Long Mode（EFER.LME = bit 8）
     ; ---------------------------------------------------------------
     mov  ecx, 0xC0000080             ; IA32_EFER MSR
     rdmsr
@@ -218,77 +194,59 @@ _start:
     wrmsr
 
     ; ---------------------------------------------------------------
-    ; Step 7: Enable Paging (CR0.PG = bit 31)
-    ; LME + PAE + PG -> Enter long mode (compatibility sub-mode)
+    ; 步骤 7: 启用分页（CR0.PG = bit 31）
+    ; LME + PAE + PG -> 进入长模式（兼容子模式）
     ; ---------------------------------------------------------------
     mov  eax, cr0
     or   eax, (1 << 31)
     mov  cr0, eax
 
-    ; === 调试：写 '7' ===
-    mov  word [0xB800C], 0x0F37
-
     ; ---------------------------------------------------------------
-    ; Step 8: Load 64-bit GDT, restore Multiboot2 args, far jump
+    ; 步骤 8: 加载 64 位 GDT，恢复 Multiboot2 参数，far jump
     ; ---------------------------------------------------------------
     lgdt [gdt64.pointer]
 
-    ; === 调试：写 '8' ===
-    mov  word [0xB800E], 0x0F38
+    pop  edi                          ; EDI = magic（零扩展到 RDI）
+    pop  esi                          ; ESI = MBI 地址（零扩展到 RSI）
 
-    pop  edi                          ; EDI = magic (zero-extend to RDI later)
-    pop  esi                          ; ESI = MBI address (zero-extend to RSI later)
-
-    ; Far jump to 64-bit code segment -> enter 64-bit sub-mode
-    ; long_mode_entry is in bootstrap (physical address, 32-bit reachable)
+    ; Far jump 到 64 位代码段 -> 进入 64 位子模式
     jmp  gdt64.code_seg:long_mode_entry
 
 ; =============================================================================
-; 64-bit Entry Point (still in bootstrap section, running at physical address)
+; 64 位入口（仍在 bootstrap 段，运行在物理地址）
 ; =============================================================================
 bits 64
 
 long_mode_entry:
-    ; === 覆盖式调试：每次都写 0xB8000 ===
-    mov  word [0xB8000], 0x0F39          ; '9' - 进入 64 位模式
-
+    ; 加载 64 位数据段寄存器
     mov  ax, 0x10
     mov  ds, ax
     mov  es, ax
     mov  fs, ax
     mov  gs, ax
     mov  ss, ax
-    mov  word [0xB8000], 0x0F46          ; 'F' - 段寄存器加载完成
 
-    ; 加载 kernel_main 虚拟地址
-    mov  rax, [kernel_main_ptr]
-    mov  word [0xB8000], 0x0F4A          ; 'J' - kernel_main 地址已加载
+    ; 零扩展 Multiboot2 参数到 64 位（System V AMD64 ABI）
+    mov  edi, edi                    ; RDI = magic
+    mov  esi, esi                    ; RSI = MBI 地址
 
-    ; 直接测试高半区映射：从 kernel_main 虚拟地址读取第一个字节
-    mov  bl, byte [rax]
-    mov  word [0xB8000], 0x0F4D          ; 'M' - 高半区代码页可读
-
-    ; 加载栈并准备参数
+    ; 加载内核栈（虚拟地址，来自 bootstrap_data）
     mov  rsp, [stack_top_ptr]
-    mov  word [0xB8000], 0x0F48          ; 'H' - 栈已加载
 
-    mov  edi, edi
-    mov  esi, esi
-
-    mov  word [0xB8000], 0x0F4B          ; 'K' - 即将调用 kernel_main
-
+    ; 间接调用 kernel_main（通过虚拟地址）
+    mov  rax, [kernel_main_ptr]
     call rax
 
-    ; If kernel_main returns, halt
+    ; 如果 kernel_main 返回，停机
 .halt:
     cli
     hlt
     jmp  .halt
 
 ; =============================================================================
-; BSS: Kernel Stack (at virtual address, in higher-half)
+; BSS: 内核栈（虚拟地址，在高半区）
 ; =============================================================================
 section .bss align=16
 stack_bottom:
-    resb 16384                        ; 16 KB stack
+    resb 16384                        ; 16 KB 栈
 stack_top:

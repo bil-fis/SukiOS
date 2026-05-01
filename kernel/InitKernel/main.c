@@ -6,6 +6,7 @@
  * ============================================================================= */
 
 #include "kernel/tty.h"
+#include "kernel/apic.h"
 
 void init_kernel(void)
 {
@@ -19,7 +20,12 @@ void init_kernel(void)
     tty_print("\n");
 
     tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
-    tty_print("SukiOS v0.1.0 - x86_64\n");
+    tty_print("SukiOS v0.1.0 - x86_64\n\n");
+
+    /* 初始化 APIC 中断控制器 */
+    apic_init();
+
     tty_setcolor(VGA_GREEN, VGA_BLACK);
-    tty_print("SukiOS booted successfully!\n");
+    tty_print("\nSukiOS booted successfully!\n");
+    tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
 }

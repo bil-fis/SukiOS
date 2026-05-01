@@ -11,6 +11,7 @@
 #include "kernel/idt.h"
 #include "kernel/tty.h"
 #include "kernel/io.h"
+#include "kernel/apic.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 
@@ -47,6 +48,9 @@ extern uint64_t isr16, isr17, isr18, isr19, isr20, isr21;
 extern uint64_t isr22, isr23, isr24, isr25, isr26, isr27;
 extern uint64_t isr28, isr29, isr30, isr31;
 
+/* 伪中断 ISR 255（由 apic_init 启用 LAPIC 后可能触发） */
+extern uint64_t isr_spurious;
+
 static uint64_t isr_table[32] = {
     (uint64_t)&isr0,  (uint64_t)&isr1,  (uint64_t)&isr2,  (uint64_t)&isr3,
     (uint64_t)&isr4,  (uint64_t)&isr5,  (uint64_t)&isr6,  (uint64_t)&isr7,
@@ -68,6 +72,20 @@ void idt_set_gate(uint8_t n, uint64_t handler, uint16_t selector,
     idt[n].ist         = ist;
     idt[n].type_attr   = type_attr;
     idt[n].reserved    = 0;
+}
+
+/* APIC 伪中断处理（ISR 255）
+ * APIC 启用后可能产生伪中断，只需发送 EOI 后立即返回
+ * 参考：Intel SDM Vol.3 10.4.7 Spurious Interrupt */
+void spurious_irq_handler(struct interrupt_frame *frame)
+{
+    (void)frame;
+
+    /* 发送 LAPIC EOI（End of Interrupt）
+     * 如果 apic_lapic_base 尚未初始化（InitKernel 之前），则忽略 */
+    if (apic_lapic_base) {
+        lapic_write(LAPIC_EOI, 0);
+    }
 }
 
 /* CPU 异常处理函数（由 idt_stubs.asm 中的 ISR 存根调用） */
@@ -120,6 +138,11 @@ void idt_init(void)
 
     load_idt();
 
-    /* 对未覆盖的异常向量（32-255），CPU 访问时会触发 #GP，
+    /* 注册伪中断向量（0xFF）- APIC 启用后可能触发
+     * 参考：OSDev APIC - Spurious Interrupt Vector Register */
+    idt_set_gate(APIC_SPURIOUS_VECTOR, (uint64_t)&isr_spurious,
+                 GDT_SELECTOR_KERNEL_CS, IDT_GATE_INTERRUPT, 0);
+
+    /* 对未覆盖的异常向量（32-254），CPU 访问时会触发 #GP，
      * 我们已经设置了 #GP 处理函数，可以显示调试信息 */
 }

@@ -122,3 +122,58 @@ global double_fault_stack_bottom
 double_fault_stack_bottom:
     resb 16384
 double_fault_stack_top:
+
+; ---- 伪中断处理存根（ISR 255） ----
+; APIC 启用后会产生伪中断，需要发送 EOI 并返回
+; 参考：OSDev APIC - Spurious Interrupt Vector Register
+section .text
+
+extern spurious_irq_handler
+
+global isr_spurious
+isr_spurious:
+    push qword 0                  ; 占位错误码
+    push qword 255                ; 中断号 = 0xFF
+    jmp spurious_common_stub
+
+spurious_common_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rdi, rsp
+    call spurious_irq_handler
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 16
+    iretq
+
+; 消除 "missing .note.GNU-stack" 链接器警告
+section .note.GNU-stack noalloc noexec nowrite progbits

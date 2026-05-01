@@ -20,9 +20,10 @@ LD      = gcc
 NASM    = nasm
 
 # 编译选项
+# -mcmodel=large: 内核在高半区 (0xFFFFFFFF80000000)，需要绝对 64 位寻址
 CFLAGS  = -ffreestanding -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
-          -fno-pic -fno-pie -O2 -Wall -Wextra -Wno-unused-parameter -std=gnu11 \
-          -I include
+          -mcmodel=large -fno-pic -fno-pie -O2 -Wall -Wextra \
+          -Wno-unused-parameter -std=gnu11 -I include
 
 LDFLAGS = -ffreestanding -nostdlib -static -z max-page-size=0x1000 \
           -T boot/linker.ld

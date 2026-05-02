@@ -64,6 +64,62 @@ void ioapic_write(uint32_t reg, uint32_t value)
     apic_ioapic_base[IOAPIC_REGWIN / sizeof(uint32_t)] = value;
 }
 
+/* 配置 I/O APIC 重定向条目
+ * 参考：Intel 82093AA datasheet, OSDev IOAPIC
+ *
+ * 每个重定向条目 64 位，分为两个 32 位寄存器：
+ *   [base+0]: 低 32 位 — Destination Mode, Delivery Mode, Vector, Mask
+ *   [base+1]: 高 32 位 — Reserved, Destination Field
+ *
+ * 位布局（低 32 位）：
+ *   bits 0-7:   Interrupt Vector
+ *   bit 8:      Delivery Mode (0 = Fixed)
+ *   bit 9:      Destination Mode (0 = Physical)
+ *   bit 10:     Delivery Status (RO)
+ *   bit 11:     Polarity (0 = Active High)
+ *   bit 12:     Trigger Mode (0 = Edge)
+ *   bit 13:     Interrupt Mask (0 = Unmasked)
+ *   bits 14-15: Reserved
+ *   bits 16-31: Reserved
+ *
+ * 高 32 位：
+ *   bits 56-63: Destination Field (APIC ID)
+ *   bits 32-55: Reserved
+ *
+ * @flags: MADT ISA Override flags
+ *   bits 0-1: Polarity (0=conform, 1=active high, 2=active low)
+ *   bits 2-3: Trigger Mode (0=conform, 1=edge, 4=level)
+ * 参考：ACPI Spec 6.5 Table 5-72 */
+void ioapic_set_redirection(uint8_t irq_pin, uint8_t vector, bool masked, uint16_t flags)
+{
+    uint32_t reg = IOAPIC_REDIR_BASE + irq_pin * 2;
+
+    /* 低 32 位：指定向量 */
+    uint32_t low = (uint32_t)vector;
+
+    /* 根据 MADT flags 设置极性和触发模式
+     * 默认（flags=0 或 conforms）: Active High, Edge Triggered */
+    uint8_t polarity = flags & 0x3;
+    uint8_t trigger  = (flags >> 2) & 0x3;
+
+    if (polarity == 2)       /* Active Low */
+        low |= IOAPIC_REDIR_POLARITY;
+    /* polarity == 0 (conform to bus) 或 1 (active high) → 默认 0 */
+
+    if (trigger == 4)        /* Level Triggered */
+        low |= IOAPIC_REDIR_TRIGGER;
+    /* trigger == 0 (conform) 或 1 (edge) → 默认 0 */
+
+    if (masked)
+        low |= IOAPIC_REDIR_MASK;
+
+    /* 高 32 位：目标 APIC ID = 0（BSP） */
+    uint32_t high = 0;
+
+    ioapic_write(reg, low);
+    ioapic_write(reg + 1, high);
+}
+
 /* =========================================================================
  * Local APIC 初始化
  * ========================================================================= */
@@ -202,6 +258,9 @@ void apic_init(void)
 
     /* 3. 解析 MADT */
     struct acpi_madt_info info = acpi_parse_madt(madt_hdr);
+
+    /* 3.5 解析 ISA 中断源覆盖（必须在配置 IOAPIC 重定向之前） */
+    acpi_parse_isa_overrides(madt_hdr);
 
     tty_print("[OK] MADT parsed  LAPIC: ");
     tty_print_hex64(info.lapic_addr);

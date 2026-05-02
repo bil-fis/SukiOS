@@ -120,10 +120,13 @@ void kernel_main(uint32_t magic, uint64_t mbi_addr)
     parse_multiboot_tags(mbi_addr);
     tty_print("[OK] Boot info parsed\n");
 
-    /* 4. 初始化 GDT（含 TSS） */
+    /* 4. 初始化 GDT（含 TSS & IST） */
     tty_print("[..] Initializing GDT...\n");
     gdt_init();
     tty_print("[OK] GDT initialized\n");
+    tty_print("  TSS loaded  RSP0=");
+    tty_print_hex64(kernel_tss.rsp0);
+    tty_print("  IST: DF=1 NMI=2 MC=3\n");
 
     /* 5. 初始化 PIC */
     tty_print("[..] Remapping PIC...\n");
@@ -151,6 +154,13 @@ void kernel_main(uint32_t magic, uint64_t mbi_addr)
     tty_print("\nEntering InitKernel...\n\n");
     init_kernel();
 
+    /* 正常运行：启用中断并进入空闲循环
+     * sti: 设置 IF=1，允许响应硬件中断（键盘、定时器等）
+     * hlt: 挂起 CPU 直到下一个中断唤醒，然后继续循环
+     * 参考：Intel SDM Vol.3 6.8 (HLT), OSDev Bare Bones */
+    for (;;) __asm__ volatile ("sti; hlt");
+
 halt:
+    /* 错误路径：禁用中断并停机 */
     for (;;) __asm__ volatile ("cli; hlt");
 }

@@ -17,6 +17,12 @@ static uint64_t gdt_entries[GDT_ENTRIES];
 /* TSS 实例（BSS 段，链接器初始化为零） */
 struct tss_entry kernel_tss;
 
+/* ISR 存根中的栈符号（定义在 idt_stubs.asm 的 .bss 段） */
+extern uint8_t double_fault_stack_top;
+extern uint8_t nmi_stack_top;
+extern uint8_t machine_check_stack_top;
+extern uint8_t kernel_interrupt_stack_top;
+
 /* ---- GDT 编码辅助函数 ---- */
 
 /* 编码普通段描述符（代码段/数据段）
@@ -111,9 +117,19 @@ void gdt_init(void)
     gdt_entries[4] = make_seg(0xFFFFF, 0, 0xF2, 0xC);
 
     /* [0x28-0x30] TSS（64 位系统段，占 2 个条目）
-     * 设置 IST1 用于 Double Fault 处理（需要专用栈） */
-    extern uint8_t double_fault_stack_top;
+     * 参考：AMD64 APM Vol.2 Figure 4-15, OSDev GDT - TSS Descriptor
+     *
+     * 设置 TSS 栈：
+     *   RSP0: ring3→ring0 中断时 CPU 自动加载此栈（特权级切换必须）
+     *   IST1: Double Fault 专用栈（内核栈可能已损坏）
+     *   IST2: NMI 专用栈（可随时中断任意内核代码）
+     *   IST3: Machine Check 专用栈（不可屏蔽 abort，可随时发生）
+     * 参考：Intel SDM Vol.3 6.12.1 (RSP0), 6.14.1 (IST) */
+    kernel_tss.rsp0 = (uint64_t)&kernel_interrupt_stack_top;
     kernel_tss.ist1 = (uint64_t)&double_fault_stack_top;
+    kernel_tss.ist2 = (uint64_t)&nmi_stack_top;
+    kernel_tss.ist3 = (uint64_t)&machine_check_stack_top;
+    /* I/O 权限位图偏移 = TSS 大小，表示无位图 → ring3 访问任何 I/O 端口均触发 #GP */
     kernel_tss.iopb_offset = sizeof(struct tss_entry);
 
     make_tss_desc(&gdt_entries[5], &gdt_entries[6],
@@ -122,6 +138,7 @@ void gdt_init(void)
     /* 加载 GDT 并刷新段寄存器 */
     load_gdt(gdt_entries, sizeof(gdt_entries) - 1);
 
-    /* 加载 TSS（LTR 指令） */
+    /* 加载 TSS（LTR 指令）
+     * 参考：Intel SDM Vol.3 6.2.4 - Task Register */
     __asm__ volatile ("ltr %w0" : : "r"(GDT_SELECTOR_TSS));
 }

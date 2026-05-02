@@ -8,6 +8,7 @@ SukiOS EarlyKernel
 [OK] Boot info parsed
 [..] Initializing GDT...
 [OK] GDT initialized
+  TSS loaded  RSP0=0xFFFFFFFF8003C2D0  IST: DF=1 NMI=2 MC=3
 [..] Remapping PIC...
 [OK] PIC remapped
 [..] Initializing IDT...
@@ -15,7 +16,7 @@ SukiOS EarlyKernel
 [..] Initializing PMM...
 [OK] PMM initialized
 
-Memory: 129668 KB free, 222 pages used
+Memory: 129612 KB free, 236 pages used
 
 Entering InitKernel...
 
@@ -50,9 +51,18 @@ SukiOS v0.1.0 - x86_64
   [IOAPIC] Phys: 0x00000000FEC00000  Virt: 0xFFFFFFFFC0001000  ID: 0  Ver: 32  RedirEntries: 24
 [OK] I/O APIC initialized (all IRQs masked)
 
+[..] Initializing LAPIC Timer...
+[OK] LAPIC Timer: bus_freq=4294 MHz  freq=100 Hz  init_count=2684353
+
+[..] Initializing PS/2 Keyboard...
+[OK] PS/2 Keyboard initialized (IRQ1 -> GSI=1 vector=33)
+
 [..] Testing kernel heap...
 [OK] kmalloc: p1=0xFFFFFFFFA0000010 p2=0xFFFFFFFFA00000A0 p3=0xFFFFFFFFA00001B0
 [OK] kfree + kmalloc: p4=0xFFFFFFFFA0000010
 [OK] Heap stats: 0 KB used, 3 KB free
 
 SukiOS booted successfully!
+
+Keyboard ready. Type something:
+> dim  dimsum 2212211244444444444444444 

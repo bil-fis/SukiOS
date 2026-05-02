@@ -89,6 +89,19 @@ struct acpi_madt_info {
     uint32_t ioapic_gsi_base;
 };
 
+/* ---- ISA 中断源覆盖查找 ---- */
+#define ACPI_MAX_ISA_OVERRIDES 16
+
+/* 查找指定 ISA IRQ 的 GSI 和 flags
+ * @isa_irq: ISA IRQ 编号 (0-15)
+ * @gsi:     输出 GSI (IOAPIC 引脚号)
+ * @flags:   输出 MADT flags (极性/触发模式)
+ * @return:  true 表示找到 override，false 表示使用默认映射 (GSI=isa_irq, flags=0) */
+bool acpi_get_isa_override(uint8_t isa_irq, uint32_t *gsi, uint16_t *flags);
+
+/* 初始化 ISA override 表（在 apic_init 中调用） */
+void acpi_parse_isa_overrides(struct acpi_sdt_header *madt_hdr);
+
 /* ---- 函数声明 ---- */
 
 /* 在 BIOS 区域搜索 RSDP */

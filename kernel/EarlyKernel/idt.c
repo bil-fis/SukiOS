@@ -51,6 +51,13 @@ extern uint64_t isr28, isr29, isr30, isr31;
 /* 伪中断 ISR 255（由 apic_init 启用 LAPIC 后可能触发） */
 extern uint64_t isr_spurious;
 
+/* IRQ 存根地址（在 idt_stubs.asm 中定义，向量 0x20-0x2F） */
+extern uint64_t irq32, irq33, irq34, irq35, irq36, irq37, irq38, irq39;
+extern uint64_t irq40, irq41, irq42, irq43, irq44, irq45, irq46, irq47;
+
+/* IRQ 处理函数注册表（在 InitKernel 阶段由驱动注册） */
+static irq_handler_fn irq_handlers[16] = { NULL };
+
 static uint64_t isr_table[32] = {
     (uint64_t)&isr0,  (uint64_t)&isr1,  (uint64_t)&isr2,  (uint64_t)&isr3,
     (uint64_t)&isr4,  (uint64_t)&isr5,  (uint64_t)&isr6,  (uint64_t)&isr7,
@@ -88,9 +95,14 @@ void spurious_irq_handler(struct interrupt_frame *frame)
     }
 }
 
-/* CPU 异常处理函数（由 idt_stubs.asm 中的 ISR 存根调用） */
+/* CPU 异常处理函数（由 idt_stubs.asm 中的 ISR 存根调用）
+ * 参考：Intel SDM Vol.3 Table 6-1 (exception classes) */
 void exception_handler(struct interrupt_frame *frame)
 {
+    /* 检测特权级变化：CS 低 2 位 = CPL
+     * 如果 CPL != 0，说明异常来自用户态（ring3） */
+    uint8_t from_ring = frame->cs & 0x3;
+
     tty_setcolor(VGA_RED, VGA_BLACK);
     tty_print("\n!!! CPU Exception: ");
 
@@ -105,8 +117,21 @@ void exception_handler(struct interrupt_frame *frame)
     tty_print_hex64(frame->err_code);
     tty_print("\n  RIP: ");
     tty_print_hex64(frame->rip);
-    tty_print("  RSP: ");
-    tty_print_hex64((uint64_t)&frame->rax);  /* 栈顶即 RSP */
+    tty_print("  CS: ");
+    tty_print_hex64(frame->cs);
+    tty_print("  RFLAGS: ");
+    tty_print_hex64(frame->rflags);
+    tty_print("\n  RSP: ");
+    tty_print_hex64((uint64_t)&frame->rax);  /* 当前栈顶（内核栈/RSP0） */
+
+    /* 仅在特权级变化时打印用户态的 SS:RSP（由 CPU 压入）
+     * 参考：Intel SDM Vol.3 Figure 6-8 */
+    if (from_ring != 0) {
+        tty_print("\n  [User] RSP: ");
+        tty_print_hex64(frame->rsp);
+        tty_print("  SS: ");
+        tty_print_hex64(frame->ss);
+    }
     tty_print("\n");
 
     /* 停机 */
@@ -130,9 +155,21 @@ void idt_init(void)
         idt[i].offset_low = idt[i].offset_mid = idt[i].offset_high = 0;
 
     /* 设置 CPU 异常门（0-31）
-     * Double Fault (8) 使用 IST=1（专用栈，避免栈溢出导致的 triple fault） */
+     * 参考：Intel SDM Vol.3 Table 6-1, OSDev IDT
+     *
+     * IST 分配策略：
+     *   Double Fault (#DF, 8):  IST1 — 内核栈可能已损坏，必须独立栈
+     *   NMI (2):               IST2 — 可在任何时刻中断内核（包括中断处理中）
+     *   Machine Check (#MC, 18): IST3 — 不可屏蔽 abort，可随时发生
+     *   其余异常:              IST0 — 使用当前栈（无特权级变化时）或 RSP0 */
     for (int i = 0; i < 32; i++) {
-        uint8_t ist = (i == 8) ? 1 : 0;   /* 仅 Double Fault 使用 IST1 */
+        uint8_t ist = 0;
+        switch (i) {
+        case 2:  ist = IST_NMI; break;   /* NMI */
+        case 8:  ist = IST_DF;  break;   /* Double Fault */
+        case 18: ist = IST_MC;  break;   /* Machine Check */
+        default: break;
+        }
         idt_set_gate(i, isr_table[i], GDT_SELECTOR_KERNEL_CS, IDT_GATE_INTERRUPT, ist);
     }
 
@@ -143,6 +180,55 @@ void idt_init(void)
     idt_set_gate(APIC_SPURIOUS_VECTOR, (uint64_t)&isr_spurious,
                  GDT_SELECTOR_KERNEL_CS, IDT_GATE_INTERRUPT, 0);
 
+    /* 设置 IRQ 门（向量 0x20-0x2F）
+     * IRQ 存根在 idt_stubs.asm 中定义
+     * 注意：此时 IOAPIC 尚未初始化，IRQ 不会实际触发
+     * 各驱动的 IOAPIC 重定向条目在 InitKernel 阶段配置 */
+    static uint64_t irq_table[16] = {
+        (uint64_t)&irq32, (uint64_t)&irq33, (uint64_t)&irq34, (uint64_t)&irq35,
+        (uint64_t)&irq36, (uint64_t)&irq37, (uint64_t)&irq38, (uint64_t)&irq39,
+        (uint64_t)&irq40, (uint64_t)&irq41, (uint64_t)&irq42, (uint64_t)&irq43,
+        (uint64_t)&irq44, (uint64_t)&irq45, (uint64_t)&irq46, (uint64_t)&irq47,
+    };
+    for (int i = 0; i < 16; i++) {
+        idt_set_gate(0x20 + i, irq_table[i],
+                     GDT_SELECTOR_KERNEL_CS, IDT_GATE_INTERRUPT, 0);
+    }
+
     /* 对未覆盖的异常向量（32-254），CPU 访问时会触发 #GP，
      * 我们已经设置了 #GP 处理函数，可以显示调试信息 */
+}
+
+/* IRQ 处理函数注册 */
+void irq_register_handler(uint8_t irq_num, irq_handler_fn handler)
+{
+    if (irq_num < 16) {
+        irq_handlers[irq_num] = handler;
+    }
+}
+
+/* IRQ 通用处理函数（由 idt_stubs.asm 的 irq_common_stub 调用）
+ * 参考：Intel SDM Vol.3 6.8, OSDev IRQ Handling
+ *
+ * 中断处理流程：
+ *   1. 保存寄存器（汇编存根完成）
+ *   2. 调用已注册的 IRQ 处理函数
+ *   3. 发送 LAPIC EOI（必须在中断处理完成后发送）
+ *   4. 恢复寄存器并 iretq（汇编存根完成） */
+void irq_handler(struct interrupt_frame *frame)
+{
+    /* 计算 IRQ 编号：向量号 - IRQ_BASE */
+    uint8_t irq_num = (uint8_t)(frame->int_no - 0x20);
+
+    if (irq_num < 16 && irq_handlers[irq_num]) {
+        /* 调用已注册的处理函数，传入中断向量号 */
+        irq_handlers[irq_num]((uint8_t)frame->int_no);
+    }
+
+    /* 发送 LAPIC EOI（End of Interrupt）
+     * 必须在处理完成后发送，否则 LAPIC 不会再转发后续中断
+     * 参考：Intel SDM Vol.3 10.8.5 */
+    if (apic_lapic_base) {
+        lapic_write(LAPIC_EOI, 0);
+    }
 }

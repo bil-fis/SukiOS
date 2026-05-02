@@ -14,6 +14,9 @@
 #include "kernel/vmm.h"
 #include "kernel/heap.h"
 #include "kernel/apic.h"
+#include "kernel/idt.h"
+#include "kernel/keyboard.h"
+#include "kernel/apic_timer.h"
 
 void init_kernel(void)
 {
@@ -50,7 +53,17 @@ void init_kernel(void)
     /* ---- 3. 初始化 APIC 中断控制器（使用 VMM 映射 MMIO） ---- */
     apic_init();
 
-    /* ---- 4. 验证堆分配 ---- */
+    /* ---- 4. 初始化 LAPIC 定时器（需要 APIC 已启用） ---- */
+    tty_print("\n[..] Initializing LAPIC Timer...\n");
+    irq_register_handler(0, apic_timer_irq_handler);
+    apic_timer_init();
+
+    /* ---- 5. 初始化 PS/2 键盘驱动（需要 IOAPIC 已初始化） ---- */
+    tty_print("\n[..] Initializing PS/2 Keyboard...\n");
+    irq_register_handler(1, keyboard_irq_handler);
+    keyboard_init();
+
+    /* ---- 6. 验证堆分配 ---- */
     tty_print("\n[..] Testing kernel heap...\n");
     {
         void *p1 = kmalloc(128);
@@ -91,4 +104,7 @@ void init_kernel(void)
     tty_setcolor(VGA_GREEN, VGA_BLACK);
     tty_print("\nSukiOS booted successfully!\n");
     tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
+
+    /* ---- 7. 键盘输入测试 ---- */
+    tty_print("\nKeyboard ready. Type something:\n> ");
 }

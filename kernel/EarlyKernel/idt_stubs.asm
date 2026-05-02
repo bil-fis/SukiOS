@@ -115,13 +115,42 @@ isr_common_stub:
     add rsp, 16
     iretq
 
-; ---- Double Fault 专用栈（16 KB） ----
+; ---- Double Fault 专用栈（IST1, 16 KB） ----
+; Double Fault 可能在内核栈已损坏时触发，必须使用独立栈
+; 参考：Intel SDM Vol.3 6.15, OSDev Double Fault
 section .bss align=16
 global double_fault_stack_top
 global double_fault_stack_bottom
 double_fault_stack_bottom:
     resb 16384
 double_fault_stack_top:
+
+; ---- NMI 专用栈（IST2, 16 KB） ----
+; NMI 可在任何时刻（包括中断处理过程中）中断内核，必须使用独立栈
+; 参考：Intel SDM Vol.3 6.7, OSDev NMI
+global nmi_stack_top
+global nmi_stack_bottom
+nmi_stack_bottom:
+    resb 16384
+nmi_stack_top:
+
+; ---- Machine Check 专用栈（IST3, 16 KB） ----
+; Machine Check 是不可屏蔽的 abort，可随时发生，必须使用独立栈
+; 参考：Intel SDM Vol.3 15, OSDev Machine Check
+global machine_check_stack_top
+global machine_check_stack_bottom
+machine_check_stack_bottom:
+    resb 16384
+machine_check_stack_top:
+
+; ---- 内核中断栈（TSS.RSP0, ring3→ring0 中断时使用, 16 KB） ----
+; 当 CPU 从 ring3 接收中断时，自动切换到此栈（TSS.RSP0）
+; 参考：Intel SDM Vol.3 6.12.1, OSDev Task State Segment
+global kernel_interrupt_stack_top
+global kernel_interrupt_stack_bottom
+kernel_interrupt_stack_bottom:
+    resb 16384
+kernel_interrupt_stack_top:
 
 ; ---- 伪中断处理存根（ISR 255） ----
 ; APIC 启用后会产生伪中断，需要发送 EOI 并返回
@@ -156,6 +185,92 @@ spurious_common_stub:
     mov rdi, rsp
     call spurious_irq_handler
 
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 16
+    iretq
+
+; =============================================================================
+; IRQ 存根（中断请求）
+;
+; IRQ 0-15 对应向量 0x20-0x2F（偏移 IRQ_BASE）
+; 与 CPU 异常存根共享相同的寄存器保存/恢复逻辑。
+;
+; 每个 IRQ 存根：
+;   1. 压入 0（IRQ 无错误码）
+;   2. 压入中断号
+;   3. 跳转到 irq_common_stub
+;
+; 注意：IRQ 存根不自动发送 LAPIC EOI，由 C 处理函数负责。
+; =============================================================================
+
+extern irq_handler
+
+; 用于生成 IRQ 存根的宏（与 ISR_NOERRCODE 结构相同）
+%macro IRQ 1
+global irq%1
+irq%1:
+    push qword 0              ; 占位错误码
+    push qword %1             ; 中断号
+    jmp irq_common_stub
+%endmacro
+
+; IRQ 存根 0-15
+IRQ 32    ; IRQ0: 定时器 (LAPIC Timer)
+IRQ 33    ; IRQ1: PS/2 键盘
+IRQ 34    ; IRQ2: 级联（APIC 模式下未使用）
+IRQ 35    ; IRQ3: 串口 2/4
+IRQ 36    ; IRQ4: 串口 1/3
+IRQ 37    ; IRQ5: 并口 2 / 声卡
+IRQ 38    ; IRQ6: 软盘控制器
+IRQ 39    ; IRQ7: 并口 1
+IRQ 40    ; IRQ8: RTC (实时时钟)
+IRQ 41    ; IRQ9: ACPI / SCI
+IRQ 42    ; IRQ10: 未使用
+IRQ 43    ; IRQ11: 未使用
+IRQ 44    ; IRQ12: PS/2 鼠标
+IRQ 45    ; IRQ13: FPU / 协处理器
+IRQ 46    ; IRQ14: 主 ATA (IDE)
+IRQ 47    ; IRQ15: 从 ATA (IDE)
+
+; IRQ 通用处理存根
+irq_common_stub:
+    ; 保存所有通用寄存器（与 interrupt_frame 结构体顺序一致）
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; RDI = 指向 interrupt_frame 的指针
+    mov rdi, rsp
+    call irq_handler
+
+    ; 恢复所有寄存器
     pop r15
     pop r14
     pop r13

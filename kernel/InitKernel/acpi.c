@@ -9,6 +9,49 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
+
+/* ---- ISA 中断源覆盖表 ---- */
+static struct acpi_madt_int_override isa_overrides[ACPI_MAX_ISA_OVERRIDES];
+static int isa_override_count = 0;
+
+void acpi_parse_isa_overrides(struct acpi_sdt_header *madt_hdr)
+{
+    isa_override_count = 0;
+    memset(isa_overrides, 0, sizeof(isa_overrides));
+
+    uint8_t *ptr = (uint8_t *)madt_hdr + sizeof(struct acpi_madt);
+    uint8_t *end = (uint8_t *)madt_hdr + madt_hdr->length;
+
+    while (ptr + sizeof(struct acpi_madt_entry) <= end) {
+        struct acpi_madt_entry *entry = (struct acpi_madt_entry *)ptr;
+        if (entry->length < sizeof(struct acpi_madt_entry))
+            break;
+
+        if (entry->type == 2 && isa_override_count < ACPI_MAX_ISA_OVERRIDES) {
+            struct acpi_madt_int_override *ov =
+                (struct acpi_madt_int_override *)entry;
+            isa_overrides[isa_override_count++] = *ov;
+        }
+
+        ptr += entry->length;
+    }
+}
+
+bool acpi_get_isa_override(uint8_t isa_irq, uint32_t *gsi, uint16_t *flags)
+{
+    for (int i = 0; i < isa_override_count; i++) {
+        if (isa_overrides[i].irq == isa_irq) {
+            *gsi = isa_overrides[i].gsi;
+            *flags = isa_overrides[i].flags;
+            return true;
+        }
+    }
+    /* 默认：无 override，GSI = ISA IRQ */
+    *gsi = isa_irq;
+    *flags = 0;
+    return false;
+}
 
 /* 在指定物理地址范围内搜索 RSDP */
 static struct acpi_rsdp *search_rsdp(uintptr_t start, uintptr_t end)

@@ -1,9 +1,7 @@
 /* =============================================================================
- * SukiOS - 64 位 IDT 初始化 + CPU 异常处理 + syscall
+ * SukiOS - 64 位 IDT 初始化 + CPU 异常处理 + int 0x80 系统调用
  *
- * 参考：OSDev IDT, Intel SDM Vol.3 6.14, AMD64 APM Vol.2 12.4.1
- *
- * 使用统一的 rdmsr / wrmsr，并验证 LSTAR 写入。
+ * 使用 int 0x80 替代 syscall，兼容性更好。
  * ============================================================================= */
 
 #include "kernel/gdt.h"
@@ -31,6 +29,7 @@ extern uint64_t isr16, isr17, isr18, isr19, isr20, isr21;
 extern uint64_t isr22, isr23, isr24, isr25, isr26, isr27;
 extern uint64_t isr28, isr29, isr30, isr31;
 extern uint64_t isr_spurious;
+extern uint64_t isr80;   // int 0x80 存根
 
 extern uint64_t irq32, irq33, irq34, irq35, irq36, irq37, irq38, irq39;
 extern uint64_t irq40, irq41, irq42, irq43, irq44, irq45, irq46, irq47;
@@ -51,31 +50,23 @@ static uint64_t isr_table[32] = {
     (uint64_t)&isr28, (uint64_t)&isr29, (uint64_t)&isr30, (uint64_t)&isr31,
 };
 
-/* ---- syscall 初始化（验证 LSTAR） ---- */
-static void setup_syscall(void)
+/* ---- int 0x80 处理函数 ---- */
+static void int80_handler(struct interrupt_frame *frame)
 {
-    uint64_t stub_addr = (uint64_t)&syscall_stub;
+    struct syscall_frame sf;
+    sf.rax = frame->rax;
+    sf.rdi = frame->rdi;
+    sf.rsi = frame->rsi;
+    sf.rdx = frame->rdx;
+    sf.r10 = frame->r10;
+    sf.r8  = frame->r8;
+    sf.r9  = frame->r9;
+    sf.rcx = 0;
+    sf.r11 = 0;
+    sf.rip = 0;
 
-    tty_setcolor(VGA_CYAN, VGA_BLACK);
-    tty_print("  [syscall] LSTAR target = 0x");
-    tty_print_hex64(stub_addr);
-    tty_print("\n");
-    tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
-
-    wrmsr(MSR_IA32_LSTAR, stub_addr);
-
-    /* 读回验证 */
-    uint64_t lstar = rdmsr(MSR_IA32_LSTAR);
-    tty_print("  [syscall] LSTAR readback = 0x");
-    tty_print_hex64(lstar);
-    tty_print("\n");
-
-    if (lstar != stub_addr) {
-        tty_setcolor(VGA_RED, VGA_BLACK);
-        tty_print("  ERROR: LSTAR mismatch! Check MSR access.\n");
-        tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
-        for (;;) __asm__ volatile ("cli; hlt");
-    }
+    syscall_handler(&sf);
+    frame->rax = sf.rax;   // 将返回值写回用户态 rax
 }
 
 void idt_set_gate(uint8_t n, uint64_t handler, uint16_t selector,
@@ -100,6 +91,12 @@ void spurious_irq_handler(struct interrupt_frame *frame)
 
 void exception_handler(struct interrupt_frame *frame)
 {
+    /* 系统调用分发 */
+    if (frame->int_no == 0x80) {
+        int80_handler(frame);
+        return;       // 处理完毕，直接返回，不打印异常
+    }
+
     uint8_t from_ring = frame->cs & 0x3;
 
     tty_setcolor(VGA_RED, VGA_BLACK);
@@ -186,7 +183,8 @@ void idt_init(void)
                      GDT_SELECTOR_KERNEL_CS, IDT_GATE_INTERRUPT, 0);
     }
 
-    setup_syscall();
+    /* 注册 int 0x80 系统调用门（DPL=3，中断门） */
+    idt_set_gate(0x80, (uint64_t)&isr80, GDT_SELECTOR_KERNEL_CS, 0xEE, 0);
 }
 
 void irq_register_handler(uint8_t irq_num, irq_handler_fn handler)

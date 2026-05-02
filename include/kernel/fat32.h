@@ -92,4 +92,13 @@ void fat32_flush(fat32_fs_t *fs); /* 强制写回FAT */
 void     fat32_seek(fat32_file_t *file, uint32_t offset);
 uint32_t fat_next_cluster(fat32_fs_t *fs, uint32_t cluster);
 
+/* 供 VFS 适配器使用的底层函数 */
+#define FAT_EOF         0x0FFFFFF8
+
+uint32_t fat_next_cluster(fat32_fs_t *fs, uint32_t cluster);
+uint32_t cluster_to_lba(fat32_fs_t *fs, uint32_t cluster);
+
+/* 注意：disk_read 在内部是静态函数，我们增加一个包装函数供外部使用 */
+int fat32_disk_read(uint32_t lba, uint32_t count, void *buf);
+
 #endif

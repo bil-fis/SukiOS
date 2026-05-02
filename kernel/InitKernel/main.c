@@ -21,6 +21,7 @@
 #include "kernel/fat32.h"
 #include "kernel/vfs.h"
 #include "kernel/fat32_vfs.h"
+#include "kernel/rtc.h"
 
 #define KERNEL_VIRT_BASE    0xFFFFFFFF80000000ULL
 #define KERNEL_LMA          0x110000ULL
@@ -94,6 +95,33 @@ void init_kernel(void)
         tty_print("  IDE read failed!\n");
         tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
     }
+
+    // 在 init_kernel 函数中，vfs_init() 之后或附近：
+    rtc_init();
+
+    // 测试 RTC 读取
+    rtc_time_t now;
+    rtc_read_time(&now);
+    tty_print("[RTC] Current time: ");
+    tty_print_dec(now.year);
+    tty_print("-");
+    tty_print_dec(now.month);
+    tty_print("-");
+    tty_print_dec(now.day);
+    tty_print(" ");
+    tty_print_dec(now.hour);
+    tty_print(":");
+    tty_print_dec(now.minute);
+    tty_print(":");
+    tty_print_dec(now.second);
+    tty_print("\n");
+
+    // 测试 FAT 时间戳转换
+    tty_print("[RTC] FAT time=0x");
+    tty_print_hex64(rtc_to_fat_time(&now));
+    tty_print(" FAT date=0x");
+    tty_print_hex64(rtc_to_fat_date(&now));
+    tty_print("\n");
 
     // tty_print("[..] Mounting FAT32...\n");
     // fat32_fs_t fs;
@@ -187,23 +215,20 @@ void init_kernel(void)
                 tty_print("[VFS] README.TXT not found via VFS.\n");
             }
 
-            // 创建并测试写入
-            vfs_create("/HELLO.TXT", 0);
-            fd = vfs_open("/HELLO.TXT", O_WRONLY);
-            if (fd >= 0) {
-                const char *msg = "Hello via VFS!\n";
-                int written = vfs_write(fd, msg, 15);
-                vfs_close(fd);
-                tty_print("[VFS] Written ");
-                tty_print_dec(written);
-                tty_print(" bytes to HELLO.TXT via VFS.\n");
-            } else {
-                tty_print("[VFS] Could not open HELLO.TXT for writing.\n");
+            vfs_dir_t *dir = vfs_opendir("/");
+            if (dir) {
+                vfs_dir_entry_t ent;
+                tty_print("[VFS] Root directory contents:\n");
+                while (vfs_readdir(dir, &ent) > 0) {
+                    tty_print("  ");
+                    tty_print(ent.name);
+                    if (ent.type == VFS_FLAG_DIR)
+                        tty_print(" [DIR]\n");
+                    else
+                        tty_print("\n");
+                }
+                vfs_closedir(dir);
             }
-
-            // 删除测试文件
-            vfs_delete("/HELLO.TXT");
-            tty_print("[VFS] Deleted HELLO.TXT.\n");
         }
     } else {
         tty_print("[FAIL] FAT32 mount failed.\n");

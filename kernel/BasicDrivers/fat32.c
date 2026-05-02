@@ -2,6 +2,7 @@
 #include "kernel/ide.h"
 #include "kernel/tty.h"
 #include "kernel/heap.h"
+#include "kernel/rtc.h"
 
 /* ====== 磁盘物理读写 ====== */
 static int disk_read(uint32_t lba, uint32_t count, void *buf) {
@@ -47,7 +48,7 @@ uint32_t fat_next_cluster(fat32_fs_t *fs, uint32_t cluster)
     return fs->fat[cluster] & 0x0FFFFFFF;
 }
 
-static inline uint32_t cluster_to_lba(fat32_fs_t *fs, uint32_t cluster) {
+uint32_t cluster_to_lba(fat32_fs_t *fs, uint32_t cluster) {
     return fs->first_data_sector + (cluster - 2) * fs->sectors_per_cluster;
 }
 
@@ -235,7 +236,8 @@ int fat32_write(fat32_file_t *file, const void *buf, uint32_t size) {
 }
 
 /* ====== 更新目录项大小 ====== */
-static int fat32_update_dir_entry(fat32_file_t *file) {
+static int fat32_update_dir_entry(fat32_file_t *file)
+{
     if (!file->fs) return -1;
 
     fat32_fs_t *fs = file->fs;
@@ -243,17 +245,32 @@ static int fat32_update_dir_entry(fat32_file_t *file) {
     uint8_t *buf = (uint8_t*)kmalloc(fs->sectors_per_cluster * 512);
     if (!buf) return -1;
 
+    /* 获取当前时间 */
+    rtc_time_t now;
+    rtc_read_time(&now);
+    uint16_t fat_time = rtc_to_fat_time(&now);
+    uint16_t fat_date = rtc_to_fat_date(&now);
+
     while (cluster < FAT_EOF && cluster >= 2) {
-        if (disk_read(cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf)) break;
+        if (disk_read(cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf))
+            break;
+
         fat32_dir_entry_t *e = (fat32_dir_entry_t*)buf;
         int count = (fs->sectors_per_cluster * 512) / sizeof(fat32_dir_entry_t);
         for (int i = 0; i < count; ++i) {
             if ((unsigned char)e[i].name[0] == 0x00) break;
             if ((unsigned char)e[i].name[0] == 0xE5) continue;
             if (e[i].attr == 0x0F) continue;
-            uint32_t ent_cluster = e[i].first_cluster_low | ((uint32_t)e[i].first_cluster_high << 16);
+
+            uint32_t ent_cluster = e[i].first_cluster_low |
+                                  ((uint32_t)e[i].first_cluster_high << 16);
             if (ent_cluster == file->start_cluster) {
+                /* 更新文件大小、最后写入时间和日期 */
                 e[i].file_size = file->size;
+                e[i].write_time = fat_time;
+                e[i].write_date = fat_date;
+
+                /* 写回目录簇 */
                 if (disk_write(cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf)) {
                     kfree(buf);
                     return -1;
@@ -318,6 +335,14 @@ int fat32_create_file(fat32_fs_t *fs, const char *filename, fat32_file_t *file) 
     ent->attr = 0x20;
     ent->first_cluster_low  = new_clu & 0xFFFF;
     ent->first_cluster_high = new_clu >> 16;
+    ent->file_size = 0;
+    rtc_time_t now;
+    rtc_read_time(&now);
+
+    ent->creation_time = rtc_to_fat_time(&now);
+    ent->creation_date = rtc_to_fat_date(&now);
+    ent->write_time    = rtc_to_fat_time(&now);
+    ent->write_date    = rtc_to_fat_date(&now);
     ent->file_size = 0;
     disk_write(cluster_to_lba(fs, target_clu), fs->sectors_per_cluster, buf);
     kfree(buf);
@@ -425,4 +450,10 @@ void fat32_seek(fat32_file_t *file, uint32_t offset)
     }
     file->current_cluster = cluster;
     file->offset = remaining;
+}
+
+int fat32_disk_read(uint32_t lba, uint32_t count, void *buf) {
+    for (uint32_t i = 0; i < count; ++i)
+        if (!ide_read_sector(lba + i, (uint8_t*)buf + i * 512)) return -1;
+    return 0;
 }

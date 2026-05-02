@@ -16,6 +16,9 @@
 #include "kernel/keyboard.h"
 #include "kernel/apic_timer.h"
 #include "kernel/io.h"
+#include "kernel/pci.h"
+#include "kernel/ide.h"
+#include "kernel/fat32.h"
 
 #define KERNEL_VIRT_BASE    0xFFFFFFFF80000000ULL
 #define KERNEL_LMA          0x110000ULL
@@ -63,6 +66,63 @@ void init_kernel(void)
     tty_print("\n");
 
     apic_init();
+
+    /* ---- PCI 初始化 ---- */
+    tty_print("\n[..] Initializing PCI...\n");
+    pci_init();
+
+    /* ---- IDE 驱动初始化 ---- */
+    tty_print("\n[..] Initializing IDE...\n");
+    ide_init();
+
+    /* ---- 测试读取扇区 0 ---- */
+    static uint8_t sector_buf[IDE_SECTOR_SIZE];
+    tty_print("[..] Reading sector 0...\n");
+    if (ide_read_sector(0, sector_buf)) {
+        tty_print("[OK] Sector 0:\n");
+        /* 打印前 64 字节 (十六进制) */
+        for (int i = 0; i < 64; i++) {
+            tty_print_hex64((uint64_t)sector_buf[i]);
+            tty_print(" ");
+            if ((i + 1) % 16 == 0) tty_print("\n");
+        }
+        tty_print("\n");
+    } else {
+        tty_setcolor(VGA_RED, VGA_BLACK);
+        tty_print("  IDE read failed!\n");
+        tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
+    }
+
+    tty_print("[..] Mounting FAT32...\n");
+    fat32_fs_t fs;
+    if (fat32_mount(&fs) == 0) {
+        tty_print("[OK] FAT32 mounted. Root directory:\n");
+        fat32_list_root(&fs);
+
+        tty_print("[..] Opening README.TXT...\n");
+        fat32_file_t file;
+        if (fat32_open(&fs, "README.TXT", &file) == 0) {
+            char buf[513];
+            uint32_t total = 0;
+            tty_print("--- README.TXT ---\n");
+            while (total < file.size) {
+                uint32_t chunk = file.size - total;
+                if (chunk > 512) chunk = 512;
+                int n = fat32_read(&file, buf, chunk);
+                if (n <= 0) break;
+                buf[n] = '\0';
+                tty_print(buf);
+                total += n;
+            }
+            tty_print("\n--- end ---\n");
+            fat32_close(&file);
+        } else {
+            tty_print("README.TXT not found.\n");
+        }
+        fat32_unmount(&fs);
+    } else {
+        tty_print("[FAIL] FAT32 mount failed.\n");
+    }
 
     tty_print("\n[..] Initializing LAPIC Timer...\n");
     irq_register_handler(0, apic_timer_irq_handler);

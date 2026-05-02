@@ -94,7 +94,7 @@ iso: $(KERNEL_ELF)
 
 # 在 QEMU 中运行
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -m 128M -serial file:serial.log
+	qemu-system-x86_64 -cdrom $(ISO) -m 128M -serial file:serial.log -drive file=disk.img,format=raw,if=ide -boot d
 
 # 直接通过 QEMU 内核加载运行
 run-direct: $(KERNEL_ELF)

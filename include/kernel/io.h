@@ -1,5 +1,5 @@
 /* =============================================================================
- * SukiOS - x86 端口 I/O + MSR 指令
+* SukiOS - x86 端口 I/O + MSR 指令
  * ============================================================================= */
 
 #ifndef SUKIOS_IO_H
@@ -26,12 +26,24 @@ static inline uint16_t inw(uint16_t port)
     return ret;
 }
 
+static inline void outl(uint16_t port, uint32_t val)
+{
+    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint32_t inl(uint16_t port)
+{
+    uint32_t ret;
+    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 static inline void io_wait(void)
 {
     outb(0x80, 0);
 }
 
-/* 读取 MSR（Model Specific Register） */
+/* 读取 MSR */
 static inline uint64_t rdmsr(uint32_t msr)
 {
     uint32_t low, high;
@@ -44,6 +56,11 @@ static inline void wrmsr(uint32_t msr, uint64_t value)
 {
     __asm__ volatile ("wrmsr"
         : : "c"(msr), "a"((uint32_t)value), "d"((uint32_t)(value >> 32)));
+}
+
+static inline void outw(uint16_t port, uint16_t val)
+{
+    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 
 #endif /* SUKIOS_IO_H */

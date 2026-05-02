@@ -1,0 +1,58 @@
+SukiOS EarlyKernel
+[OK] Multiboot2 verified
+[..] Parsing boot info...
+  [Cmdline] 
+  [Bootloader] GRUB 2.12-1ubuntu7.3
+  [Memory] lower: 639 KB, upper: 129920 KB
+  [Framebuffer] 80x25x16 @ 0x00000000000B8000
+[OK] Boot info parsed
+[..] Initializing GDT...
+[OK] GDT initialized
+[..] Remapping PIC...
+[OK] PIC remapped
+[..] Initializing IDT...
+[OK] IDT initialized
+[..] Initializing PMM...
+[OK] PMM initialized
+
+Memory: 129668 KB free, 222 pages used
+
+Entering InitKernel...
+
+  _____ _____ __  __  __  __ 
+ |  __ \_   _|  \/  | |  \/  |
+ | |__) || | | .  . | | .  . |
+ |  ___/ | | | |\/| | | |\/| |
+ | |    _| |_| |  | | | |  | |
+ |_|   |_____|_|  |_|_|_|  |_|
+
+SukiOS v0.1.0 - x86_64
+
+[..] Initializing Virtual Memory Manager...
+[OK] VMM initialized
+  PML4 at phys=0x0000000000070000
+  Identity map: 0-4GB (1GB pages)
+  Kernel: 0xFFFFFFFF80000000 (boot.asm mapping preserved)
+  Heap:   0xFFFFFFFFA0000000 (on-demand via PML4[511])
+  MMIO:   0xFFFFFFFFC0000000 (on-demand via PML4[511])
+
+[..] Initializing kernel heap...
+[OK] Kernel heap at 0xFFFFFFFFA0000000 (4 KB mapped)
+
+[..] Searching for RSDP...
+[OK] RSDP at 0x00000000000F5290 rev.0
+[..] Locating MADT table...
+[OK] MADT parsed  LAPIC: 0x00000000FEE00000  IOAPIC: 0x00000000FEC00000
+[..] Initializing Local APIC...
+  [LAPIC] Phys: 0x00000000FEE00000  Virt: 0xFFFFFFFFC0000000  ID: 0  Version: 20
+[OK] Local APIC enabled (spurious vector 0x255)
+[..] Initializing I/O APIC...
+  [IOAPIC] Phys: 0x00000000FEC00000  Virt: 0xFFFFFFFFC0001000  ID: 0  Ver: 32  RedirEntries: 24
+[OK] I/O APIC initialized (all IRQs masked)
+
+[..] Testing kernel heap...
+[OK] kmalloc: p1=0xFFFFFFFFA0000010 p2=0xFFFFFFFFA00000A0 p3=0xFFFFFFFFA00001B0
+[OK] kfree + kmalloc: p4=0xFFFFFFFFA0000010
+[OK] Heap stats: 0 KB used, 3 KB free
+
+SukiOS booted successfully!

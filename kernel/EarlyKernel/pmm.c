@@ -20,8 +20,12 @@ static uint8_t pmm_bitmap[PMM_MAX_PAGES / 8];
 static uint64_t total_pages;
 static uint64_t used_pages;
 
-/* 内核结束物理地址（由链接脚本提供） */
-extern uint64_t __kernel_phys_end;
+/* 内核结束物理地址（由链接脚本提供）
+ *
+ * 链接脚本中 PROVIDE(__kernel_phys_end = LOADADDR(.bss) + SIZEOF(.bss))
+ * 创建的符号 __kernel_phys_end 的【地址】等于物理结束地址。
+ * 因此用 extern char[] 声明，取符号地址 (&) 即为物理结束地址。 */
+extern char __kernel_phys_end[];
 
 /* 简易 memset */
 static void mem_set(void *dst, int val, size_t n)
@@ -77,7 +81,8 @@ void pmm_init(struct multiboot2_mmap_entry *entries, uint32_t count)
     /* 3. 将内核占用的物理内存标记为已使用
      * 包括页表（0x70000-0x76FFF）、bootstrap（0x100000-0x10FFFF）、
      * 以及内核代码/数据/BSS（0x110000 - __kernel_phys_end） */
-    uint64_t kernel_end_page = (__kernel_phys_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t kernel_end_phys = (uint64_t)(uintptr_t)__kernel_phys_end;
+    uint64_t kernel_end_page = (kernel_end_phys + PAGE_SIZE - 1) / PAGE_SIZE;
 
     for (uint64_t p = 0; p < kernel_end_page && p < PMM_MAX_PAGES; p++) {
         if (!bitmap_test(p)) {

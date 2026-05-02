@@ -94,11 +94,11 @@ iso: $(KERNEL_ELF)
 
 # 在 QEMU 中运行
 run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -m 128M -serial stdio
+	qemu-system-x86_64 -cdrom $(ISO) -m 128M -serial file:serial.log
 
 # 直接通过 QEMU 内核加载运行
 run-direct: $(KERNEL_ELF)
-	qemu-system-x86_64 -kernel $(KERNEL_ELF) -m 128M
+	qemu-system-x86_64 -kernel $(KERNEL_ELF) -m 128M -serial file:serial.log
 
 # GDB 调试
 debug: iso
@@ -109,3 +109,4 @@ debug: iso
 # 清理
 clean:
 	rm -rf $(BUILD_DIR)
+	rm serial.log

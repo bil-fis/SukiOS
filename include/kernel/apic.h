@@ -4,6 +4,7 @@
  * 参考：OSDev APIC, Intel SDM Vol.3 Chapter 10
  *
  * 包含 Local APIC 和 I/O APIC 的初始化。
+ * MMIO 基地址通过 VMM 映射到内核专用 MMIO 区域。
  * ============================================================================= */
 
 #ifndef SUKIOS_APIC_H
@@ -40,11 +41,24 @@
 /* ---- 伪中断向量 ---- */
 #define APIC_SPURIOUS_VECTOR    0xFF
 
-/* ---- 全局 APIC MMIO 基地址（由 apic_init 设置） ---- */
+/* ---- 全局 APIC MMIO 基地址（由 apic_init 设置，通过 VMM 映射） ---- */
 extern volatile uint32_t *apic_lapic_base;
 extern volatile uint32_t *apic_ioapic_base;
 
 /* ---- 函数声明 ---- */
+
+/**
+ * apic_init - 初始化 APIC 子系统
+ *
+ * 前置条件：VMM 已初始化（vmm_init()）
+ *
+ * 步骤：
+ *   1. 解析 ACPI MADT 获取 APIC 地址
+ *   2. 通过 MSR 启用 Local APIC
+ *   3. 使用 VMM 永久映射 LAPIC/IOAPIC MMIO
+ *   4. 配置 Spurious Interrupt Vector
+ *   5. 初始化 I/O APIC（屏蔽所有重定向条目）
+ */
 void apic_init(void);
 
 /* Local APIC 寄存器读写 */

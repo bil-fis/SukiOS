@@ -3,6 +3,7 @@
  * ============================================================================= */
 
 #include "kernel/tty.h"
+#include "kernel/uart.h"
 
 #define VGA_WIDTH    80
 #define VGA_HEIGHT   25
@@ -47,15 +48,11 @@ static void tty_scroll(void)
         term_buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = vga_entry(' ', term_color);
 }
 
-static size_t str_len(const char *s)
-{
-    size_t len = 0;
-    while (s[len]) len++;
-    return len;
-}
-
 void tty_init(void)
 {
+    /* 先初始化串口，再初始化 VGA */
+    uart_init();
+
     term_row = 0;
     term_col = 0;
     term_color = vga_color(VGA_LIGHT_GREY, VGA_BLACK);
@@ -75,6 +72,9 @@ void tty_setcolor(uint8_t fg, uint8_t bg)
 
 void tty_putchar(char c)
 {
+    /* 同步输出到 COM1 串口 */
+    uart_putchar(c);
+
     if (c == '\n') {
         term_col = 0;
         if (++term_row == VGA_HEIGHT) {

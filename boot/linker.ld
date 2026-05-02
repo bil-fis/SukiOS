@@ -80,7 +80,7 @@ SECTIONS
 
     /* 内核结束符号（供 PMM 使用） */
     PROVIDE(__kernel_virt_end = .);
-    PROVIDE(__kernel_phys_end = ADDR(.bss) + SIZEOF(.bss));
+    PROVIDE(__kernel_phys_end = LOADADDR(.bss) + SIZEOF(.bss));
 
     /* Discard unnecessary sections */
     /DISCARD/ :

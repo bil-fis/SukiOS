@@ -4,57 +4,28 @@
  * 参考：OSDev APIC, Intel SDM Vol.3 Chapter 10
  *
  * 初始化流程：
- *   1. 扩展身份映射以覆盖 MMIO 区域（0-4GB）
- *   2. 解析 ACPI MADT 获取 APIC 地址
- *   3. 通过 MSR 启用 Local APIC
+ *   1. 解析 ACPI MADT 获取 APIC 地址
+ *   2. 通过 MSR 启用 Local APIC
+ *   3. 使用 VMM 永久映射 LAPIC/IOAPIC MMIO 到内核地址空间
  *   4. 配置 Spurious Interrupt Vector Register
  *   5. 初始化 I/O APIC（屏蔽所有重定向条目）
  * ============================================================================= */
 
 #include "kernel/apic.h"
 #include "kernel/acpi.h"
+#include "kernel/vmm.h"
 #include "kernel/tty.h"
 #include "kernel/io.h"
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ---- 页表物理地址（与 boot.asm 一致） ---- */
-#define PML4_ADDR       0x70000
-#define PDPTE_A_ADDR    0x71000
-
 /* ---- 全局 APIC MMIO 基地址 ---- */
 volatile uint32_t *apic_lapic_base = NULL;
 volatile uint32_t *apic_ioapic_base = NULL;
 
-/* =========================================================================
- * 身份映射扩展
- *
- * 当前页表仅映射 0-4MB（4KB 页）和内核高半区。
- * APIC MMIO 地址通常在 0xFEC00000 / 0xFEE00000，超出已有映射范围。
- *
- * 方案：在 PDPTE_A 中添加 1GB 大页条目，将物理 1GB-4GB 映射为身份映射。
- * 使用 PS=1（Page Size）位实现，无需分配额外的 PD/PT 页。
- * ========================================================================= */
-static void extend_identity_map(void)
-{
-    /* 将 PDPTE_A[0..3] 全部设为 1GB 大页，实现 0-4GB 完整身份映射
-     *
-     * 注意：覆盖 PDPTE_A[0] 会丢失 0-4MB 的 4KB 细粒度映射，
-     *       但内核已在高半区运行，不再需要低地址的精细映射。
-     *
-     * flags: P=1(bit0) + RW=1(bit1) + PS=1(bit7) = 0x83
-     * 参考：Intel SDM Vol.3 Figure 4-5: 1-GByte Page Table Entry */
-    volatile uint64_t *pdpte = (volatile uint64_t *)(uintptr_t)PDPTE_A_ADDR;
-    for (int i = 0; i <= 3; i++) {
-        uint64_t phys = (uint64_t)i * 0x40000000ULL;  /* i * 1GB */
-        pdpte[i] = phys | 0x83;
-    }
-
-    /* 刷新整个 TLB（重载 CR3，参考 Intel SDM Vol.3 4.10.4） */
-    uintptr_t cr3;
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    __asm__ volatile ("mov %0, %%cr3" :: "r"(cr3) : "memory");
-}
+/* ---- MMIO 映射大小 ---- */
+#define LAPIC_MMIO_SIZE    0x1000   /* 4KB 足够覆盖所有 LAPIC 寄存器 */
+#define IOAPIC_MMIO_SIZE   0x1000   /* 4KB 足够覆盖 IOAPIC 寄存器窗口 */
 
 /* =========================================================================
  * Local APIC 寄存器访问
@@ -127,18 +98,29 @@ static void lapic_init(uint32_t lapic_phys_addr)
         wrmsr(IA32_APIC_BASE_MSR, msr);
     }
 
-    apic_lapic_base = (volatile uint32_t *)(uintptr_t)base;
+    /* 3. 使用 VMM 永久映射 LAPIC MMIO
+     * 将物理 MMIO 地址映射到内核专用 MMIO 虚拟区域
+     * 参考：OSDev MMIO, Intel SDM Vol.3 10.4.1 */
+    uint64_t lapic_virt = vmm_map_mmio(base, LAPIC_MMIO_SIZE);
+    if (!lapic_virt) {
+        tty_setcolor(VGA_RED, VGA_BLACK);
+        tty_print("  ERROR: Failed to map LAPIC MMIO!\n");
+        return;
+    }
+    apic_lapic_base = (volatile uint32_t *)(uintptr_t)lapic_virt;
 
-    /* 3. 打印 LAPIC 信息 */
-    tty_print("  [LAPIC] Base: ");
+    /* 4. 打印 LAPIC 信息 */
+    tty_print("  [LAPIC] Phys: ");
     tty_print_hex64(base);
+    tty_print("  Virt: ");
+    tty_print_hex64(lapic_virt);
     tty_print("  ID: ");
     tty_print_dec(lapic_read(LAPIC_ID_REG) >> 24);
     tty_print("  Version: ");
     tty_print_dec(lapic_read(LAPIC_VERSION_REG) & 0xFF);
     tty_putchar('\n');
 
-    /* 4. 设置 Spurious Interrupt Vector Register（SVR）
+    /* 5. 设置 Spurious Interrupt Vector Register（SVR）
      *   bit 8 = 软件启用 APIC（开始接收中断）
      *   bits 0-7 = 伪中断向量号（最低 4 位必须为 1，使用 0xFF） */
     lapic_write(LAPIC_SVR, LAPIC_SVR_ENABLE | APIC_SPURIOUS_VECTOR);
@@ -149,7 +131,14 @@ static void lapic_init(uint32_t lapic_phys_addr)
  * ========================================================================= */
 static void ioapic_init(uint32_t ioapic_phys_addr)
 {
-    apic_ioapic_base = (volatile uint32_t *)(uintptr_t)ioapic_phys_addr;
+    /* 使用 VMM 永久映射 IOAPIC MMIO */
+    uint64_t ioapic_virt = vmm_map_mmio(ioapic_phys_addr, IOAPIC_MMIO_SIZE);
+    if (!ioapic_virt) {
+        tty_setcolor(VGA_RED, VGA_BLACK);
+        tty_print("  ERROR: Failed to map IOAPIC MMIO!\n");
+        return;
+    }
+    apic_ioapic_base = (volatile uint32_t *)(uintptr_t)ioapic_virt;
 
     /* 读取 I/O APIC 信息 */
     uint32_t id_raw = ioapic_read(IOAPIC_ID_REG);
@@ -158,8 +147,10 @@ static void ioapic_init(uint32_t ioapic_phys_addr)
     uint8_t  version = ver_raw & 0xFF;
     uint8_t  max_redir = ((ver_raw >> 16) & 0xFF) + 1;
 
-    tty_print("  [IOAPIC] Base: ");
+    tty_print("  [IOAPIC] Phys: ");
     tty_print_hex64(ioapic_phys_addr);
+    tty_print("  Virt: ");
+    tty_print_hex64(ioapic_virt);
     tty_print("  ID: ");
     tty_print_dec(ioapic_id);
     tty_print("  Ver: ");
@@ -181,12 +172,10 @@ static void ioapic_init(uint32_t ioapic_phys_addr)
  * ========================================================================= */
 void apic_init(void)
 {
-    /* 1. 扩展身份映射（访问 MMIO 区域所需） */
-    tty_print("[..] Extending identity map for MMIO...\n");
-    extend_identity_map();
-    tty_print("[OK] Identity map: 0-4GB\n");
+    /* 注意：VMM 已在 apic_init() 调用前由 init_kernel 初始化
+     * VMM 保留了 0-4GB 身份映射，可直接访问 ACPI 表 */
 
-    /* 2. 搜索 RSDP */
+    /* 1. 搜索 RSDP */
     tty_print("[..] Searching for RSDP...\n");
     struct acpi_rsdp *rsdp = acpi_find_rsdp();
     if (!rsdp) {
@@ -201,7 +190,7 @@ void apic_init(void)
     tty_print_dec(rsdp->revision);
     tty_putchar('\n');
 
-    /* 3. 查找 MADT 表 */
+    /* 2. 查找 MADT 表 */
     tty_print("[..] Locating MADT table...\n");
     struct acpi_sdt_header *madt_hdr = acpi_find_table(rsdp, "APIC");
     if (!madt_hdr) {
@@ -211,7 +200,7 @@ void apic_init(void)
         return;
     }
 
-    /* 4. 解析 MADT */
+    /* 3. 解析 MADT */
     struct acpi_madt_info info = acpi_parse_madt(madt_hdr);
 
     tty_print("[OK] MADT parsed  LAPIC: ");
@@ -222,7 +211,7 @@ void apic_init(void)
     }
     tty_putchar('\n');
 
-    /* 5. 初始化 Local APIC */
+    /* 4. 初始化 Local APIC */
     tty_print("[..] Initializing Local APIC...\n");
     lapic_init(info.lapic_addr);
     tty_setcolor(VGA_GREEN, VGA_BLACK);
@@ -231,7 +220,7 @@ void apic_init(void)
     tty_print(")\n");
     tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
 
-    /* 6. 初始化 I/O APIC */
+    /* 5. 初始化 I/O APIC */
     if (info.ioapic_found) {
         tty_print("[..] Initializing I/O APIC...\n");
         ioapic_init(info.ioapic_addr);

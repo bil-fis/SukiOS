@@ -83,6 +83,7 @@ int  fat32_read(fat32_file_t *file, void *buf, uint32_t size);
 int  fat32_write(fat32_file_t *file, const void *buf, uint32_t size);
 void fat32_close(fat32_file_t *file);
 int  fat32_create_file(fat32_fs_t *fs, const char *filename, fat32_file_t *file);
+int fat32_delete(fat32_fs_t *fs, const char *filename);
 
 /* 目录操作 */
 void fat32_list_root(fat32_fs_t *fs);

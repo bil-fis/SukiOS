@@ -146,6 +146,17 @@ void init_kernel(void)
     tty_print("[..] Root directory updated:\n");
     fat32_list_root(&fs);
 
+    tty_print("[..] Deleting HELLO.TXT...\n");
+    if (fat32_delete(&fs, "HELLO.TXT") == 0) {
+        tty_print("[OK] HELLO.TXT deleted.\n");
+    } else {
+        tty_print("[FAIL] Could not delete HELLO.TXT.\n");
+    }
+
+    // 再次列出根目录，确认文件已消失
+    tty_print("[..] Root directory after deletion:\n");
+    fat32_list_root(&fs);
+
     tty_print("\n[..] Initializing LAPIC Timer...\n");
     irq_register_handler(0, apic_timer_irq_handler);
     apic_timer_init();

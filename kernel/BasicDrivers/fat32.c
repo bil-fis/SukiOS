@@ -3,10 +3,10 @@
 #include "kernel/tty.h"
 #include "kernel/heap.h"
 
+/* ====== 磁盘物理读写 ====== */
 static int disk_read(uint32_t lba, uint32_t count, void *buf) {
     for (uint32_t i = 0; i < count; ++i)
-        if (!ide_read_sector(lba + i, (uint8_t*)buf + i * 512))
-            return -1;
+        if (!ide_read_sector(lba + i, (uint8_t*)buf + i * 512)) return -1;
     return 0;
 }
 
@@ -22,6 +22,7 @@ static int disk_write(uint32_t lba, uint32_t count, const void *buf) {
     return 0;
 }
 
+/* ====== 短文件名转换 ====== */
 static void to_short(const char *in, char out[11]) {
     int i = 0, j = 0;
     for (int k = 0; k < 11; ++k) out[k] = ' ';
@@ -37,11 +38,14 @@ static void to_short(const char *in, char out[11]) {
     }
 }
 
+/* ====== FAT 表辅助函数 ====== */
 #define FAT_EOF        0x0FFFFFF8
+
 static inline uint32_t fat_next_cluster(fat32_fs_t *fs, uint32_t cluster) {
     if (cluster < 2 || cluster >= fs->total_clusters + 2) return FAT_EOF;
     return fs->fat[cluster] & 0x0FFFFFFF;
 }
+
 static inline uint32_t cluster_to_lba(fat32_fs_t *fs, uint32_t cluster) {
     return fs->first_data_sector + (cluster - 2) * fs->sectors_per_cluster;
 }
@@ -52,7 +56,7 @@ static uint32_t find_free_cluster(fat32_fs_t *fs) {
     return 0;
 }
 
-/* 挂载 */
+/* ====== 挂载/卸载 ====== */
 int fat32_mount(fat32_fs_t *fs) {
     uint8_t boot[512];
     if (disk_read(0, 1, boot)) return -1;
@@ -67,7 +71,7 @@ int fat32_mount(fat32_fs_t *fs) {
         return -1;
     }
 
-    fs->bytes_per_sector   = 512;
+    fs->bytes_per_sector    = 512;
     fs->sectors_per_cluster = bpb->sectors_per_cluster;
     fs->root_cluster        = bpb->root_cluster;
     fs->fat_start_sector    = bpb->reserved_sectors;
@@ -97,6 +101,7 @@ void fat32_unmount(fat32_fs_t *fs) {
     if (fs->fat) { kfree(fs->fat); fs->fat = NULL; }
 }
 
+/* ====== 列出根目录 ====== */
 void fat32_list_root(fat32_fs_t *fs) {
     uint32_t cluster = fs->root_cluster;
     uint8_t *buf = (uint8_t*)kmalloc(fs->sectors_per_cluster * 512);
@@ -122,6 +127,7 @@ void fat32_list_root(fat32_fs_t *fs) {
     kfree(buf);
 }
 
+/* ====== 打开文件 ====== */
 int fat32_open(fat32_fs_t *fs, const char *filename, fat32_file_t *file) {
     char target[11]; to_short(filename, target);
 
@@ -159,6 +165,7 @@ int fat32_open(fat32_fs_t *fs, const char *filename, fat32_file_t *file) {
     return -1;
 }
 
+/* ====== 读取文件 ====== */
 int fat32_read(fat32_file_t *file, void *buf, uint32_t size) {
     uint8_t *dst = (uint8_t*)buf;
     uint32_t remain = size;
@@ -186,6 +193,7 @@ int fat32_read(fat32_file_t *file, void *buf, uint32_t size) {
     return (int)(size - remain);
 }
 
+/* ====== 写入文件 ====== */
 int fat32_write(fat32_file_t *file, const void *buf, uint32_t size) {
     const uint8_t *src = (const uint8_t*)buf;
     uint32_t remain = size;
@@ -225,32 +233,26 @@ int fat32_write(fat32_file_t *file, const void *buf, uint32_t size) {
     return (int)size;
 }
 
-static int fat32_update_dir_entry(fat32_file_t *file)
-{
-    if (!file->fs || file->size == 0)   // 如果大小为 0，也更新（可能刚创建）
-        ;
+/* ====== 更新目录项大小 ====== */
+static int fat32_update_dir_entry(fat32_file_t *file) {
+    if (!file->fs) return -1;
 
     fat32_fs_t *fs = file->fs;
     uint32_t cluster = fs->root_cluster;
     uint8_t *buf = (uint8_t*)kmalloc(fs->sectors_per_cluster * 512);
     if (!buf) return -1;
 
-    // 遍历根目录，寻找起始簇匹配的目录项
-    while (cluster < 0x0FFFFFF8 && cluster >= 2) {
-        if (disk_read(cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf))
-            break;
-
+    while (cluster < FAT_EOF && cluster >= 2) {
+        if (disk_read(cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf)) break;
         fat32_dir_entry_t *e = (fat32_dir_entry_t*)buf;
-        for (int i = 0; i < (512 * fs->sectors_per_cluster) / sizeof(fat32_dir_entry_t); ++i) {
+        int count = (fs->sectors_per_cluster * 512) / sizeof(fat32_dir_entry_t);
+        for (int i = 0; i < count; ++i) {
             if ((unsigned char)e[i].name[0] == 0x00) break;
             if ((unsigned char)e[i].name[0] == 0xE5) continue;
             if (e[i].attr == 0x0F) continue;
-
             uint32_t ent_cluster = e[i].first_cluster_low | ((uint32_t)e[i].first_cluster_high << 16);
             if (ent_cluster == file->start_cluster) {
-                // 更新文件大小（也可以更新时间和日期，此处暂略）
                 e[i].file_size = file->size;
-                // 写回目录簇
                 if (disk_write(cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf)) {
                     kfree(buf);
                     return -1;
@@ -265,12 +267,14 @@ static int fat32_update_dir_entry(fat32_file_t *file)
     return -1;
 }
 
+/* ====== 关闭文件 ====== */
 void fat32_close(fat32_file_t *file) {
     if (!file->fs) return;
     fat32_update_dir_entry(file);
     fat32_flush(file->fs);
 }
 
+/* ====== 强制写回FAT表 ====== */
 void fat32_flush(fat32_fs_t *fs) {
     if (!fs->fat || !fs->fat_size_sectors) return;
     tty_print("[FAT32] Writing FAT...\n");
@@ -278,6 +282,7 @@ void fat32_flush(fat32_fs_t *fs) {
     tty_print("[FAT32] FAT flushed.\n");
 }
 
+/* ====== 创建文件 ====== */
 int fat32_create_file(fat32_fs_t *fs, const char *filename, fat32_file_t *file) {
     char target[11]; to_short(filename, target);
 
@@ -322,5 +327,82 @@ int fat32_create_file(fat32_fs_t *fs, const char *filename, fat32_file_t *file) 
     file->size = 0;
     file->offset = 0;
     fat32_flush(fs);
+    return 0;
+}
+
+/* ====== 释放簇链 ====== */
+static int fat32_free_cluster_chain(fat32_fs_t *fs, uint32_t start_cluster) {
+    uint32_t cluster = start_cluster;
+    while (cluster >= 2 && cluster < FAT_EOF) {
+        uint32_t next = fs->fat[cluster] & 0x0FFFFFFF;
+        fs->fat[cluster] = 0;          // 清零，表示空闲
+        if (next >= FAT_EOF) break;
+        cluster = next;
+    }
+    return 0;
+}
+
+/* ====== 删除文件 ====== */
+int fat32_delete(fat32_fs_t *fs, const char *filename) {
+    char target[11]; to_short(filename, target);
+
+    // 1. 在根目录中找到对应目录项
+    uint32_t dir_cluster = fs->root_cluster;
+    uint8_t *buf = (uint8_t*)kmalloc(fs->sectors_per_cluster * 512);
+    if (!buf) return -1;
+
+    int found = 0;
+    uint32_t file_first_cluster = 0;
+    uint32_t entry_cluster = 0;
+    int entry_index = 0;
+
+    while (dir_cluster < FAT_EOF && dir_cluster >= 2) {
+        if (disk_read(cluster_to_lba(fs, dir_cluster), fs->sectors_per_cluster, buf)) break;
+        fat32_dir_entry_t *e = (fat32_dir_entry_t*)buf;
+        int count = (fs->sectors_per_cluster * 512) / sizeof(fat32_dir_entry_t);
+        for (int i = 0; i < count; ++i) {
+            if ((unsigned char)e[i].name[0] == 0x00) break;
+            if ((unsigned char)e[i].name[0] == 0xE5) continue;
+            if (e[i].attr == 0x0F) continue;
+
+            int match = 1;
+            for (int j = 0; j < 11; ++j) {
+                char a = e[i].name[j];
+                if (a >= 'a' && a <= 'z') a -= 32;
+                if (a != target[j]) { match = 0; break; }
+            }
+            if (match) {
+                file_first_cluster = e[i].first_cluster_low | ((uint32_t)e[i].first_cluster_high << 16);
+                e[i].name[0] = 0xE5;      // 标记已删除
+                entry_cluster = dir_cluster;
+                entry_index = i;
+                found = 1;
+                break;  // 跳出内层 for，仍需写回目录
+            }
+        }
+        if (found) break;
+        dir_cluster = fat_next_cluster(fs, dir_cluster);
+    }
+
+    if (!found) {
+        kfree(buf);
+        return -1;
+    }
+
+    // 2. 将修改后的目录簇写回磁盘
+    if (disk_write(cluster_to_lba(fs, entry_cluster), fs->sectors_per_cluster, buf)) {
+        kfree(buf);
+        return -1;
+    }
+    kfree(buf);
+
+    // 3. 释放文件占用的所有簇
+    if (file_first_cluster != 0) {
+        fat32_free_cluster_chain(fs, file_first_cluster);
+    }
+
+    // 4. 刷新 FAT 表
+    fat32_flush(fs);
+
     return 0;
 }

@@ -51,7 +51,7 @@ ISO            = $(BUILD_DIR)/sukios.iso
 
 LINKER   = boot/linker.ld
 GRUB_CFG = boot/grub.cfg
-.PHONY: all verify iso run run-direct debug clean dirs
+.PHONY: all verify iso run run-direct debug clean dirs disk
 
 # 默认目标：编译内核
 all: dirs $(KERNEL_ELF)
@@ -110,3 +110,7 @@ debug: iso
 clean:
 	rm -rf $(BUILD_DIR)
 	rm -f serial.log
+
+disk:
+	qemu-img create disk.img 64M
+	mkfs.vfat -F 32 disk.img

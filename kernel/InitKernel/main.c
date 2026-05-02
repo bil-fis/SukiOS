@@ -124,6 +124,28 @@ void init_kernel(void)
         tty_print("[FAIL] FAT32 mount failed.\n");
     }
 
+    tty_print("[..] Creating HELLO.TXT and writing data...\n");
+    fat32_file_t wfile;
+    if (fat32_create_file(&fs, "HELLO.TXT", &wfile) == 0) {
+        const char *msg = "Hello from SukiOS!\n";   // 22 字节（包括换行）
+        // 手动计算长度（因为你没有 strlen）
+        int len = 0;
+        while (msg[len]) len++;
+
+        int written = fat32_write(&wfile, msg, len);
+        fat32_close(&wfile);
+
+        tty_print("[OK] Written ");
+        tty_print_dec(written);
+        tty_print(" bytes to HELLO.TXT.\n");
+    } else {
+        tty_print("[FAIL] Could not create HELLO.TXT.\n");
+    }
+
+    // 重新列出根目录，查看结果
+    tty_print("[..] Root directory updated:\n");
+    fat32_list_root(&fs);
+
     tty_print("\n[..] Initializing LAPIC Timer...\n");
     irq_register_handler(0, apic_timer_irq_handler);
     apic_timer_init();

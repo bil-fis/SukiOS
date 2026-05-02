@@ -19,6 +19,7 @@
 #define VGA_BROWN       6
 #define VGA_LIGHT_GREY  7
 #define VGA_DARK_GREY   8
+#define VGA_YELLOW      14
 #define VGA_WHITE       15
 
 void tty_init(void);

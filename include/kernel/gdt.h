@@ -57,4 +57,24 @@ extern struct tss_entry kernel_tss;
 
 void gdt_init(void);
 
+/* ---- syscall/sysret MSR 定义 ----
+ * 参考：AMD64 APM Vol.2 12.4.1 (SYSCALL/SYSRET), Intel SDM Vol.3 4.9
+ *
+ * syscall 指令：
+ *   - RCX ← RIP（返回地址）
+ *   - R11 ← RFLAGS
+ *   - 清除 IA32_FMASK 中对应的 RFLAGS 位
+ *   - CS ← STAR[47:32] + 0x08（Ring 3 CS）→ 变为 STAR[63:48]
+ *   - SS ← STAR[47:32] + 0x10（Ring 3 SS）
+ * sysret 指令：
+ *   - RIP ← RCX
+ *   - RFLAGS ← R11
+ *   - CS ← STAR[47:32] + 0x10（Ring 3 CS）
+ *   - SS ← STAR[47:32] + 0x18（Ring 3 SS） */
+#define MSR_IA32_STAR   0xC0000081  /* 段选择子基础（CS/SS 对） */
+#define MSR_IA32_LSTAR  0xC0000082  /* syscall 入口点 RIP */
+#define MSR_IA32_FMASK  0xC0000084  /* syscall 清除的 RFLAGS 位 */
+#define MSR_IA32_EFER   0xC0000080  /* 扩展功能启用寄存器 */
+#define EFER_SCE        (1ULL << 0) /* System Call Extension（启用 syscall） */
+
 #endif /* SUKIOS_GDT_H */

@@ -36,12 +36,21 @@ struct idt_ptr {
 
 /* 中断帧（ISR 栈上的寄存器快照）
  * 布局与 idt_stubs.asm 中的压栈顺序严格对应。
+ *
+ * ISR 存根压栈顺序（先压的在低地址，后压的在高地址）：
+ *   push rax   → 偏移 15*8 = 120
+ *   push rbx   → 偏移 14*8 = 112
+ *   ...
+ *   push r15   → 偏移 0
+ *   mov rdi, rsp → RDI 指向 r15
+ *
+ * 因此结构体中 r15 在 offset 0，rax 在 offset 15*8。
  * 当中断发生特权级切换（ring3→ring0）时，CPU 额外压入 SS 和 RSP。
  * 参考：Intel SDM Vol.3 Figure 6-8 (64-bit mode interrupt stack frame) */
 struct interrupt_frame {
-    /* 由 ISR 存根压入的通用寄存器（保存顺序与 idt_stubs.asm 一致） */
-    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp;
-    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    /* 由 ISR 存根压入的通用寄存器（r15 在栈顶 = offset 0） */
+    uint64_t r15, r14, r13, r12, r11, r10;
+    uint64_t r9, r8, rbp, rdi, rsi, rdx, rcx, rbx, rax;
     /* 由 ISR 存根压入 */
     uint64_t int_no;
     uint64_t err_code;        /* 无错误码的异常压入 0 占位 */
@@ -67,5 +76,40 @@ void irq_handler(struct interrupt_frame *frame);
  * @handler: 处理函数，参数为中断号 */
 typedef void (*irq_handler_fn)(uint8_t int_no);
 void irq_register_handler(uint8_t irq_num, irq_handler_fn handler);
+
+/* ---- syscall/sysret 支持 ----
+ * 参考：AMD64 APM Vol.2 12.4.1, Intel SDM Vol.3 4.9
+ *
+ * syscall 存根在 idt_stubs.asm 中定义：
+ *   - 保存用户态寄存器到 struct syscall_frame
+ *   - 调用 C 语言 syscall_handler
+ *   - 恢复寄存器并通过 sysretq 返回 Ring 3
+ *
+ * syscall 约定（Linux x86_64 ABI）：
+ *   RAX = 系统调用编号
+ *   RDI, RSI, RDX, R10, R8, R9 = 参数
+ *   返回值在 RAX
+ *   syscall 指令自动保存 RIP→RCX, RFLAGS→R11 */
+
+struct syscall_frame {
+    /* 由 syscall 存根压入的通用寄存器 */
+    uint64_t rax;          /* 系统调用编号 / 返回值 */
+    uint64_t rdi;          /* 第 1 个参数 */
+    uint64_t rsi;          /* 第 2 个参数 */
+    uint64_t rdx;          /* 第 3 个参数 */
+    uint64_t r10;          /* 第 4 个参数 */
+    uint64_t r8;           /* 第 5 个参数 */
+    uint64_t r9;           /* 第 6 个参数 */
+    /* 由 CPU 自动保存（syscall 指令） */
+    uint64_t rcx;          /* 返回地址（RIP） */
+    uint64_t r11;          /* 保存的 RFLAGS */
+    uint64_t rip;          /* 返回地址副本（用于调试） */
+};
+
+void syscall_handler(struct syscall_frame *frame);
+
+/* Ring 3 切换存根（在 idt_stubs.asm 中定义）
+ * 通过 iretq 切换到 Ring 3 用户态 */
+extern void enter_ring3(uint64_t rip, uint64_t rsp);
 
 #endif /* SUKIOS_IDT_H */

@@ -109,4 +109,4 @@ debug: iso
 # 清理
 clean:
 	rm -rf $(BUILD_DIR)
-	rm serial.log
+	rm -f serial.log

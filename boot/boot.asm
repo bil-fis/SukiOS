@@ -34,13 +34,17 @@ PD_B_ADDR       equ 0x75000
 PT_B_ADDR       equ 0x76000
 
 ; ===== GDT 标志 =====
+; Access byte (byte 5):
 PRESENT         equ (1 << 7)
 NOT_SYS         equ (1 << 4)
 EXEC            equ (1 << 3)
 RW              equ (1 << 1)
-GRAN_4K         equ (1 << 7)
-SZ_32           equ (1 << 6)
-LONG_MODE       equ (1 << 5)
+; Flags nibble (byte 6, bits 7:4):
+;   bit7 = G (Granularity), bit6 = D/B, bit5 = L (Long mode), bit4 = AVL
+; 参考：Intel SDM Vol.3 Figure 3-8 "Segment Descriptor", OSDev GDT
+GRAN_4K         equ (1 << 7)    ; G = bit7
+SZ_32           equ (1 << 6)    ; D/B = bit6
+LONG_MODE       equ (1 << 5)    ; L = bit5
 
 ; =============================================================================
 ; Multiboot2 Header（必须在 32KB 以内，8 字节对齐）

@@ -290,5 +290,121 @@ irq_common_stub:
     add rsp, 16
     iretq
 
-; 消除 "missing .note.GNU-stack" 链接器警告
-section .note.GNU-stack noalloc noexec nowrite progbits
+; =============================================================================
+; syscall 存根（Ring 3 → Ring 0 快速系统调用）
+;
+; syscall 指令执行流程（硬件自动完成）：
+;   RCX ← RIP（返回地址）
+;   R11 ← RFLAGS
+;   RSP 不变（syscall 不自动切换栈，需要手动处理）
+;   CS ← IA32_STAR[63:48]（Ring 0 内核代码段）
+;   SS ← IA32_STAR[47:32] + 0x08（Ring 0 内核数据段）
+;
+; 参考：AMD64 APM Vol.2 12.4.1, Intel SDM Vol.3 4.9, OSDev SYSCALL
+; =============================================================================
+
+extern syscall_handler
+
+; GDT 选择子（与 gdt.h 中的定义一致）
+%define GDT_SELECTOR_USER_CS    0x18
+%define GDT_SELECTOR_USER_DS    0x20
+
+section .text
+
+global syscall_stub
+global user_rsp_save
+syscall_stub:
+    ; ---- 保存用户 RSP 并切换到内核栈 ----
+    ; syscall 不自动切换 RSP，必须手动处理
+    mov [rel user_rsp_save], rsp
+    lea rsp, [rel kernel_interrupt_stack_top]
+
+    ; ---- 保存寄存器（与 syscall_frame 结构体顺序一致） ----
+    push rax                        ; [0] rax - 系统调用编号 / 返回值
+    push rdi                        ; [8] rdi - 参数 1
+    push rsi                        ; [16] rsi - 参数 2
+    push rdx                        ; [24] rdx - 参数 3
+    push r10                        ; [32] r10 - 参数 4（syscall clobbers rcx，用 r10 代替）
+    push r8                         ; [40] r8  - 参数 5
+    push r9                         ; [48] r9  - 参数 6
+    push rcx                        ; [56] rcx - 保存的 RIP（syscall 自动保存）
+    push r11                        ; [64] r11 - 保存的 RFLAGS（syscall 自动保存）
+
+    ; 调用 C 语言 syscall_handler（返回值在 RAX）
+    mov rdi, rsp                    ; RDI = 指向 syscall_frame 的指针
+    call syscall_handler            ; RAX = 返回值
+
+    ; ---- 恢复寄存器 ----
+    pop r11                         ; 恢复 RFLAGS → R11（sysretq 需要这个）
+    pop rcx                         ; 恢复 RIP → RCX（sysretq 需要这个）
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
+    add rsp, 8                      ; 跳过 rax（返回值已在 RAX 寄存器中）
+
+    ; ---- 切换回用户栈 ----
+    mov rsp, [rel user_rsp_save]
+
+    ; sysretq 恢复：RIP ← RCX, RFLAGS ← R11
+    ; CS ← STAR[47:32] + 0x10 = Ring 3 CS (0x18)
+    ; SS ← STAR[47:32] + 0x18 = Ring 3 DS (0x20)
+    sysretq
+
+; 用户 RSP 保存位置（每 CPU）
+section .bss align=8
+user_rsp_save:
+    resq 1
+
+; =============================================================================
+; Ring 3 切换存根（Ring 0 → Ring 3）
+;
+; 通过 iretq 指令切换到 Ring 3 用户态。
+; 参数：RDI = 用户程序入口 RIP, RSI = 用户栈顶 RSP
+; 参考：OSDev Getting to Ring 3, Intel SDM Vol.3 6.14.1
+; =============================================================================
+
+section .text
+
+global enter_ring3
+enter_ring3:
+    ; 参数：RDI = RIP（用户程序入口）, RSI = RSP（用户栈顶）
+    ; 使用 iretq 切换到 Ring 3（不调用任何 C 函数，避免寄存器被破坏）。
+    ; 参考：OSDev Getting to Ring 3, Intel SDM Vol.3 6.14.1
+
+    ; 禁用中断：防止 push/iretq 序列被打断
+    cli
+
+    ; 保存用户 RSP，syscall_stub 返回时需要用它恢复用户栈
+    mov [rel user_rsp_save], rsi
+
+    ; 设置用户态数据段寄存器（RPL=3）
+    mov ax, (GDT_SELECTOR_USER_DS | 3)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    ; 构造 iretq 栈帧（从高地址到低地址压栈）
+    ; 关键：CS/SS 的 RPL 必须等于 3（目标 DPL），否则 #GP
+    push (GDT_SELECTOR_USER_DS | 3)   ; SS  = 0x23 (Ring 3 数据段, RPL=3)
+    push rsi                            ; RSP = 用户栈指针
+    pushfq                              ; RFLAGS（从当前 RFLAGS 复制）
+    or qword [rsp], 0x200               ; 确保 IF=1（允许用户态响应中断）
+    push (GDT_SELECTOR_USER_CS | 3)   ; CS  = 0x1B (Ring 3 代码段, RPL=3)
+    push rdi                            ; RIP = 用户程序入口
+
+    iretq                               ; 切换到 Ring 3！
+
+; ---- 用户栈（Ring 3 使用, 4 KB） ----
+; 栈向下增长，初始 RSP = user_stack_top（buffer 末尾地址）
+; 必须 4096 对齐，确保栈不跨页
+; 参考：OSDev Getting to Ring 3
+section .bss align=4096
+global user_stack_top
+global user_stack_bottom
+user_stack_bottom:
+    resb 4096
+user_stack_top:

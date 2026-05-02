@@ -40,6 +40,16 @@ void pic_init(void)
     /* 屏蔽所有 IRQ（除中断外不响应硬件中断） */
     outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
+
+    /* 切换到 APIC 中断模式
+     * 在同时存在 PIC 和 IOAPIC 的系统中，IMCR (Interrupt Mode Control Register)
+     * 决定 ISA IRQ 信号是发往 PIC 还是直接发往 APIC。
+     * 默认 PIC 模式下，IRQ 信号发往被屏蔽的 PIC，IOAPIC 收不到任何外部中断。
+     * 参考：OSDev 8259 PIC - "IMCR", Intel SDM Vol.3 10.1.3
+     *   端口 0x22 = IMCR 地址寄存器，写入 0x70 选择 IMCR
+     *   端口 0x23 = IMCR 数据寄存器，bit 0 = 1 表示 APIC 模式 */
+    outb(0x22, 0x70);
+    outb(0x23, 0x01);
 }
 
 void pic_send_eoi(uint8_t irq)

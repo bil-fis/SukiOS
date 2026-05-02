@@ -8,7 +8,7 @@ SukiOS EarlyKernel
 [OK] Boot info parsed
 [..] Initializing GDT...
 [OK] GDT initialized
-  TSS loaded  RSP0=0xFFFFFFFF8003C2D0  IST: DF=1 NMI=2 MC=3
+  TSS loaded  RSP0=0xFFFFFFFF8003C3F0  IST: DF=1 NMI=2 MC=3
 [..] Remapping PIC...
 [OK] PIC remapped
 [..] Initializing IDT...
@@ -55,6 +55,8 @@ SukiOS v0.1.0 - x86_64
 [OK] LAPIC Timer: bus_freq=4294 MHz  freq=100 Hz  init_count=2684353
 
 [..] Initializing PS/2 Keyboard...
+  [KBD] Self-test passed
+  [KBD] Scanning enabled
 [OK] PS/2 Keyboard initialized (IRQ1 -> GSI=1 vector=33)
 
 [..] Testing kernel heap...
@@ -65,4 +67,4 @@ SukiOS v0.1.0 - x86_64
 SukiOS booted successfully!
 
 Keyboard ready. Type something:
-> dim  dimsum 2212211244444444444444444 
+> ddddddddddddddda        			 fffffffffffffff suanluobobiechi ;.>><>,./.[][p{}" sanbabababbuba

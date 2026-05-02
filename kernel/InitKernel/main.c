@@ -63,6 +63,9 @@ void init_kernel(void)
     irq_register_handler(1, keyboard_irq_handler);
     keyboard_init();
 
+    /* 注册定时器回调驱动按键重复 */
+    apic_timer_set_callback(keyboard_timer_tick);
+
     /* ---- 6. 验证堆分配 ---- */
     tty_print("\n[..] Testing kernel heap...\n");
     {
@@ -107,4 +110,18 @@ void init_kernel(void)
 
     /* ---- 7. 键盘输入测试 ---- */
     tty_print("\nKeyboard ready. Type something:\n> ");
+
+    /* 启用中断并进入主循环
+     * sti: 设置 EFLAGS.IF=1，允许 CPU 响应硬件中断
+     *       GRUB/Multiboot2 规范传递 IF=0，boot.asm 未执行 sti，
+     *       所以必须在此处显式启用中断，否则 HLT 永远阻塞。
+     * hlt: 挂起 CPU 直到下一个中断唤醒（Timer/键盘等）
+     * 参考：Intel SDM Vol.3 6.8 (HLT), OSDev Bare Bones */
+    for (;;) {
+        char c = keyboard_getchar_nb();
+        if (c) {
+            tty_putchar(c);
+        }
+        __asm__ volatile ("sti; hlt");
+    }
 }

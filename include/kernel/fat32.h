@@ -89,4 +89,7 @@ int fat32_delete(fat32_fs_t *fs, const char *filename);
 void fat32_list_root(fat32_fs_t *fs);
 void fat32_flush(fat32_fs_t *fs); /* 强制写回FAT */
 
+void     fat32_seek(fat32_file_t *file, uint32_t offset);
+uint32_t fat_next_cluster(fat32_fs_t *fs, uint32_t cluster);
+
 #endif

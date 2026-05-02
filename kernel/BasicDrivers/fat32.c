@@ -41,7 +41,8 @@ static void to_short(const char *in, char out[11]) {
 /* ====== FAT 表辅助函数 ====== */
 #define FAT_EOF        0x0FFFFFF8
 
-static inline uint32_t fat_next_cluster(fat32_fs_t *fs, uint32_t cluster) {
+uint32_t fat_next_cluster(fat32_fs_t *fs, uint32_t cluster)
+{
     if (cluster < 2 || cluster >= fs->total_clusters + 2) return FAT_EOF;
     return fs->fat[cluster] & 0x0FFFFFFF;
 }
@@ -405,4 +406,23 @@ int fat32_delete(fat32_fs_t *fs, const char *filename) {
     fat32_flush(fs);
 
     return 0;
+}
+
+void fat32_seek(fat32_file_t *file, uint32_t offset)
+{
+    if (!file || !file->fs) return;
+    if (offset > file->size) offset = file->size;
+    fat32_fs_t *fs = file->fs;
+    uint32_t cluster = file->start_cluster;
+    uint32_t cluster_size = fs->sectors_per_cluster * fs->bytes_per_sector;
+    uint32_t remaining = offset;
+
+    while (remaining >= cluster_size) {
+        uint32_t next = fat_next_cluster(fs, cluster);
+        if (next >= FAT_EOF) break;
+        remaining -= cluster_size;
+        cluster = next;
+    }
+    file->current_cluster = cluster;
+    file->offset = remaining;
 }

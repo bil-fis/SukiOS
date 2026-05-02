@@ -19,6 +19,8 @@
 #include "kernel/pci.h"
 #include "kernel/ide.h"
 #include "kernel/fat32.h"
+#include "kernel/vfs.h"
+#include "kernel/fat32_vfs.h"
 
 #define KERNEL_VIRT_BASE    0xFFFFFFFF80000000ULL
 #define KERNEL_LMA          0x110000ULL
@@ -93,69 +95,119 @@ void init_kernel(void)
         tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
     }
 
-    tty_print("[..] Mounting FAT32...\n");
+    // tty_print("[..] Mounting FAT32...\n");
+    // fat32_fs_t fs;
+    // if (fat32_mount(&fs) == 0) {
+    //     tty_print("[OK] FAT32 mounted. Root directory:\n");
+    //     fat32_list_root(&fs);
+    //
+    //     tty_print("[..] Opening README.TXT...\n");
+    //     fat32_file_t file;
+    //     if (fat32_open(&fs, "README.TXT", &file) == 0) {
+    //         char buf[513];
+    //         uint32_t total = 0;
+    //         tty_print("--- README.TXT ---\n");
+    //         while (total < file.size) {
+    //             uint32_t chunk = file.size - total;
+    //             if (chunk > 512) chunk = 512;
+    //             int n = fat32_read(&file, buf, chunk);
+    //             if (n <= 0) break;
+    //             buf[n] = '\0';
+    //             tty_print(buf);
+    //             total += n;
+    //         }
+    //         tty_print("\n--- end ---\n");
+    //         fat32_close(&file);
+    //     } else {
+    //         tty_print("README.TXT not found.\n");
+    //     }
+    //     fat32_unmount(&fs);
+    // } else {
+    //     tty_print("[FAIL] FAT32 mount failed.\n");
+    // }
+    //
+    // tty_print("[..] Creating HELLO.TXT and writing data...\n");
+    // fat32_file_t wfile;
+    // if (fat32_create_file(&fs, "HELLO.TXT", &wfile) == 0) {
+    //     const char *msg = "Hello from SukiOS!\n";   // 22 字节（包括换行）
+    //     // 手动计算长度（因为你没有 strlen）
+    //     int len = 0;
+    //     while (msg[len]) len++;
+    //
+    //     int written = fat32_write(&wfile, msg, len);
+    //     fat32_close(&wfile);
+    //
+    //     tty_print("[OK] Written ");
+    //     tty_print_dec(written);
+    //     tty_print(" bytes to HELLO.TXT.\n");
+    // } else {
+    //     tty_print("[FAIL] Could not create HELLO.TXT.\n");
+    // }
+    //
+    // // 重新列出根目录，查看结果
+    // tty_print("[..] Root directory updated:\n");
+    // fat32_list_root(&fs);
+    //
+    // tty_print("[..] Deleting HELLO.TXT...\n");
+    // if (fat32_delete(&fs, "HELLO.TXT") == 0) {
+    //     tty_print("[OK] HELLO.TXT deleted.\n");
+    // } else {
+    //     tty_print("[FAIL] Could not delete HELLO.TXT.\n");
+    // }
+    //
+    // // 再次列出根目录，确认文件已消失
+    // tty_print("[..] Root directory after deletion:\n");
+    // fat32_list_root(&fs);
+
     fat32_fs_t fs;
     if (fat32_mount(&fs) == 0) {
-        tty_print("[OK] FAT32 mounted. Root directory:\n");
-        fat32_list_root(&fs);
+        tty_print("[OK] FAT32 mounted. Integrating with VFS...\n");
 
-        tty_print("[..] Opening README.TXT...\n");
-        fat32_file_t file;
-        if (fat32_open(&fs, "README.TXT", &file) == 0) {
-            char buf[513];
-            uint32_t total = 0;
-            tty_print("--- README.TXT ---\n");
-            while (total < file.size) {
-                uint32_t chunk = file.size - total;
-                if (chunk > 512) chunk = 512;
-                int n = fat32_read(&file, buf, chunk);
-                if (n <= 0) break;
-                buf[n] = '\0';
-                tty_print(buf);
-                total += n;
+        vfs_node_t *root = fat32_mount_to_vfs(&fs);
+        if (root) {
+            vfs_mount("ata0", "/", FS_FAT32, root);
+            tty_print("[VFS] FAT32 mounted at /.\n");
+
+            // 列出根目录（通过 VFS）
+            tty_print("[VFS] Root directory (via VFS finddir):\n");
+            // 使用原有的 fat32_list_root 也可以，但为了演示，直接遍历根目录名列表需要额外的 VFS 实现，此处略。
+            // 测试 VFS 打开文件
+            int fd = vfs_open("/README.TXT", O_RDONLY);
+            if (fd >= 0) {
+                char buf[128];
+                int n = vfs_read(fd, buf, sizeof(buf)-1);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    tty_print("--- VFS README.TXT ---\n");
+                    tty_print(buf);
+                    tty_print("\n--- end ---\n");
+                }
+                vfs_close(fd);
+            } else {
+                tty_print("[VFS] README.TXT not found via VFS.\n");
             }
-            tty_print("\n--- end ---\n");
-            fat32_close(&file);
-        } else {
-            tty_print("README.TXT not found.\n");
+
+            // 创建并测试写入
+            vfs_create("/HELLO.TXT", 0);
+            fd = vfs_open("/HELLO.TXT", O_WRONLY);
+            if (fd >= 0) {
+                const char *msg = "Hello via VFS!\n";
+                int written = vfs_write(fd, msg, 15);
+                vfs_close(fd);
+                tty_print("[VFS] Written ");
+                tty_print_dec(written);
+                tty_print(" bytes to HELLO.TXT via VFS.\n");
+            } else {
+                tty_print("[VFS] Could not open HELLO.TXT for writing.\n");
+            }
+
+            // 删除测试文件
+            vfs_delete("/HELLO.TXT");
+            tty_print("[VFS] Deleted HELLO.TXT.\n");
         }
-        fat32_unmount(&fs);
     } else {
         tty_print("[FAIL] FAT32 mount failed.\n");
     }
-
-    tty_print("[..] Creating HELLO.TXT and writing data...\n");
-    fat32_file_t wfile;
-    if (fat32_create_file(&fs, "HELLO.TXT", &wfile) == 0) {
-        const char *msg = "Hello from SukiOS!\n";   // 22 字节（包括换行）
-        // 手动计算长度（因为你没有 strlen）
-        int len = 0;
-        while (msg[len]) len++;
-
-        int written = fat32_write(&wfile, msg, len);
-        fat32_close(&wfile);
-
-        tty_print("[OK] Written ");
-        tty_print_dec(written);
-        tty_print(" bytes to HELLO.TXT.\n");
-    } else {
-        tty_print("[FAIL] Could not create HELLO.TXT.\n");
-    }
-
-    // 重新列出根目录，查看结果
-    tty_print("[..] Root directory updated:\n");
-    fat32_list_root(&fs);
-
-    tty_print("[..] Deleting HELLO.TXT...\n");
-    if (fat32_delete(&fs, "HELLO.TXT") == 0) {
-        tty_print("[OK] HELLO.TXT deleted.\n");
-    } else {
-        tty_print("[FAIL] Could not delete HELLO.TXT.\n");
-    }
-
-    // 再次列出根目录，确认文件已消失
-    tty_print("[..] Root directory after deletion:\n");
-    fat32_list_root(&fs);
 
     tty_print("\n[..] Initializing LAPIC Timer...\n");
     irq_register_handler(0, apic_timer_irq_handler);

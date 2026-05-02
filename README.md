@@ -1,6 +1,6 @@
 # SukiOS
 
-一个从零编写的 x86_64 单内核（Monolithic Kernel）操作系统，采用 Higher-Half 内核模型，通过 Multiboot2 协议由 GRUB2 引导启动。
+一个从零编写的 x86_64 单内核（Monolithic Kernel）操作系统，采用 Higher-Half 内核模型，通过 Multiboot2 协议由 GRUB2 引导启动，现已支持用户态程序运行和磁盘读写。
 
 ## 目录
 
@@ -23,6 +23,10 @@
   - [I/O APIC](#io-apic)
   - [LAPIC 定时器](#lapic-定时器)
   - [PS/2 键盘驱动](#ps2-键盘驱动)
+  - [PCI 总线枚举](#pci-总线枚举)
+  - [IDE 磁盘驱动](#ide-磁盘驱动)
+  - [FAT32 文件系统](#fat32-文件系统)
+  - [用户态与系统调用](#用户态与系统调用)
   - [VGA 终端](#vga-终端)
   - [UART 串口](#uart-串口)
 - [中断向量分配](#中断向量分配)
@@ -65,7 +69,7 @@ sudo apt install nasm qemu-system-x86 grub-pc-bin grub-common xorriso gcc
 make              # 编译生成 build/kernel.elf
 make verify       # 验证 Multiboot2 头部有效性
 make iso          # 生成可启动 ISO (build/sukios.iso)
-make run          # 生成 ISO 并在 QEMU 中运行 (128MB 内存)
+make run          # 生成 ISO 并在 QEMU 中运行 (128MB 内存, 附加 FAT32 磁盘镜像)
 make run-direct   # 通过 QEMU -kernel 直接加载运行
 make debug        # ISO + GDB 远程调试 (-s -S, 端口 1234)
 make clean        # 清理 build/ 目录
@@ -111,6 +115,9 @@ SukiOS/
 │       ├── apic_timer.h        # LAPIC 定时器接口
 │       ├── heap.h              # 内核堆 (kmalloc/kfree/krealloc/kcalloc)
 │       ├── keyboard.h          # PS/2 键盘 (键码定义、事件结构、驱动接口)
+│       ├── pci.h               # PCI 总线枚举接口 (传统 CAM 模式)
+│       ├── ide.h               # IDE ATA PIO 磁盘驱动接口
+│       ├── fat32.h             # FAT32 文件系统接口 (读/写/创建/删除)
 │       └── vmm.h               # 虚拟内存管理器 (4 级分页)
 └── kernel/
     ├── EarlyKernel/            # 启动阶段（无动态内存，直接操作物理内存）
@@ -123,14 +130,17 @@ SukiOS/
     │   ├── tty.c               # VGA 80x25 文本模式终端
     │   └── uart.c              # UART COM1 串口驱动 (115200 8N1)
     ├── InitKernel/             # 高级初始化阶段（有 VMM 和堆）
-    │   ├── main.c              # init_kernel 入口，APIC/定时器/键盘初始化
+    │   ├── main.c              # init_kernel 入口，Ring 3 切换、PCI/IDE/FAT32 测试
     │   ├── vmm.c               # 虚拟内存管理器 (4 级页表按需映射)
     │   ├── heap.c              # 内核堆 (隐式空闲链表, first-fit)
     │   ├── acpi.c              # ACPI 表解析 (RSDP/XSDT/MADT)
-    │   └── apic.c              # APIC 子系统初始化 (LAPIC + IOAPIC)
+    │   ├── apic.c              # APIC 子系统初始化 (LAPIC + IOAPIC)
+    │   ├── pci.c               # PCI 总线枚举 + BAR 探测 (传统 CAM)
+    │   └── fat32.c             # FAT32 文件系统挂载、读写、创建、删除
     └── BasicDrivers/           # 硬件驱动
         ├── apic_timer.c        # LAPIC 定时器 (PIT 校准, 100Hz)
-        └── keyboard.c          # PS/2 键盘驱动 (8042, Scancode Set 1)
+        ├── keyboard.c          # PS/2 键盘驱动 (8042, Scancode Set 1)
+        └── ide.c               # IDE ATA PIO 磁盘驱动 (LBA28, 主/从盘探测)
 ```
 
 ---
@@ -168,16 +178,22 @@ InitKernel init_kernel()  ◄─────────────────
   ├─ heap_init()       内核堆 (0xFFFFFFFFA0000000, 512MB 预留)
   ├─ acpi_init()       搜索 RSDP → 解析 MADT (LAPIC/IOAPIC 地址)
   ├─ apic_init()       LAPIC 启用 + IOAPIC 初始化
+  ├─ pci_init()        枚举 PCI 总线 (传统 CAM 模式)
+  ├─ ide_init()        检测 IDE ATA 硬盘 (主/从盘)
+  ├─ fat32_mount()     挂载 FAT32 文件系统
+  ├─ fat32_open() / fat32_read()  读取 README.TXT
+  ├─ fat32_create_file() / fat32_write()  创建并写入 HELLO.TXT
+  ├─ fat32_delete()    删除 HELLO.TXT
   ├─ apic_timer_init() PIT 校准 → 100Hz 周期定时器
   ├─ keyboard_init()   8042 自检 → 键盘初始化 → IOAPIC IRQ1 重定向
   ├─ 堆分配测试        kmalloc/kfree 验证
-  └─ 主循环            keyboard_getchar_nb() + sti; hlt
+  └─ enter_ring3()     切换到 Ring 3 用户态
 ```
 
 ### 两阶段设计理念
 
 - **EarlyKernel**：在 VMM 和堆可用之前运行，直接操作物理内存，负责最基本的硬件初始化
-- **InitKernel**：在 VMM 和堆就绪后运行，初始化高级功能（APIC、定时器、键盘驱动等）
+- **InitKernel**：在 VMM 和堆就绪后运行，初始化高级功能，挂载文件系统并进行磁盘 I/O 测试，然后切换到用户态
 
 ---
 
@@ -191,6 +207,8 @@ InitKernel init_kernel()  ◄─────────────────
 | 内核代码/数据 | `0xFFFFFFFF80000000`+ | 2 MB | `.text` / `.rodata` / `.data` / `.bss`（boot.asm 映射，4KB 页） |
 | 内核堆 | `0xFFFFFFFFA0000000`+ | 512 MB 预留 | kmalloc 区域（PML4[511] 按需 4KB 映射） |
 | MMIO 映射 | `0xFFFFFFFFC0000000`+ | 512 MB 预留 | LAPIC、IOAPIC 等 MMIO（PML4[511] 按需 4KB 映射） |
+| 用户代码 | `0x100000000`+ | 4 KB | 用户态程序代码（按需映射） |
+| 用户栈 | `0x100001000`+ | 4 KB | 用户态栈（向下增长） |
 
 ### boot.asm 页表布局（7 张表，28KB）
 
@@ -281,6 +299,7 @@ TSS 配置：
 - **IRQ 宏**：为 IRQ（向量 32-47）生成存根
 - **`isr_common_stub`**：保存全部 15 个通用寄存器，调用 `exception_handler`，`iretq` 恢复
 - **`irq_common_stub`**：类似，调用 `irq_handler`（含 LAPIC EOI）
+- **`int 0x80` 系统调用存根**：保存寄存器，调用 `int80_handler`，`iretq` 返回用户态
 - **专用栈**（BSS 段）：Double Fault / NMI / Machine Check 各 16KB
 
 **异常处理**：打印异常名称、向量号、错误码、RIP、CS、RFLAGS、RSP，然后 `hlt` 停机。
@@ -473,6 +492,126 @@ I/O APIC 初始化和中断重定向：
 
 **IOAPIC 配置**：ISA IRQ1 → 向量 0x21，通过 `acpi_get_isa_override()` 支持 ACPI 中断源覆盖。
 
+### PCI 总线枚举
+
+**文件**: `kernel/InitKernel/pci.c`, `include/kernel/pci.h`
+
+通过传统 CAM (Configuration Access Mechanism) 对 PCI/PCIe 总线进行枚举。使用 I/O 端口 **0xCF8** (地址寄存器) 和 **0xCFC** (数据寄存器) 读取设备的配置空间 [2†L10-L12]。
+
+**枚举过程**（Brute Force 方式）[0†L6-L8]：
+1. 对所有 256 条总线和每条总线上的 32 个设备进行暴力扫描
+2. 读取 Vendor ID：若返回 `0xFFFF` 则跳过该设备 [0†L22]
+3. 检查 Header Type 第 7 位：若为 1 (多功能设备)，逐一扫描功能 0-7 [0†L23-L26]
+4. 对每个设备，提取 Vendor/Device ID、Class Code 等信息 [0†L22-L26]
+
+**BAR 探测**：
+1. 保存各 BAR 原始值后，写入全 1 (`0xFFFFFFFF`) [11†L15-L17]
+2. 读回值，根据低位区分 I/O 空间 (bit 0=1) 或 MMIO 空间 (bit 0=0)
+3. 清除低位相应标志位后取反并加 1，计算 BAR 大小
+4. 写回原始值还原 BAR 配置
+
+**输出示例**：
+```
+0:1.1  8086:7010  Class 01.01.80 (Mass Storage)
+      BAR4: I/O  0xC040 size=16 bytes
+0:2.0  1234:1111  Class 03.00.00 (Display)
+      BAR0: MMIO 0xFD000000 size=16777216 bytes
+```
+
+### IDE 磁盘驱动
+
+**文件**: `kernel/BasicDrivers/ide.c`, `include/kernel/ide.h`
+
+基于 ATA PIO 模式的IDE磁盘驱动，实现 28 位 LBA 寻址下的扇区读写。控制器通过 `0x1F0-0x1F7` 和 `0x3F6` 等端口访问。
+
+**主/从盘探测**：
+1. 对主盘 (`0xE0`) 和从盘 (`0xF0`) 分别执行 `IDENTIFY` 命令
+2. 检测 ATA 签名：若 LBA Mid=0x14 且 LBA High=0xEB，识别为 ATAPI 设备 (CD-ROM)，跳过
+3. 仅选择探测到的第一个 ATA 硬盘进行读写
+
+**读扇区**（IDE_CMD_READ_SECTORS = `0x20`）：
+1. 设置目标 LBA28 地址
+2. 发送 `0x20` 命令
+3. 等待 BSY 清零、DRQ 置位
+4. 从 Data Port (`0x1F0`) 循环读取 256 个 Word（512 字节）
+
+**写扇区**（IDE_CMD_WRITE_SECTORS = `0x30`）：
+1. 设置目标 LBA28 地址
+2. 发送 `0x30` 命令
+3. 等待 BSY 清零、DRQ 置位
+4. 向 Data Port 循环写入 256 个 Word
+5. 发送 `0xE7` (Cache Flush) 命令，确保写入不会因掉电丢失
+
+### FAT32 文件系统
+
+**文件**: `kernel/InitKernel/fat32.c`, `include/kernel/fat32.h`
+
+实现了 FAT32 文件系统的完整读写支持，基于 OSDev Wiki 的 FAT32 规范。
+
+**挂载 (fat32_mount)**：
+1. 读取引导扇区 (LBA 0)，解析 BPB（BIOS Parameter Block）
+2. 验证签名 (`0x28` 或 `0x29`) 和扇区大小 (512 字节)
+3. 计算并加载整个 FAT 表到内存中 (通过 `kmalloc`)
+4. 记录关键参数：`first_data_sector`、`total_clusters`、`root_cluster` 等
+
+**文件读取 (fat32_read)**：
+1. 根据当前偏移量定位所在扇区
+2. 读取目标扇区，拷贝所需字节
+3. 当偏移量超过当前簇大小时，通过 FAT 表查找下一个簇
+
+**文件写入 (fat32_write)**：
+1. 读取当前扇区到缓冲区
+2. 修改缓冲区内容并写回
+3. 若需要扩展簇链，查找空闲簇并更新内存中的 FAT 表
+
+**文件创建 (fat32_create_file)**：
+1. 将用户文件名 (如 `"HELLO.TXT"`) 转换为 8.3 短文件名 (如 `"HELLO   TXT"`)
+2. 在根目录簇链中搜索空闲目录项 (首字节 `0x00` 或 `0xE5`)
+3. 分配一个新空闲簇，在 FAT 表中写入 EOF (`0x0FFFFFF8`) 标记
+4. 填充目录项信息：文件名、属性 (`0x20` 存档)、起始簇号、初始文件大小 (0)
+
+**目录项更新 (fat32_update_dir_entry)**：
+1. 遍历根目录簇链，通过匹配起始簇号定位文件对应的目录项
+2. 更新 `file_size` 字段并写回目录簇
+
+**文件删除 (fat32_delete)**：
+1. 遍历根目录，通过名称匹配找到目标文件
+2. 将目录项首字节标记为 `0xE5` (已删除)
+3. 遍历文件占用的簇链，将 FAT 表中对应条目全部清零
+4. 将修改后的目录簇和 FAT 表写回磁盘
+
+**FAT 表刷新 (fat32_flush)**：将内存中修改过的 FAT 表完整写回磁盘，确保写入操作在重启后可见。
+
+### 用户态与系统调用
+
+**文件**: `kernel/EarlyKernel/idt_stubs.asm`, `kernel/EarlyKernel/idt.c`, `kernel/Userland/userland.asm`
+
+SukiOS 实现了从内核态 (Ring 0) 到用户态 (Ring 3) 的完整切换，以及基于 `int 0x80` 中断的系统调用机制。
+
+**Ring 3 切换 (`enter_ring3`)**：
+1. 禁用中断 (`cli`)
+2. 设置用户态数据段寄存器 (DS, ES, FS, GS = `0x23`)
+3. 构造 `iretq` 栈帧，按顺序压入 [16†L9-L13]：
+  - `SS` = 0x23 (Ring 3 数据段，RPL=3)
+  - `RSP` = 用户栈顶指针
+  - `RFLAGS` (确保 IF 置位，允许用户态响应中断)
+  - `CS` = 0x1B (Ring 3 代码段，RPL=3)
+  - `RIP` = 用户程序入口点
+4. 执行 `iretq` 完成 CPU 特权级切换
+
+**系统调用处理** (`int 0x80`)[15†L10-L13]：
+1. 在 IDT 中注册向量 `0x80` 的中断门 (DPL=3，允许用户态触发)
+2. 用户程序通过 `int 0x80` 触发系统调用，约定寄存器：
+  - `RAX` = 系统调用编号 (1=write, 2=read, 3=getpid, 60=exit)
+  - `RDI, RSI, RDX, R10, R8, R9` = 参数
+  - 返回值在 `RAX` 中
+3. 中断处理函数 `int80_handler` 提取寄存器参数并分发给具体的处理函数
+
+**用户态程序** (`userland.asm`)：
+- 通过 `int 0x80` 调用 `write` 在屏幕上打印字符
+- 通过 `int 0x80` 调用 `read` 从键盘接收输入并回显
+- 按下 ESC 键后调用 `exit` 退出用户态，返回内核空闲循环
+
 ### VGA 终端
 
 **文件**: `kernel/EarlyKernel/tty.c`, `include/kernel/tty.h`
@@ -508,6 +647,7 @@ UART COM1 串口驱动（调试输出）：
 | `0x20` | 1 | IRQ0: LAPIC 定时器 (100Hz) |
 | `0x21` | 1 | IRQ1: PS/2 键盘 |
 | `0x22-0x2F` | 14 | IRQ2-15: 预留（串口、并口、RTC、ATA 等） |
+| `0x80` | 1 | 系统调用 (int 0x80) |
 | `0xFF` | 1 | APIC 伪中断 (Spurious Interrupt) |
 
 ---
@@ -524,6 +664,9 @@ UART COM1 串口驱动（调试输出）：
 | LAPIC 定时器 | `kernel/BasicDrivers/apic_timer.c` | PIT 校准，100Hz 周期中断 |
 | PS/2 键盘 (8042) | `kernel/BasicDrivers/keyboard.c` | Set 1 完整解码，US QWERTY，按键重复 |
 | ACPI (RSDP/MADT) | `kernel/InitKernel/acpi.c` | XSDT/RSDT 表查找，MADT 解析 |
+| PCI 总线 | `kernel/InitKernel/pci.c` | 传统 CAM 枚举，BAR 探测与大小计算 |
+| IDE ATA PIO 磁盘 | `kernel/BasicDrivers/ide.c` | LBA28，主/从盘自动探测，读写扇区 |
+| FAT32 文件系统 | `kernel/InitKernel/fat32.c` | 挂载/卸载、读/写/创建/删除文件、目录遍历 |
 
 ---
 
@@ -533,3 +676,8 @@ UART COM1 串口驱动（调试输出）：
 - [Intel SDM (Software Developer's Manual)](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html) — x86/x86_64 架构手册
 - [Multiboot2 Specification](https://www.gnu.org/software/grub/manual/multiboot2/multiboot.html) — GNU GRUB 引导协议
 - [ACPI Specification](https://uefi.org/specifications) — 高级配置与电源接口
+- [OSDev: PCI](https://wiki.osdev.org/PCI) — PCI 总线枚举与配置空间访问 [0†L5-L7]
+- [OSDev: FAT32 (User:Requimrar)](https://wiki.osdev.org/User:Requimrar/FAT32) — FAT32 实现细节 [8†L26-L27]
+- [OSDev: PCI IDE Controller](https://wiki.osdev.org/PCI_IDE_Controller) — IDE 控制器编程 [7†L13-L15]
+- [OSDev: ATA PIO Mode](https://wiki.osdev.org/ATA_PIO_Mode) — ATA PIO 读写模式 [13†L5-L8]
+- [OSDev: Getting to Ring 3](https://wiki.osdev.org/Getting_to_Ring_3) — 从内核态切换到用户态 [16†L9-L13][16†L25-L27]

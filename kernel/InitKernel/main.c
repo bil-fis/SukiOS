@@ -21,12 +21,11 @@
 void init_kernel(void)
 {
     tty_setcolor(VGA_GREEN, VGA_BLACK);
-    tty_print("  _____ _____ __  __  __  __ \n");
-    tty_print(" |  __ \\_   _|  \\/  | |  \\/  |\n");
-    tty_print(" | |__) || | | .  . | | .  . |\n");
-    tty_print(" |  ___/ | | | |\\/| | | |\\/| |\n");
-    tty_print(" | |    _| |_| |  | | | |  | |\n");
-    tty_print(" |_|   |_____|_|  |_|_|_|  |_|\n");
+    tty_print(" ____          _     _   ___   ____  \n");
+    tty_print("/ ___|  _   _ | | __(_) / _ \\ / ___| \n");
+    tty_print("\\___ \\ | | | || |/ /| || | | |\\___ \\ \n");
+    tty_print(" ___) || |_| ||   < | || |_| | ___) |\n");
+    tty_print("|____/  \\__,_||_|\\_\\_| \\___/ |____/ \n");
     tty_print("\n");
 
     tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);

@@ -218,8 +218,8 @@ void syscall_handler(struct syscall_frame *frame) {
             break;
     }
     case 2: { /* read() */
-            char c = keyboard_getchar_blocking();;
-            frame->rax = (uint64_t)(uint8_t)c;
+            char c = (unsigned char)keyboard_getchar_blocking();
+            frame->rax = (uint64_t)c;
             break;
     }
     case 3: { /* getpid() */

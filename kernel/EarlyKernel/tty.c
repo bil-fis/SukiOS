@@ -70,9 +70,7 @@ void tty_setcolor(uint8_t fg, uint8_t bg)
     term_color = vga_color(fg, bg);
 }
 
-void tty_putchar(char c)
-{
-    /* 同步输出到 COM1 串口 */
+void tty_putchar(char c) {
     uart_putchar(c);
 
     if (c == '\n') {
@@ -83,10 +81,17 @@ void tty_putchar(char c)
         }
         tty_update_cursor();
         return;
+    } else if (c == '\b') {       // 处理退格
+        if (term_col > 0) {
+            term_col--;
+            // 可选：在当前位置写空格以擦除
+            term_buffer[term_row * VGA_WIDTH + term_col] = vga_entry(' ', term_color);
+            tty_update_cursor();
+        }
+        return;
     }
 
     term_buffer[term_row * VGA_WIDTH + term_col] = vga_entry(c, term_color);
-
     if (++term_col == VGA_WIDTH) {
         term_col = 0;
         if (++term_row == VGA_HEIGHT) {
@@ -94,7 +99,6 @@ void tty_putchar(char c)
             tty_scroll();
         }
     }
-
     tty_update_cursor();
 }
 

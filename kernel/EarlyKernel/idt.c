@@ -11,6 +11,9 @@
 #include "kernel/apic.h"
 #include "kernel/keyboard.h"
 #include "kernel/proc.h"
+#include "kernel/vfs.h"
+#include "kernel/fat32.h"
+#include "kernel/heap.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 
@@ -225,6 +228,81 @@ void syscall_handler(struct syscall_frame *frame) {
     case 3: { /* getpid() */
             if (curr) frame->rax = curr->pid;
             else frame->rax = 0;
+            break;
+    }
+    case 59: { /* execve(path, argv, envp) */
+            // execve 系统调用：替换当前进程为新程序
+            // 参数：rdi = path (const char*), rsi = argv (char**), rdx = envp (char**)
+            const char *path = (const char*)frame->rdi;
+            
+            // 验证路径指针有效性（简单检查）
+            if (!path || (uint64_t)path < 0x100000) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            
+            // 尝试打开文件
+            int fd = vfs_open(path, O_RDONLY);
+            if (fd < 0) {
+                frame->rax = (uint64_t)-2; // ENOENT
+                break;
+            }
+            
+            size_t file_size = vfs_get_size(fd);
+            if (file_size == 0) {
+                vfs_close(fd);
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            
+            // 分配内存读取文件
+            uint8_t *elf_buf = (uint8_t *)kmalloc(file_size);
+            if (!elf_buf) {
+                vfs_close(fd);
+                frame->rax = (uint64_t)-12; // ENOMEM
+                break;
+            }
+            
+            // 读取ELF文件
+            if (vfs_read(fd, elf_buf, file_size) != (int)file_size) {
+                kfree(elf_buf);
+                vfs_close(fd);
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            
+            vfs_close(fd);
+            
+            // 创建新进程
+            pcb_t *new_proc = proc_create_from_elf(elf_buf, file_size);
+            kfree(elf_buf);
+            
+            if (!new_proc) {
+                frame->rax = (uint64_t)-1;
+                break;
+            }
+            
+            // 替换当前进程（简单实现：退出当前进程，新进程会运行）
+            if (curr) {
+                curr->state = PROC_ZOMBIE;
+                // 释放当前进程资源（简化版）
+                if (curr->kernel_stack) {
+                    kfree(curr->kernel_stack);
+                }
+                // 清理文件描述符表
+                for (int i = 0; i < MAX_FD; i++) {
+                    if (curr->fds[i].vnode) {
+                        vfs_close_node(curr->fds[i].vnode);
+                        curr->fds[i].vnode = NULL;
+                    }
+                }
+            }
+            
+            // 设置新进程为当前进程
+            g_current_proc = new_proc;
+            new_proc->state = PROC_RUNNING;
+            
+            frame->rax = 0; // success
             break;
     }
     case 60: { /* exit(code) */

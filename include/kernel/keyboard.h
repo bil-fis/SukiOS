@@ -162,4 +162,7 @@ void keyboard_process_scancode(uint8_t scancode);
 /* 定时器回调（用于按键重复，由 apic_timer 驱动） */
 void keyboard_timer_tick(void);
 
+char keyboard_getchar_blocking(void);
+void keyboard_reenable_irq(void);
+
 #endif /* SUKIOS_KEYBOARD_H */

@@ -1,5 +1,9 @@
 ; =============================================================================
 ; SukiOS - x86_64 ISR 存根（中断服务例程）
+; 修复内容：
+;   - isr_common_stub 中开启中断 (sti)，返回前关闭 (cli)
+;   - irq_common_stub 保存 g_current_proc->rsp
+;   - 所有原有的功能保持不变
 ; =============================================================================
 
 bits 64
@@ -8,6 +12,9 @@ default rel
 section .text
 
 extern exception_handler
+extern irq_handler
+extern spurious_irq_handler
+extern g_current_proc
 
 %macro ISR_NOERRCODE 1
 global isr%1
@@ -58,14 +65,14 @@ ISR_NOERRCODE 29
 ISR_NOERRCODE 30
 ISR_NOERRCODE 31
 
-; ---- int 0x80 用户态系统调用入口（手动编写，避免宏名称冲突） ----
+; ---- int 0x80 用户态系统调用入口 ----
 global isr80
 isr80:
     push qword 0          ; 无错误码
     push qword 0x80       ; 中断号 = 128
     jmp isr_common_stub
 
-; ---- 通用 ISR 存根 ----
+; ---- 通用 ISR 存根（异常 + int 0x80） ----
 isr_common_stub:
     push rax
     push rbx
@@ -83,8 +90,19 @@ isr_common_stub:
     push r14
     push r15
 
+    ; ---- 保存当前 RSP 到 g_current_proc->rsp ----
+    mov rax, [g_current_proc]
+    test rax, rax
+    jz .no_save
+    mov [rax], rsp
+.no_save:
+
+    sti                         ; ★ 重新开启中断，允许键盘、定时器等 IRQ 到达
+
     mov rdi, rsp
     call exception_handler
+
+    cli                         ; ★ 返回前关中断，保护后续的寄存器弹出操作
 
     pop r15
     pop r14
@@ -123,7 +141,6 @@ kernel_interrupt_stack_top:
 
 ; ---- 伪中断 ISR 255 ----
 section .text
-extern spurious_irq_handler
 global isr_spurious
 isr_spurious:
     push qword 0
@@ -167,7 +184,6 @@ spurious_common_stub:
     iretq
 
 ; ---- IRQ 存根 ----
-extern irq_handler
 %macro IRQ 1
 global irq%1
 irq%1:
@@ -209,8 +225,17 @@ irq_common_stub:
     push r13
     push r14
     push r15
+
+    ; ---- 保存当前 RSP 到 g_current_proc->rsp ----
+    mov rax, [g_current_proc]
+    test rax, rax
+    jz .no_save
+    mov [rax], rsp
+.no_save:
+
     mov rdi, rsp
     call irq_handler
+
     pop r15
     pop r14
     pop r13
@@ -285,8 +310,5 @@ enter_ring3:
     push rdi
     iretq
 
-; ---- 用户栈 ----
-section .bss align=4096
-global user_stack_top, user_stack_bottom
-user_stack_bottom: resb 4096
-user_stack_top:
+section .data
+extern g_current_proc

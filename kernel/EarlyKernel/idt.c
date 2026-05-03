@@ -10,6 +10,7 @@
 #include "kernel/io.h"
 #include "kernel/apic.h"
 #include "kernel/keyboard.h"
+#include "kernel/proc.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 
@@ -207,37 +208,35 @@ void irq_handler(struct interrupt_frame *frame)
     }
 }
 
-void syscall_handler(struct syscall_frame *frame)
-{
+void syscall_handler(struct syscall_frame *frame) {
+    pcb_t *curr = g_current_proc;
+
     switch (frame->rax) {
-    case 1: { /* write(char c) */
-        tty_putchar((char)frame->rdi);
-        frame->rax = 0;
-        break;
+    case 1: { /* write(char) */
+            tty_putchar((char)frame->rdi);
+            frame->rax = 0;
+            break;
     }
     case 2: { /* read() */
-        char c = keyboard_getchar_nb();
-        frame->rax = (uint64_t)(uint8_t)c;
-        break;
+            char c = keyboard_getchar_blocking();;
+            frame->rax = (uint64_t)(uint8_t)c;
+            break;
     }
     case 3: { /* getpid() */
-        frame->rax = 0;
-        break;
+            if (curr) frame->rax = curr->pid;
+            else frame->rax = 0;
+            break;
     }
     case 60: { /* exit(code) */
-        tty_print("\n[Kernel] User program exited with code ");
-        tty_print_dec((uint32_t)frame->rdi);
-        tty_print("\n");
-
-        __asm__ volatile (
-            "mov %[kstack], %%rsp\n\t"
-            "sti\n\t"
-            "jmp kernel_idle_loop\n\t"
-            :
-            : [kstack] "r"((uint64_t)&kernel_interrupt_stack_top)
-            : "memory"
-        );
-        for (;;) {}
+            int code = (int)frame->rdi;
+            tty_print("[exit] PID ");
+            if (curr) tty_print_dec((uint32_t)curr->pid);
+            tty_print(" exited with ");
+            tty_print_dec(code);
+            tty_print("\n");
+            if (curr) curr->state = PROC_ZOMBIE;
+            schedule();
+            break;
     }
     default:
         frame->rax = (uint64_t)-1;

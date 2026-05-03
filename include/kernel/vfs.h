@@ -2,6 +2,7 @@
 #define SUKIOS_VFS_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* ========== 标志常量 ========== */
 #define VFS_FLAG_DIR        0x01
@@ -118,5 +119,7 @@ int vfs_close(int fd);
 
 /* ========== 文件系统类型宏 ========== */
 #define FS_FAT32 1
+
+size_t vfs_get_size(int fd);
 
 #endif

@@ -216,3 +216,13 @@ int vfs_close(int fd) {
     fd_table[fd].ref_count = 0;
     return 0;
 }
+
+size_t vfs_get_size(int fd)
+{
+    /* 检查文件描述符有效性 */
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].node)
+        return 0;
+
+    /* 直接返回节点的 size 字段 */
+    return fd_table[fd].node->size;
+}

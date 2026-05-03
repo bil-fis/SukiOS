@@ -111,14 +111,40 @@ int vmm_map_page(uint64_t phys, uint64_t virt, uint64_t flags)
     phys &= ~(VMM_PAGE_SIZE - 1);
     virt &= ~(VMM_PAGE_SIZE - 1);
 
+    /* ---- 第一步：拿到 PD 并尝试正常获取 PT ---- */
+    pde_t *pd = get_pd(virt, true);
+    if (!pd) return -1;
+
+    uint64_t pd_idx = vmm_pd_index(virt);
+    pde_t pde = pd[pd_idx];
+
+    /* 如果当前是 2MB 大页 */
+    if (pde & VMM_PS) {
+        /* 分配新页作为页表 (PT) */
+        uint64_t pt_phys = pmm_alloc_page();
+        if (!pt_phys) return -1;
+        clear_page(pt_phys);
+
+        /* 获取大页的物理基址 */
+        uint64_t base_phys = pde & 0x000FFFFFFFE00000ULL; /* 2MB 对齐 */
+
+        /* 在页表中填入 512 个 4KB 页，权限沿用原大页的 */
+        volatile pte_t *pt = (volatile pte_t *)(uintptr_t)pt_phys;
+        for (int i = 0; i < 512; i++) {
+            pt[i] = (base_phys + i * VMM_PAGE_SIZE) | (pde & 0xFFF) | VMM_PRESENT;
+        }
+
+        /* 更新 PDE，指向新 PT，清除 PS 位 */
+        pd[pd_idx] = pt_phys | VMM_PRESENT | VMM_WRITE | (pde & VMM_USER);  /* PT 本身必须可读写 */
+        vmm_invalidate_all();  /* 刷新 TLB，确保后续访问通过新 PT */
+    }
+
+    /* ---- 第二步：正常拿到 PT，设置新映射 ---- */
     pte_t *pt = get_pt(virt, true);
     if (!pt) return -1;
 
     uint64_t pt_idx = vmm_pt_index(virt);
-
-    uint64_t paddr = phys & 0x000FFFFFFFFFF000ULL;   // 仅保留物理地址
-    uint64_t f     = flags & 0xFFFULL;               // 仅保留低12位标志
-    pt[pt_idx] = (paddr | f) & ~VMM_XD;              // 强制清除 XD 位
+    pt[pt_idx] = (phys & 0x000FFFFFFFFFF000ULL) | ((flags & 0xFFFULL) & ~VMM_XD);
 
     vmm_invalidate_page(virt);
     return 0;
@@ -221,11 +247,24 @@ void vmm_init(void)
     s_pml4_phys = cr3;
     s_pml4_virt = (pml4e_t *)(uintptr_t)cr3;
 
-    /* 1. 扩展身份映射到 0-4GB，使用 1GB 大页 */
-    volatile uint64_t *pdpte_a = (volatile uint64_t *)(uintptr_t)BOOT_PDPTE_A_ADDR;
-    for (int i = 0; i < 4; i++) {
-        uint64_t phys = (uint64_t)i * 0x40000000ULL;
-        pdpte_a[i] = phys | VMM_PRESENT | VMM_WRITE | VMM_PS;
+    /* 确保 PML4[0] 允许用户访问（指向 PDPTE_A） */
+    s_pml4_virt[0] |= VMM_USER;
+
+    /* 1. 扩展身份映射到 0-4GB，使用 2MB 大页，并设置用户权限 */
+    volatile pdpte_t *pdpte_a = (volatile pdpte_t *)(uintptr_t)BOOT_PDPTE_A_ADDR;
+    for (int gb = 0; gb < 4; gb++) {
+        uint64_t pd_phys = pmm_alloc_page();
+        if (!pd_phys) {
+            tty_setcolor(VGA_RED, VGA_BLACK);
+            tty_print("  ERROR: Failed to allocate PD for identity map\n");
+            return;
+        }
+        volatile pde_t *pd = (volatile pde_t *)(uintptr_t)pd_phys;
+        for (int i = 0; i < 512; i++) {
+            uint64_t phys = (uint64_t)(gb * 0x40000000ULL) + (i * 0x200000ULL);
+            pd[i] = phys | VMM_PRESENT | VMM_WRITE | VMM_USER | VMM_PS;
+        }
+        pdpte_a[gb] = pd_phys | VMM_PRESENT | VMM_WRITE | VMM_USER;
     }
 
     vmm_invalidate_all();
@@ -234,7 +273,7 @@ void vmm_init(void)
     tty_print("  PML4 at phys=");
     tty_print_hex64(s_pml4_phys);
     tty_print("\n");
-    tty_print("  Identity map: 0-4GB (1GB pages)\n");
+    tty_print("  Identity map: 0-4GB (2MB pages, user accessible)\n");
     tty_print("  Kernel: ");
     tty_print_hex64(KERNEL_VMA);
     tty_print(" (boot.asm mapping preserved)\n");

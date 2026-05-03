@@ -54,6 +54,8 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "kernel/proc.h"
+
 /* =============================================================================
  * PS/2 控制器端口和命令
  * 参考：OSDev 8042 PS/2 Controller - PS/2 Controller IO Ports
@@ -1016,9 +1018,15 @@ void keyboard_init(void)
 
     /* 写入最终配置字节: IRQ1 + 翻译模式使能 */
     cfg |= PS2_CFG_IRQ1 | PS2_CFG_TRANSLATE;
-    ps2_send_controller_cmd(PS2_CMD_WRITE_CFG);
-    ps2_send_device(cfg);
-    io_wait();
+
+    // 等待输入缓冲区空闲，发送“写配置”命令 (0x60)
+    while (inb(PS2_CMD_PORT) & PS2_STATUS_INBUF);
+    outb(PS2_CMD_PORT, PS2_CMD_WRITE_CFG);
+    // 再次等待空闲，发送新的配置字节
+    while (inb(PS2_CMD_PORT) & PS2_STATUS_INBUF);
+    outb(PS2_DATA_PORT, cfg);
+
+    tty_print("  [KBD] IRQ1 enabled (unverified, trust the write).\n");
 
     /* 最终刷新（使能 IRQ 后可能立即到达的 scancode） */
     ps2_flush();
@@ -1033,4 +1041,68 @@ void keyboard_init(void)
         tty_print("]");
     }
     tty_print(")\n");
+
+    uint32_t low = ioapic_read(IOAPIC_REDIR_BASE + gsi * 2);
+    tty_print("  [DEBUG] IOAPIC redir low: 0x");
+    tty_print_hex64(low);
+    tty_print("\n");
+}
+
+/**
+ * 重新使能键盘中断（IOAPIC + PS/2 配置）
+ * 在启动用户进程前调用，用于修复中断丢失问题。
+ */
+void keyboard_reenable_irq(void) {
+    uint32_t gsi;
+    uint16_t isa_flags;
+    acpi_get_isa_override(1, &gsi, &isa_flags);
+
+    // 1. 重新配置 IOAPIC 重定向条目，强制取消屏蔽
+    ioapic_set_redirection((uint8_t)gsi, IRQ_KEYBOARD, false, isa_flags);
+
+    // 2. 再次写入 PS/2 配置字节，确保 IRQ1 使能位绝对被设置
+    uint8_t cfg;
+    while (inb(PS2_CMD_PORT) & PS2_STATUS_INBUF);
+    outb(PS2_CMD_PORT, PS2_CMD_READ_CFG);
+    while (!(inb(PS2_CMD_PORT) & PS2_STATUS_OUTBUF));
+    cfg = inb(PS2_DATA_PORT);
+
+    cfg |= PS2_CFG_IRQ1 | PS2_CFG_TRANSLATE;
+    while (inb(PS2_CMD_PORT) & PS2_STATUS_INBUF);
+    outb(PS2_CMD_PORT, PS2_CMD_WRITE_CFG);
+    while (inb(PS2_CMD_PORT) & PS2_STATUS_INBUF);
+    outb(PS2_DATA_PORT, cfg);
+
+    // 刷新可能积累的垃圾数据
+    while (inb(PS2_CMD_PORT) & PS2_STATUS_OUTBUF)
+        inb(PS2_DATA_PORT);
+}
+
+/**
+ * 阻塞读取字符（带轮询后备）
+ * 即使键盘 IRQ 未送达，只要按下按键就能读取。
+ */
+char keyboard_getchar_blocking(void) {
+    char c;
+    while (1) {
+        // 首先检查缓冲区（由中断或轮询填充）
+        c = keyboard_getchar_nb();
+        if (c) return c;
+
+        // 后备轮询：直接检查 PS/2 输出缓冲区
+        // 这是参考 OSDev “轮询模式”，完全绕过中断
+        uint8_t status = inb(PS2_CMD_PORT);
+        while (status & PS2_STATUS_OUTBUF) {
+            uint8_t scancode = inb(PS2_DATA_PORT);
+            keyboard_process_scancode(scancode);
+            status = inb(PS2_CMD_PORT);
+        }
+
+        // 再次检查缓冲区（刚解码的字符）
+        c = keyboard_getchar_nb();
+        if (c) return c;
+
+        // 没有字符，让出 CPU，等待下次调度
+//        schedule();
+    }
 }

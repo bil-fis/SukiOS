@@ -18,6 +18,7 @@
 #include "kernel/io.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include "kernel/proc.h"
 
 /* ---- PIT (8254 Timer) 寄存器/命令 ---- */
 /* 参考：OSDev PIT, Intel 8253/8254 datasheet */
@@ -120,14 +121,14 @@ static uint32_t calibrate_apic_timer(void)
  * 公共接口
  * ========================================================================= */
 
-void apic_timer_irq_handler(uint8_t int_no)
-{
+void apic_timer_irq_handler(uint8_t int_no) {
     (void)int_no;
     timer_ticks++;
 
-    /* 调用用户回调 */
     if (timer_cb)
         timer_cb();
+
+    schedule();             // 抢占式调度
 }
 
 void apic_timer_set_callback(timer_callback_t cb)

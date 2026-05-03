@@ -1,11 +1,8 @@
 /* =============================================================================
- * SukiOS - InitKernel（int 0x80 版本）
+ * SukiOS - InitKernel（集成进程调度器 + ELF 加载器）
  *
- * 包含完整的 Ring 3 切换准备：
- *   1. 用户代码/栈映射到低半区并设置 U/S=1
- *   2. 整条页表链修复 U/S 位及清 XD/PS
- *   3. 全局 TLB 刷新
- *   4. 切换到干净内核栈后进入用户态
+ * 完成内核高级初始化后，创建用户进程并启动抢占式调度。
+ * 所有手动 Ring 3 切换已被完全替换。
  * ============================================================================= */
 
 #include "kernel/tty.h"
@@ -22,23 +19,7 @@
 #include "kernel/vfs.h"
 #include "kernel/fat32_vfs.h"
 #include "kernel/rtc.h"
-
-#define KERNEL_VIRT_BASE    0xFFFFFFFF80000000ULL
-#define KERNEL_LMA          0x110000ULL
-
-#define USER_CODE_VADDR     0x100000000ULL
-#define USER_STACK_VADDR    0x100001000ULL
-
-extern uint64_t userland_entry;
-extern uint8_t  user_stack_bottom;
-extern uint8_t  user_stack_top;
-extern void     enter_ring3(uint64_t rip, uint64_t rsp);
-extern uint8_t  kernel_interrupt_stack_top;
-
-static inline uint64_t kern_virt_to_phys(uint64_t vaddr)
-{
-    return vaddr - KERNEL_VIRT_BASE + KERNEL_LMA;
-}
+#include "kernel/proc.h"         /* 新增：进程控制块与调度器 */
 
 void init_kernel(void)
 {
@@ -83,7 +64,6 @@ void init_kernel(void)
     tty_print("[..] Reading sector 0...\n");
     if (ide_read_sector(0, sector_buf)) {
         tty_print("[OK] Sector 0:\n");
-        /* 打印前 64 字节 (十六进制) */
         for (int i = 0; i < 64; i++) {
             tty_print_hex64((uint64_t)sector_buf[i]);
             tty_print(" ");
@@ -96,10 +76,8 @@ void init_kernel(void)
         tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
     }
 
-    // 在 init_kernel 函数中，vfs_init() 之后或附近：
     rtc_init();
 
-    // 测试 RTC 读取
     rtc_time_t now;
     rtc_read_time(&now);
     tty_print("[RTC] Current time: ");
@@ -116,77 +94,13 @@ void init_kernel(void)
     tty_print_dec(now.second);
     tty_print("\n");
 
-    // 测试 FAT 时间戳转换
     tty_print("[RTC] FAT time=0x");
     tty_print_hex64(rtc_to_fat_time(&now));
     tty_print(" FAT date=0x");
     tty_print_hex64(rtc_to_fat_date(&now));
     tty_print("\n");
 
-    // tty_print("[..] Mounting FAT32...\n");
-    // fat32_fs_t fs;
-    // if (fat32_mount(&fs) == 0) {
-    //     tty_print("[OK] FAT32 mounted. Root directory:\n");
-    //     fat32_list_root(&fs);
-    //
-    //     tty_print("[..] Opening README.TXT...\n");
-    //     fat32_file_t file;
-    //     if (fat32_open(&fs, "README.TXT", &file) == 0) {
-    //         char buf[513];
-    //         uint32_t total = 0;
-    //         tty_print("--- README.TXT ---\n");
-    //         while (total < file.size) {
-    //             uint32_t chunk = file.size - total;
-    //             if (chunk > 512) chunk = 512;
-    //             int n = fat32_read(&file, buf, chunk);
-    //             if (n <= 0) break;
-    //             buf[n] = '\0';
-    //             tty_print(buf);
-    //             total += n;
-    //         }
-    //         tty_print("\n--- end ---\n");
-    //         fat32_close(&file);
-    //     } else {
-    //         tty_print("README.TXT not found.\n");
-    //     }
-    //     fat32_unmount(&fs);
-    // } else {
-    //     tty_print("[FAIL] FAT32 mount failed.\n");
-    // }
-    //
-    // tty_print("[..] Creating HELLO.TXT and writing data...\n");
-    // fat32_file_t wfile;
-    // if (fat32_create_file(&fs, "HELLO.TXT", &wfile) == 0) {
-    //     const char *msg = "Hello from SukiOS!\n";   // 22 字节（包括换行）
-    //     // 手动计算长度（因为你没有 strlen）
-    //     int len = 0;
-    //     while (msg[len]) len++;
-    //
-    //     int written = fat32_write(&wfile, msg, len);
-    //     fat32_close(&wfile);
-    //
-    //     tty_print("[OK] Written ");
-    //     tty_print_dec(written);
-    //     tty_print(" bytes to HELLO.TXT.\n");
-    // } else {
-    //     tty_print("[FAIL] Could not create HELLO.TXT.\n");
-    // }
-    //
-    // // 重新列出根目录，查看结果
-    // tty_print("[..] Root directory updated:\n");
-    // fat32_list_root(&fs);
-    //
-    // tty_print("[..] Deleting HELLO.TXT...\n");
-    // if (fat32_delete(&fs, "HELLO.TXT") == 0) {
-    //     tty_print("[OK] HELLO.TXT deleted.\n");
-    // } else {
-    //     tty_print("[FAIL] Could not delete HELLO.TXT.\n");
-    // }
-    //
-    // // 再次列出根目录，确认文件已消失
-    // tty_print("[..] Root directory after deletion:\n");
-    // fat32_list_root(&fs);
-
+    /* ---- 挂载 FAT32 并集成 VFS ---- */
     fat32_fs_t fs;
     if (fat32_mount(&fs) == 0) {
         tty_print("[OK] FAT32 mounted. Integrating with VFS...\n");
@@ -196,10 +110,6 @@ void init_kernel(void)
             vfs_mount("ata0", "/", FS_FAT32, root);
             tty_print("[VFS] FAT32 mounted at /.\n");
 
-            // 列出根目录（通过 VFS）
-            tty_print("[VFS] Root directory (via VFS finddir):\n");
-            // 使用原有的 fat32_list_root 也可以，但为了演示，直接遍历根目录名列表需要额外的 VFS 实现，此处略。
-            // 测试 VFS 打开文件
             int fd = vfs_open("/README.TXT", O_RDONLY);
             if (fd >= 0) {
                 char buf[128];
@@ -234,6 +144,10 @@ void init_kernel(void)
         tty_print("[FAIL] FAT32 mount failed.\n");
     }
 
+    /* ===== 初始化进程调度器 ===== */
+    tty_print("\n[..] Initializing process scheduler...\n");
+    scheduler_init();
+
     tty_print("\n[..] Initializing LAPIC Timer...\n");
     irq_register_handler(0, apic_timer_irq_handler);
     apic_timer_init();
@@ -243,39 +157,50 @@ void init_kernel(void)
     keyboard_init();
     apic_timer_set_callback(keyboard_timer_tick);
 
+    /* ---- 内核堆测试 ---- */
     tty_print("\n[..] Testing kernel heap...\n");
-    {
-        void *p1 = kmalloc(128);
-        void *p2 = kmalloc(256);
-        void *p3 = kmalloc(64);
-        if (p1 && p2 && p3) {
-            tty_print("[OK] kmalloc: p1=");
-            tty_print_hex64((uint64_t)(uintptr_t)p1);
-            tty_print(" p2=");
-            tty_print_hex64((uint64_t)(uintptr_t)p2);
-            tty_print(" p3=");
-            tty_print_hex64((uint64_t)(uintptr_t)p3);
-            tty_print("\n");
+    if (heap_check() == 0) {
+        tty_print("[OK] Initial heap integrity check passed\n");
+    } else {
+        tty_setcolor(VGA_RED, VGA_BLACK);
+        tty_print("[FAIL] Initial heap check failed!\n");
+        tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
+    }
 
-            kfree(p1);
-            kfree(p3);
-            void *p4 = kmalloc(32);
-            tty_print("[OK] kfree + kmalloc: p4=");
-            tty_print_hex64((uint64_t)(uintptr_t)p4);
-            tty_print("\n");
+    void *a = kmalloc(128);
+    void *b = kmalloc(200);
+    if (a && b) {
+        tty_print("[OK] kmalloc: a=0x");
+        tty_print_hex64((uint64_t)(uintptr_t)a);
+        tty_print(" b=0x");
+        tty_print_hex64((uint64_t)(uintptr_t)b);
+        tty_print("\n");
 
-            size_t heap_total, heap_used, heap_free;
-            heap_get_stats(&heap_total, &heap_used, &heap_free);
-            tty_print("[OK] Heap stats: ");
-            tty_print_dec((uint32_t)(heap_used / 1024));
-            tty_print(" KB used, ");
-            tty_print_dec((uint32_t)(heap_free / 1024));
-            tty_print(" KB free\n");
-        } else {
-            tty_setcolor(VGA_RED, VGA_BLACK);
-            tty_print("  ERROR: kmalloc test failed!\n");
-            tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
-        }
+        kfree(a);
+        tty_print("[OK] Freed a\n");
+
+        void *c = kmalloc(100);
+        tty_print("[OK] kmalloc c=0x");
+        tty_print_hex64((uint64_t)(uintptr_t)c);
+        tty_print(" (should reuse a's space)\n");
+
+        heap_dump();
+
+        kfree(b);
+        kfree(c);
+        tty_print("[OK] Freed b and c\n");
+    } else {
+        tty_setcolor(VGA_RED, VGA_BLACK);
+        tty_print("  ERROR: kmalloc test failed!\n");
+        tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
+    }
+
+    if (heap_check() == 0) {
+        tty_print("[OK] Final heap integrity check passed\n");
+    } else {
+        tty_setcolor(VGA_RED, VGA_BLACK);
+        tty_print("[FAIL] Final heap check failed!\n");
+        tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
     }
 
     tty_setcolor(VGA_GREEN, VGA_BLACK);
@@ -283,96 +208,53 @@ void init_kernel(void)
     tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
     tty_print("\nKeyboard ready.\n");
 
-    /* ===== 切换到 Ring 3 ===== */
-    tty_setcolor(VGA_CYAN, VGA_BLACK);
-    tty_print("[..] Switching to Ring 3 (User Mode)...\n");
-    tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
+    // tty_print("\n[TEST] Polling keyboard (press any key)...\n");
+    // for (int i = 0; i < 20000000; i++) {   // 等待几秒，确保用户有时间按键
+    //     char c = keyboard_getchar_nb();
+    //     if (c) {
+    //         tty_print("[OK] Got: '");
+    //         tty_putchar(c);
+    //         tty_print("'\n");
+    //         break;
+    //     }
+    //     // 短暂延迟，避免过度占用 CPU
+    //     for (volatile int j = 0; j < 1000; j++);
+    // }
+    // tty_print("[TEST] Polling done.\n");
 
-    uint64_t entry_phys = kern_virt_to_phys((uint64_t)&userland_entry);
-    uint64_t entry_offset = entry_phys & (VMM_PAGE_SIZE - 1);
-    uint64_t code_page_phys = entry_phys & ~(VMM_PAGE_SIZE - 1);
-    uint64_t stack_phys = kern_virt_to_phys((uint64_t)&user_stack_bottom);
-    uint64_t stack_page_phys = stack_phys & ~(VMM_PAGE_SIZE - 1);
 
-    if (vmm_map_page(code_page_phys, USER_CODE_VADDR,
-                     VMM_PRESENT | VMM_USER) != 0) {
-        tty_setcolor(VGA_RED, VGA_BLACK);
-        tty_print("ERROR: failed to map user code page\n");
-        tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
-        goto fallback;
-    }
-    if (vmm_map_page(stack_page_phys, USER_STACK_VADDR,
-                     VMM_PRESENT | VMM_USER | VMM_WRITE) != 0) {
-        tty_setcolor(VGA_RED, VGA_BLACK);
-        tty_print("ERROR: failed to map user stack page\n");
-        tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
-        goto fallback;
-    }
+    /* ===== 从磁盘加载 ELF 可执行文件 ===== */
+    tty_print("[..] Loading ELF program from disk...\n");
 
-    /* 页表链强制修复（U/S=1，清 XD/PS） */
-    {
-        uint64_t cr3;
-        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-        volatile uint64_t *pml4 = (volatile uint64_t *)(uintptr_t)cr3;
-
-        uint64_t pml4e = pml4[0];
-        if (!(pml4e & VMM_PRESENT)) { tty_print("ERROR: PML4[0] !P\n"); goto fallback; }
-        pml4e &= ~(VMM_XD | VMM_PS);
-        pml4e |= VMM_USER;
-        pml4[0] = pml4e;
-
-        volatile uint64_t *pdpte = (volatile uint64_t *)(uintptr_t)(pml4e & 0x000FFFFFFFFFF000ULL);
-        uint64_t pdpte_e = pdpte[4];
-        if (!(pdpte_e & VMM_PRESENT)) { tty_print("ERROR: PDPT[4] !P\n"); goto fallback; }
-        pdpte_e &= ~(VMM_XD | VMM_PS);
-        pdpte_e |= VMM_USER;
-        pdpte[4] = pdpte_e;
-
-        volatile uint64_t *pd = (volatile uint64_t *)(uintptr_t)(pdpte_e & 0x000FFFFFFFFFF000ULL);
-        uint64_t pde = pd[0];
-        if (!(pde & VMM_PRESENT)) { tty_print("ERROR: PD[0] !P\n"); goto fallback; }
-        pde &= ~(VMM_XD | VMM_PS);
-        pde |= VMM_USER;
-        pd[0] = pde;
-
-        volatile uint64_t *pt = (volatile uint64_t *)(uintptr_t)(pde & 0x000FFFFFFFFFF000ULL);
-        uint64_t pte = pt[0];
-        pte &= ~VMM_XD;
-        pt[0] = pte;
-    }
-
-    /* 全局 TLB 刷新 */
-    {
-        uint64_t cr3;
-        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-        __asm__ volatile ("mov %0, %%cr3" :: "r"(cr3) : "memory");
-    }
-
-    uint64_t user_rip = USER_CODE_VADDR + entry_offset;
-    uint64_t user_rsp = USER_STACK_VADDR + VMM_PAGE_SIZE;
-
-    /* 切换到内核中断栈 */
-    __asm__ volatile (
-        "mov %[kstack], %%rsp"
-        :
-        : [kstack] "r"((uint64_t)&kernel_interrupt_stack_top)
-        : "memory"
-    );
-
-    enter_ring3(user_rip, user_rsp);
-    __builtin_unreachable();
-
-fallback:
-    tty_setcolor(VGA_RED, VGA_BLACK);
-    tty_print("ERROR: Ring 3 switch failed! Falling back to kernel mode.\n");
-    tty_setcolor(VGA_LIGHT_GREY, VGA_BLACK);
-
-    tty_print("\nKernel fallback mode. Type something:\n> ");
-    for (;;) {
-        char c = keyboard_getchar_nb();
-        if (c) {
-            tty_putchar(c);
+    int fd = vfs_open("/ISHELL", O_RDONLY);
+    if (fd >= 0) {
+        size_t file_size = vfs_get_size(fd);
+        if (file_size > 0) {
+            uint8_t *elf_buf = (uint8_t *)kmalloc(file_size);
+            if (elf_buf) {
+                if (vfs_read(fd, elf_buf, file_size) == (int)file_size) {
+                    pcb_t *user_proc = proc_create_from_elf(elf_buf, file_size);
+                    if (user_proc) {
+                        tty_print("[OK] User process created (PID=");
+                        tty_print_dec((uint32_t)user_proc->pid);
+                        tty_print(")\n");
+                    } else {
+                        tty_print("[FAIL] Could not create process from ELF\n");
+                    }
+                }
+                kfree(elf_buf);
+            }
         }
-        __asm__ volatile ("sti; hlt");
+        vfs_close(fd);
+    } else {
+        tty_print("[WARN] /USER.ELF not found! Starting scheduler without user process.\n");
     }
+
+    keyboard_reenable_irq();
+
+    /* ===== 启动调度器（永不返回） ===== */
+    scheduler_start();
+
+    /* 理论上不会执行到此 */
+    for (;;) __asm__ volatile ("cli; hlt");
 }

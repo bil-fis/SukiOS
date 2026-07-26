@@ -1,0 +1,32 @@
+# ============================================================================
+# SukiOS .gitignore
+# 仅忽略构建产物与编辑器临时文件；源码、include、results/、osdev_wiki/ 均保留。
+# ============================================================================
+
+# ---- 构建产物（build/ 下全部生成物：.o/.elf/.bin/.iso/.img/.log/.map）----
+/build/
+
+# 若将来有散落在源码树内的产物，也一并忽略（保险）
+*.o
+*.elf
+*.bin
+*.iso
+*.img
+*.map
+*.log
+
+# ---- 编辑器 / IDE 临时文件 ----
+*.swp
+*~
+*.swo
+.vscode/
+.idea/
+clangd-files/
+compile_commands.json
+
+# ---- 本地环境 ----
+.env
+makeenv.local
+
+# osdev 文档
+osdev_wiki/

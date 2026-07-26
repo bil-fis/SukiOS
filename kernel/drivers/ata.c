@@ -1,0 +1,293 @@
+/*
+ * kernel/drivers/ata.c
+ * -----------------------------------------------------------------------------
+ * ATA PIO 驱动（LBA28，Primary Master，轮询模式）+ DISK_PORT 内核服务。
+ *
+ * 红线：这是唯一驻留 Ring0 的存储驱动。它不解析任何文件系统结构，
+ * 只作为"磁盘端口"响应 IPC 扇区读请求；FAT32 逻辑全部在 Ring3 FS_SERVER。
+ *
+ * 调用关系：kmain -> ata_init() + disk_srv_start()；
+ *           FS_SERVER --mach_msg--> DISK_PORT --disk_srv 任务--> ata_read_sectors。
+ */
+#include <kernel/ata.h>
+#include <kernel/io.h>
+#include <kernel/console.h>
+#include <kernel/task.h>
+#include <kernel/string.h>
+#include <ipc/port.h>
+#include <ipc/disk_proto.h>
+#include <mm/kmalloc.h>
+
+/* Primary 通道寄存器 */
+#define ATA_IO        0x1F0
+#define ATA_DATA      (ATA_IO + 0)
+#define ATA_ERROR     (ATA_IO + 1)
+#define ATA_SECCNT    (ATA_IO + 2)
+#define ATA_LBA_LO    (ATA_IO + 3)
+#define ATA_LBA_MID   (ATA_IO + 4)
+#define ATA_LBA_HI    (ATA_IO + 5)
+#define ATA_DRIVE     (ATA_IO + 6)
+#define ATA_STATUS    (ATA_IO + 7)
+#define ATA_CMD       (ATA_IO + 7)
+#define ATA_ALT_STATUS 0x3F6
+#define ATA_DEV_CTRL   0x3F6
+
+#define ST_BSY  0x80
+#define ST_DRDY 0x40
+#define ST_DRQ  0x08
+#define ST_ERR  0x01
+
+#define CMD_READ_SECTORS  0x20
+#define CMD_WRITE_SECTORS 0x30
+#define CMD_FLUSH_CACHE   0xE7
+#define CMD_IDENTIFY      0xEC
+
+static bool     g_disk_present = false;
+static uint32_t g_total_sectors = 0;
+
+/* 读备用状态寄存器 4 次 ≈ 400ns 通道稳定延迟 */
+static void ata_delay400(void)
+{
+    for (int i = 0; i < 4; i++) {
+        (void)inb(ATA_ALT_STATUS);
+    }
+}
+
+/* 等待 BSY 清零；超时返回 false */
+static bool ata_wait_not_busy(void)
+{
+    for (uint32_t i = 0; i < 1000000; i++) {
+        if (!(inb(ATA_STATUS) & ST_BSY)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 等待 DRQ 置位（数据就绪）；出错/超时返回 false */
+static bool ata_wait_drq(void)
+{
+    for (uint32_t i = 0; i < 1000000; i++) {
+        uint8_t st = inb(ATA_STATUS);
+        if (st & ST_ERR) {
+            return false;
+        }
+        if (!(st & ST_BSY) && (st & ST_DRQ)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ata_init(void)
+{
+    /* 关闭该通道中断（nIEN=1），纯轮询 */
+    outb(ATA_DEV_CTRL, 0x02);
+
+    /* 选择 Primary Master */
+    outb(ATA_DRIVE, 0xA0);
+    ata_delay400();
+
+    /* 悬空总线检测：status=0xFF 说明无设备 */
+    if (inb(ATA_STATUS) == 0xFF) {
+        kprintf("[ata] no device (floating bus)\n");
+        return false;
+    }
+
+    /* IDENTIFY */
+    outb(ATA_SECCNT, 0);
+    outb(ATA_LBA_LO, 0);
+    outb(ATA_LBA_MID, 0);
+    outb(ATA_LBA_HI, 0);
+    outb(ATA_CMD, CMD_IDENTIFY);
+    ata_delay400();
+
+    if (inb(ATA_STATUS) == 0) {
+        kprintf("[ata] no device on primary master\n");
+        return false;
+    }
+    if (!ata_wait_not_busy()) {
+        kprintf("[ata] IDENTIFY timeout (BSY)\n");
+        return false;
+    }
+    /* ATA 设备：LBA_MID/HI 应为 0（ATAPI 为 0x14/0xEB） */
+    if (inb(ATA_LBA_MID) != 0 || inb(ATA_LBA_HI) != 0) {
+        kprintf("[ata] device is not ATA (ATAPI?)\n");
+        return false;
+    }
+    if (!ata_wait_drq()) {
+        kprintf("[ata] IDENTIFY failed (no DRQ)\n");
+        return false;
+    }
+
+    uint16_t id[256];
+    for (int i = 0; i < 256; i++) {
+        id[i] = inw(ATA_DATA);
+    }
+    g_total_sectors = (uint32_t)id[60] | ((uint32_t)id[61] << 16);
+    g_disk_present = true;
+    kprintf("[ata] primary master OK: %u sectors (%u MiB)\n",
+            g_total_sectors, g_total_sectors / 2048);
+    return true;
+}
+
+bool ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
+{
+    if (!g_disk_present || count == 0) {
+        return false;
+    }
+    if (!ata_wait_not_busy()) {
+        return false;
+    }
+
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));   /* LBA 模式 + 高 4 位 */
+    outb(ATA_SECCNT, count);
+    outb(ATA_LBA_LO,  lba & 0xFF);
+    outb(ATA_LBA_MID, (lba >> 8) & 0xFF);
+    outb(ATA_LBA_HI,  (lba >> 16) & 0xFF);
+    outb(ATA_CMD, CMD_READ_SECTORS);
+
+    uint16_t *out = (uint16_t *)buf;
+    for (uint8_t s = 0; s < count; s++) {
+        if (!ata_wait_drq()) {
+            return false;
+        }
+        for (int i = 0; i < 256; i++) {
+            *out++ = inw(ATA_DATA);
+        }
+        ata_delay400();
+    }
+    return true;
+}
+
+/* PIO 写扇区（LBA28）：逐扇区等待 DRQ 后以 outw 写入 256 字，
+ * 全部写完后发 FLUSH CACHE (0xE7) 确保数据落盘（掉电安全）。 */
+bool ata_write_sectors(uint32_t lba, uint8_t count, const void *buf)
+{
+    if (!g_disk_present || count == 0) {
+        return false;
+    }
+    if (lba + count > g_total_sectors) {        /* 越界写保护 */
+        return false;
+    }
+    if (!ata_wait_not_busy()) {
+        return false;
+    }
+
+    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_SECCNT, count);
+    outb(ATA_LBA_LO,  lba & 0xFF);
+    outb(ATA_LBA_MID, (lba >> 8) & 0xFF);
+    outb(ATA_LBA_HI,  (lba >> 16) & 0xFF);
+    outb(ATA_CMD, CMD_WRITE_SECTORS);
+
+    const uint16_t *in = (const uint16_t *)buf;
+    for (uint8_t s = 0; s < count; s++) {
+        if (!ata_wait_drq()) {
+            return false;
+        }
+        for (int i = 0; i < 256; i++) {
+            outw(ATA_DATA, *in++);
+        }
+        ata_delay400();
+    }
+
+    /* 刷写磁盘写缓存 */
+    outb(ATA_CMD, CMD_FLUSH_CACHE);
+    if (!ata_wait_not_busy()) {
+        return false;
+    }
+    return !(inb(ATA_STATUS) & ST_ERR);
+}
+
+uint32_t ata_total_sectors(void)
+{
+    return g_total_sectors;
+}
+
+/* ---- DISK_PORT 内核服务任务 ----
+ * 消息循环：RECV DISK_PORT -> ata_read_sectors -> SEND 应答到请求方端口。 */
+static void disk_srv_task(void *arg)
+{
+    (void)arg;
+    port_set_owner(DISK_PORT, sched_current());
+
+    /* 请求缓冲须容纳写请求（头 + write_req + 7*512 数据）；
+     * 应答最大 = 头 + status + 7*512 */
+    static uint8_t req[sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)
+                       + DISK_MAX_SECTORS * ATA_SECTOR_SIZE];
+    static uint8_t resp[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t)
+                        + DISK_MAX_SECTORS * ATA_SECTOR_SIZE];
+
+    kprintf("[disk-srv] serving DISK_PORT (kernel-resident, IPC only)\n");
+    for (;;) {
+        uint32_t n = 0;
+        if (ipc_recv_kernel(DISK_PORT, req, sizeof(req), &n, true)
+                != MACH_MSG_SUCCESS || n < sizeof(mach_msg_header_t)) {
+            continue;
+        }
+        mach_msg_header_t *rh = (mach_msg_header_t *)req;
+        uint32_t reply = rh->msgh_local_port;
+        if (reply == PORT_NULL) {
+            continue;
+        }
+
+        if (rh->msgh_id == DISK_MSG_READ &&
+            n >= sizeof(mach_msg_header_t) + sizeof(disk_read_req_t)) {
+            disk_read_req_t *r =
+                (disk_read_req_t *)(req + sizeof(mach_msg_header_t));
+            uint32_t count = r->count;
+            if (count > DISK_MAX_SECTORS) {
+                count = DISK_MAX_SECTORS;
+            }
+
+            mach_msg_header_t *h = (mach_msg_header_t *)resp;
+            disk_read_resp_t *rr = (disk_read_resp_t *)(resp + sizeof(*h));
+            uint8_t *data = resp + sizeof(*h) + sizeof(*rr);
+
+            bool ok = ata_read_sectors((uint32_t)r->lba, (uint8_t)count, data);
+            rr->status = ok ? 0 : 1;
+
+            uint32_t total = sizeof(*h) + sizeof(*rr)
+                           + (ok ? count * ATA_SECTOR_SIZE : 0);
+            h->msgh_bits = 0;
+            h->msgh_size = total;
+            h->msgh_remote_port = reply;
+            h->msgh_local_port = DISK_PORT;
+            h->msgh_id = DISK_MSG_READ;
+            h->msgh_reserved = 0;
+            ipc_send_kernel(reply, resp, total);
+        } else if (rh->msgh_id == DISK_MSG_WRITE &&
+                   n >= sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)) {
+            disk_write_req_t *w =
+                (disk_write_req_t *)(req + sizeof(mach_msg_header_t));
+            uint32_t count = w->count;
+            bool ok = false;
+            /* 数据长度必须与 count 一致，防止越界读取请求缓冲 */
+            if (count >= 1 && count <= DISK_MAX_SECTORS &&
+                n >= sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)
+                     + count * ATA_SECTOR_SIZE) {
+                const uint8_t *data = req + sizeof(mach_msg_header_t)
+                                    + sizeof(disk_write_req_t);
+                ok = ata_write_sectors((uint32_t)w->lba, (uint8_t)count, data);
+            }
+
+            mach_msg_header_t *h = (mach_msg_header_t *)resp;
+            disk_write_resp_t *wr = (disk_write_resp_t *)(resp + sizeof(*h));
+            wr->status = ok ? 0 : 1;
+            uint32_t total = sizeof(*h) + sizeof(*wr);
+            h->msgh_bits = 0;
+            h->msgh_size = total;
+            h->msgh_remote_port = reply;
+            h->msgh_local_port = DISK_PORT;
+            h->msgh_id = DISK_MSG_WRITE;
+            h->msgh_reserved = 0;
+            ipc_send_kernel(reply, resp, total);
+        }
+    }
+}
+
+void disk_srv_start(void)
+{
+    task_create_kernel(disk_srv_task, NULL, "disk-srv");
+}

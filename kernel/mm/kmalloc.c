@@ -42,6 +42,7 @@ static inline uint64_t blk_canary(block_t *b)
 }
 
 static block_t *g_head;         /* 空闲/占用块链表头 */
+static uint64_t g_heap_base;    /* P0-8：随机化后的堆起点（KASLR-lite） */
 static uint64_t g_heap_end;     /* 已映射堆末尾（虚拟，独占） */
 
 /* 将堆映射扩展到至少覆盖 need_end（虚拟地址） */
@@ -68,20 +69,32 @@ static bool kheap_grow(uint64_t need_end)
 
 void kheap_init(void)
 {
-    g_heap_end = KHEAP_BASE;
+    /* P0-8 KASLR-lite：堆基址随机滑移 0..4095 页（0..16MB，页对齐）。
+     * TSC 低位混合乘散列做熵源（无 CSPRNG 的自由环境下的务实选择）。
+     * 攻击者失去「内核堆对象地址可静态预测」这一前提，堆喷/UAF 利用
+     * 成本显著上升。KHEAP_MAX 上限不变（1GB 窗口远大于滑移量）。 */
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t x = ((uint64_t)hi << 32) | lo;
+    x ^= x >> 33; x *= 0xFF51AFD7ED558CCDUL; x ^= x >> 33;
+    g_heap_base = KHEAP_BASE + (x & 0xFFF) * PAGE_SIZE;
+
+    g_heap_end = g_heap_base;
     /* 预留初始 64KB，并确保建立顶层 PML4 项 */
-    if (!kheap_grow(KHEAP_BASE + 0x10000)) {
+    if (!kheap_grow(g_heap_base + 0x10000)) {
         kprintf("[kheap] FATAL: cannot map initial heap\n");
         return;
     }
-    g_head = (block_t *)KHEAP_BASE;
-    g_head->size = (g_heap_end - KHEAP_BASE) - HDR_SIZE;
+    g_head = (block_t *)g_heap_base;
+    g_head->size = (g_heap_end - g_heap_base) - HDR_SIZE;
     g_head->free = true;
     g_head->canary = blk_canary(g_head);
     g_head->next = NULL;
     g_head->prev = NULL;
-    kprintf("[kheap] heap @ %p, initial %u KiB\n",
-            (void *)KHEAP_BASE, (unsigned)((g_heap_end - KHEAP_BASE) / 1024));
+    kprintf("[kheap] heap @ %p (KASLR slide +%lu KiB), initial %u KiB\n",
+            (void *)g_heap_base,
+            (unsigned long)((g_heap_base - KHEAP_BASE) / 1024),
+            (unsigned)((g_heap_end - g_heap_base) / 1024));
 }
 
 /* 在链表尾部追加一个新块以扩容 */

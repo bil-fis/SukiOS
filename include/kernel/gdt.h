@@ -28,4 +28,7 @@ void gdt_init_ap(uint32_t cpu);
 /* 设置发生特权级切换（Ring3->Ring0）时使用的内核栈指针 */
 void tss_set_rsp0(uint64_t rsp0);
 
+/* P0-8：更新 BSP TSS 的 IST 槽（n=1..7），用于安装守卫页 IST 栈 */
+void tss_set_ist(int n, uint64_t stack_top);
+
 #endif /* _SUKI_KERNEL_GDT_H */

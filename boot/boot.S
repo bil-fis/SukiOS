@@ -119,10 +119,24 @@ _start:
     movl %eax, %cr4
 .Lno_smep:
 
-    /* --- 置 EFER.LME (Long Mode Enable) --- */
+    /* --- 置 EFER.LME (Long Mode Enable) + 按需 EFER.NXE (P0-8) ---
+     * NXE(bit 11) 使 PTE bit63(NX) 生效：用户栈/堆页不可执行才真正落地。
+     * 必须先经 CPUID.80000001H:EDX[20] 探测 NX 支持——不支持的 CPU 上
+     * 置 NXE 会 #GP。掩码存 esi（cpuid 会毁 eax/ebx/ecx/edx，不碰 esi）。 */
+    movl $EFER_LME, %esi           /* esi = 待 OR 进 EFER 的位集合 */
+    movl $0x80000000, %eax
+    cpuid
+    cmpl $0x80000001, %eax         /* 最大扩展 leaf < 80000001H 则跳过 */
+    jb   .Lno_nx
+    movl $0x80000001, %eax
+    cpuid
+    testl $(1 << 20), %edx         /* NX 支持位 */
+    jz   .Lno_nx
+    orl  $(1 << 11), %esi          /* EFER.NXE */
+.Lno_nx:
     movl $EFER_MSR, %ecx
     rdmsr
-    orl  $EFER_LME, %eax
+    orl  %esi, %eax
     wrmsr
 
     /* --- 开启 CR0.PG (bit 31) 与 CR0.PE (bit 0) --- */

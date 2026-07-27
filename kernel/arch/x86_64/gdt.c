@@ -37,6 +37,9 @@ static struct gdt_ptr g_gdtr;
 
 /* 为 Ring3->Ring0 中断预留的独立 IST 栈（例如缺页/双重错误更安全） */
 static uint8_t g_ist_stack[16384] __attribute__((aligned(16)));
+/* P0-8：NMI 专用 IST2 启动期静态栈（security_init 后被守卫页栈替换）。
+ * NMI 与 #DF 必须用不同 IST——NMI 打断 #DF 处理时若共栈会互相踩帧。 */
+static uint8_t g_ist_stack_nmi[8192] __attribute__((aligned(16)));
 
 /* 构造一个标准 8 字节代码/数据段描述符 */
 static uint64_t make_segment(bool code, int dpl, bool long_mode)
@@ -115,6 +118,16 @@ void tss_set_rsp0(uint64_t rsp0)
     g_tss.rsp0 = rsp0;
 }
 
+/* P0-8：更新 BSP TSS 的 IST 槽（n=1..7）。security_init 用带守卫页的
+ * 新栈替换启动期静态 IST 栈；CPU 每次取 IST 都实时读 TSS 内存，无需
+ * 重新 ltr（TSS 描述符地址未变），下一次异常即生效。 */
+void tss_set_ist(int n, uint64_t stack_top)
+{
+    if (n >= 1 && n <= 7) {
+        g_tss.ist[n - 1] = stack_top;
+    }
+}
+
 void gdt_init(void)
 {
     /* 初始化 TSS */
@@ -122,7 +135,8 @@ void gdt_init(void)
         ((uint8_t *)&g_tss)[i] = 0;
     }
     g_tss.rsp0 = (uint64_t)0;                       /* 稍后由调度器/进入用户态前设置 */
-    g_tss.ist[0] = (uint64_t)(g_ist_stack + sizeof(g_ist_stack)); /* IST1 */
+    g_tss.ist[0] = (uint64_t)(g_ist_stack + sizeof(g_ist_stack)); /* IST1: #DF */
+    g_tss.ist[1] = (uint64_t)(g_ist_stack_nmi + sizeof(g_ist_stack_nmi)); /* IST2: NMI */
     g_tss.iomap_base = sizeof(struct tss_entry);    /* 无 I/O 位图 */
 
     /* 段描述符 */
@@ -150,6 +164,7 @@ void gdt_init(void)
 static uint64_t g_gdt_ap[MAX_CPUS][7];
 static struct tss_entry g_tss_ap[MAX_CPUS];
 static uint8_t g_ist_ap[MAX_CPUS][4096] __attribute__((aligned(16)));
+static uint8_t g_ist2_ap[MAX_CPUS][4096] __attribute__((aligned(16))); /* NMI */
 static struct gdt_ptr g_gdtr_ap[MAX_CPUS];
 
 void gdt_init_ap(uint32_t cpu)
@@ -162,6 +177,7 @@ void gdt_init_ap(uint32_t cpu)
         ((uint8_t *)tss)[i] = 0;
     }
     tss->ist[0] = (uint64_t)(g_ist_ap[cpu] + sizeof(g_ist_ap[cpu]));
+    tss->ist[1] = (uint64_t)(g_ist2_ap[cpu] + sizeof(g_ist2_ap[cpu])); /* NMI */
     tss->iomap_base = sizeof(struct tss_entry);
 
     uint64_t *gdt = g_gdt_ap[cpu];

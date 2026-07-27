@@ -125,7 +125,10 @@ void idt_init(void)
     }
     /* 0x8E = present, DPL0, 中断门（自动关中断）。异常 8/双故障走 IST1。 */
     for (int i = 0; i < 48; i++) {
-        uint8_t ist = (i == 8) ? 1 : 0;   /* 双重错误使用 IST1 独立栈 */
+        /* P0-8：双重错误(8)=IST1，NMI(2)=IST2——两者都可能在「当前栈
+         * 不可信」时到来（栈溢出触发 #DF；NMI 可打断任意瞬间含栈切换
+         * 中途），必须走独立已知良好栈。 */
+        uint8_t ist = (i == 8) ? 1 : ((i == 2) ? 2 : 0);
         idt_set_gate(i, (uint64_t)g_stubs[i], ist, 0x8E);
     }
 

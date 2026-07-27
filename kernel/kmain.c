@@ -24,6 +24,7 @@
 #include <kernel/smp.h>
 #include <kernel/percpu.h>
 #include <kernel/diagnostics.h>
+#include <kernel/security.h>  /* P0-8：安全地基（UMIP/IST 守卫栈/Meltdown 检测） */
 #include <kernel/keyboard.h>
 #include <kernel/string.h>
 #include <kernel/task.h>
@@ -127,6 +128,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     serial_init();
     serial_writestr("\n[boot] SukiOS kernel entered (long mode, higher half).\n");
 
+    /* P0-8：极早期重播种栈金丝雀（TSC 熵）。必须在开中断/启动 AP/创建
+     * 任务之前——kmain 自身永不返回，是唯一「序言读旧值」的在飞栈帧。 */
+    stack_canary_reseed();
+
     if (magic != MULTIBOOT2_MAGIC) {
         serial_writestr("[boot] FATAL: not Multiboot2.\n");
         for (;;) { __asm__ volatile("hlt"); }
@@ -165,6 +170,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     vmm_init();
     kheap_init();
     mm_selftest();
+
+    /* ---- P0-8：安全地基总装（vmm/kheap 就绪后、SMP 启动前）----
+     * UMIP 使能 + NXE/SMEP/SMAP 复核 + BSP 守卫页 IST 栈 + Meltdown 检测 */
+    security_init();
 
     /* ---- P0-1/P0-2/P0-4：ACPI 拓扑发现 + LAPIC/IOAPIC 取代 8259 PIC+PIT ---- */
     acpi_init();                                   /* 解析 RSDP/XSDT/MADT/HPET */

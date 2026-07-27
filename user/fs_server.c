@@ -246,21 +246,42 @@ static void upcase_str(char *s)
 #define LFN_CAP 256
 static char   g_lfn[LFN_CAP];
 static int    g_lfn_seq;     /* 当前累积的最大序列号 */
+static int    g_lfn_prev;    /* 上一条已处理的序列号（L7 连续性校验用） */
 static bool   g_lfn_valid;
+static bool   g_lfn_broken;  /* L7：链中出现序号断层/伪造时整条作废 */
 
 static void lfn_reset(void)
 {
-    g_lfn[0] = '\0';
+    /* L7 修复：整段缓冲清零（而非仅 g_lfn[0]='\0'），避免上一条 LFN 残留的
+     * 非零字节在断层被判无效后，仍被 lfn_pull 的"遇 NUL 即止"逻辑误纳入新名。 */
+    memset(g_lfn, 0, sizeof(g_lfn));
     g_lfn_valid = false;
+    g_lfn_broken = false;
     g_lfn_seq = 0;
+    g_lfn_prev = 0;
 }
 
 /* 解码一条 LFN 条目，写入 (seq-1)*13 处（UTF-16LE 的 ASCII 部分） */
 static void lfn_add(const uint8_t *e)
 {
-    int seq = e[0] & 0x1F;                  /* 低 5 位 = 序列号(1-based) */
-    if (seq == 0 || seq * 13 >= LFN_CAP) {
+    if (g_lfn_broken) {                    /* 已判定无效：忽略后续条目 */
         return;
+    }
+    int seq = e[0] & 0x1F;                  /* 低 5 位 = 序列号(1-based) */
+    if (seq == 0 || seq * 13 >= LFN_CAP) { /* 越界/非法序号直接作废 */
+        g_lfn_broken = true;
+        return;
+    }
+    /* L7 修复：LFN 物理逆序排列，首条为最高序号。要求每条序号严格递减 1，
+     * 任何断层（序号被伪造跳变、或重复）都说明链不可信，整条作废，
+     * 回退到 8.3 短名，杜绝"截断处无 NUL / 注入垃圾字符"问题。 */
+    if (g_lfn_seq == 0) {
+        g_lfn_prev = seq;                   /* 首条：记录起点序号 */
+    } else if (seq != g_lfn_prev - 1) {
+        g_lfn_broken = true;
+        return;
+    } else {
+        g_lfn_prev = seq;
     }
     const uint8_t *chunk[3] = { e + 1, e + 14, e + 28 };
     int nbytes[3] = { 10, 12, 4 };          /* = 5+6+2 个 UTF-16 字符 */
@@ -282,10 +303,10 @@ static void lfn_add(const uint8_t *e)
     }
 }
 
-/* 把累积的 LFN 写入 out（最长 LFN_CAP-1），返回长度；无 LFN 返回 0 */
+/* 把累积的 LFN 写入 out（最长 LFN_CAP-1），返回长度；无 LFN 或链已作废返回 0 */
 static int lfn_pull(char *out)
 {
-    if (!g_lfn_valid) {
+    if (!g_lfn_valid || g_lfn_broken) {     /* L7：断层链回退 8.3 短名 */
         return 0;
     }
     int end = g_lfn_seq * 13;

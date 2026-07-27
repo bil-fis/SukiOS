@@ -53,12 +53,38 @@ static bool user_access_ok(const void *uptr, size_t n, bool write)
     return true;
 }
 
+/* L3 修复（SMAP 用户态访问围栏）：g_smap_enabled 由 boot.S 在探测到 CPU
+ * 支持 SMAP(CPUID.07 EBX.bit19) 并置位 CR4.SMAP 后置 1。仅当该标志为真时
+ * 才在 copy_*_user 内执行 STAC/CLAC——因为 STAC/CLAC 指令本身依赖 SMAP
+ * 特性，在不支持的 CPU 上执行会触发 #UD 三重故障。SMAP 开启后，内核以
+ * 管理者态访问用户页会被阻塞，故任何触碰用户内存的路径必须先用 STAC 临时
+ * 放开（此处是系统唯一的用户指针解引用边界：copy_from_user/copy_to_user，
+ * 以及 port.c 经由这两个函数转发的 mach_msg 数据；elf.c 经 PHYS_TO_VIRT
+ * 内核直映写用户页，不涉及用户虚拟地址，不受 SMAP 约束）。 */
+uint8_t g_smap_enabled = 0;
+
+static inline void smap_stac(void)
+{
+    if (g_smap_enabled) {
+        __asm__ volatile("stac" ::: "cc", "memory");
+    }
+}
+static inline void smap_clac(void)
+{
+    if (g_smap_enabled) {
+        __asm__ volatile("clac" ::: "cc", "memory");
+    }
+}
+
 size_t copy_from_user(void *dest, const void *user_src, size_t n)
 {
     if (!user_access_ok(user_src, n, false)) {
         return 0;                      /* 返回 0 = EFAULT，不触发 panic */
     }
+    /* L3：SMAP 开启时，用户页对管理者态不可直接访问，须 STAC 临时放行 */
+    smap_stac();
     memcpy(dest, user_src, n);
+    smap_clac();
     return n;
 }
 
@@ -67,7 +93,10 @@ size_t copy_to_user(void *user_dest, const void *src, size_t n)
     if (!user_access_ok(user_dest, n, true)) {
         return 0;
     }
+    /* L3：同上，写用户页前 STAC 放行 */
+    smap_stac();
     memcpy(user_dest, src, n);
+    smap_clac();
     return n;
 }
 
@@ -115,20 +144,30 @@ static uint64_t sys_yield(void)
     return 0;
 }
 
-/* 4: sys_debug_write(buf, len) —— 调试输出，验证 copy_from_user */
+/* 4: sys_debug_write(buf, len) —— 调试输出，验证 copy_from_user
+ * L1 修复：旧实现把单条硬截断到 256B 并静默丢弃剩余字节，长日志（如
+ * 内核转储、大段追踪）被截断丢失。改为分块循环：每次从用户态拷入最多
+ * 255 字节的临时缓冲并立即 kprintf，直至全部 len 处理完毕；中途遇非法
+ * 用户指针则停止并返回已成功写入的字节数（done>0 时不报 -1，保证已输出
+ * 部分不丢失）。彻底消除"单条截断导致可观测性缺失"。 */
 static uint64_t sys_debug_write(uint64_t buf_uptr, uint64_t len)
 {
     char kbuf[256];
-    if (len > sizeof(kbuf) - 1) {
-        len = sizeof(kbuf) - 1;
+    uint64_t done = 0;
+    while (done < len) {
+        size_t chunk = (size_t)(len - done);
+        if (chunk > sizeof(kbuf) - 1) {
+            chunk = sizeof(kbuf) - 1;
+        }
+        if (copy_from_user(kbuf, (const void *)(buf_uptr + done), chunk) != chunk) {
+            /* 非法用户指针：返回已输出部分（done>0）或 -1（一条都没输出） */
+            return done ? done : (uint64_t)-1;
+        }
+        kbuf[chunk] = '\0';
+        kprintf("%s", kbuf);
+        done += chunk;
     }
-    size_t got = copy_from_user(kbuf, (const void *)buf_uptr, len);
-    if (got == 0 && len != 0) {
-        return (uint64_t)-1;           /* 非法用户指针 */
-    }
-    kbuf[got] = '\0';
-    kprintf("%s", kbuf);
-    return got;
+    return done;
 }
 
 /* 5: sys_input_read —— 非阻塞取原始扫描码；无数据返回 (uint64_t)-1 */

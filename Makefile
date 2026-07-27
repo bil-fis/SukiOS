@@ -29,7 +29,7 @@ ISO    := $(BUILD)/SukiOS.iso
 # 故改用 -mcmodel=large（支持任意 64 位地址）。
 CFLAGS := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
-          -mcmodel=large -fno-pic -fno-pie -fno-stack-protector \
+          -mcmodel=large -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
           -fno-asynchronous-unwind-tables -fno-omit-frame-pointer \
           -I include
 
@@ -46,9 +46,10 @@ S_SRCS := boot/boot.S boot/multiboot2_header.S $(shell find kernel -name '*.S' 2
 USER_PROGS   := fs_server input_server shell
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
-                -mcmodel=small -fno-pic -fno-pie -fno-stack-protector \
+                -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
                 -fno-asynchronous-unwind-tables -I user -I include
-USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o
+USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
+                  $(BUILD)/user/lib/stack_canary.c.o
 USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.blob.o,$(USER_PROGS))
 
 # ---- 独立程序（standalone apps，源码在 user/apps/）----
@@ -61,7 +62,7 @@ APP_PROGS    := hello playaudio audiotest
 APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -mno-red-zone -msse -msse2 \
                 -ffunction-sections -fdata-sections \
-                -mcmodel=small -fno-pic -fno-pie -fno-stack-protector \
+                -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
                 -fno-asynchronous-unwind-tables -I user -I include \
                 -I user/lib/shims -I minimp3
 APP_ELFS     := $(patsubst %,$(BUILD)/apps/%.elf,$(APP_PROGS))
@@ -113,6 +114,11 @@ $(BUILD)/user/%.S.o: user/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
+# L5：用户态栈金丝雀提供文件必须以 -fno-stack-protector 编译（理由同内核）。
+$(BUILD)/user/lib/stack_canary.c.o: user/lib/stack_canary.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -fno-stack-protector -c $< -o $@
+
 $(BUILD)/user/%.c.o: user/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -151,6 +157,13 @@ $(BUILD)/%.S.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
+# L5：栈金丝雀提供文件（__stack_chk_guard / __stack_chk_fail）必须以
+# -fno-stack-protector 编译——否则 __stack_chk_fail 自身被插桩后递归调用
+# 自己，且 guard 未初始化前插桩函数会误报栈破坏。故此处覆盖全局 CFLAGS。
+$(BUILD)/kernel/stack_canary.c.o: kernel/stack_canary.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fno-stack-protector -c $< -o $@
+
 $(BUILD)/%.c.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -162,6 +175,11 @@ $(KERNEL): $(OBJS) boot/linker.ld
 	@echo "==> Linked $(KERNEL)"
 	@grub-file --is-x86-multiboot2 $(KERNEL) \
 		&& echo "==> valid Multiboot2 kernel" || echo "!! Multiboot2 header INVALID"
+	@readelf -SW $(KERNEL) | awk '$$3==".boot"{ \
+	    a=strtonum("0x"$$5); o=strtonum("0x"$$6); s=strtonum("0x"$$7); \
+	    if (a != 0x100000) { print "!! L4 FAIL: .boot VMA != 1MB (got "a")"; exit 1; } \
+	    if (o >= 0x8000 || o+s > 0x8000) { print "!! L4 FAIL: MB2 header beyond first 32KiB (off="o" size="s")"; exit 1; } \
+	    print "==> L4 check: .boot VMA=0x"a" fileoff=0x"o" size=0x"s" (within first 32KiB)"; }'
 
 # ---- 生成可引导 ISO (BIOS + UEFI 双启动) ----
 iso: $(ISO)

@@ -23,7 +23,10 @@
 #include <kernel/elf.h>
 #include <ipc/port.h>
 
-#define KSTACK_SIZE  16384
+/* 每任务内核栈大小（字节）。注意：这是 Ring0 内核栈（syscall/中断/调度时
+ * 使用），与用户态栈(USER_STACK_PAGES，32 页=128KiB)是两套完全独立的栈，
+ * 二者单位与用途都不同，切勿混淆。 */
+#define KERNEL_STACK_BYTES  16384
 #define MAX_TASKS       256
 /* M7 修复：内核栈底守卫哨兵。任务内核栈从高地址向下增长，栈底写入哨兵；
  * 若向下溢出破坏相邻堆块，哨兵会被覆盖。每次调度前校验当前任务栈底哨兵。 */
@@ -103,7 +106,7 @@ task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
     if (!t) {
         return NULL;
     }
-    void *stack = kmalloc(KSTACK_SIZE);
+    void *stack = kmalloc(KERNEL_STACK_BYTES);
     if (!stack) {
         kfree(t);
         return NULL;
@@ -116,7 +119,7 @@ task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
     t->is_user = false;
     t->alive = true;
     t->kstack_base = (uint64_t)stack;
-    t->kstack_top  = (uint64_t)stack + KSTACK_SIZE;
+    t->kstack_top  = (uint64_t)stack + KERNEL_STACK_BYTES;
     *(uint64_t *)stack = KSTACK_CANARY;   /* M7：内核栈底守卫哨兵 */
     strncpy(t->name, name ? name : "kthread", sizeof(t->name) - 1);
 

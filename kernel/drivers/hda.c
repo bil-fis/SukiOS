@@ -384,13 +384,30 @@ static bool hda_codec_setup(void)
 
     /* Pin 的连接列表中定位 DAC，设置连接选择 */
     uint32_t cll = hda_param(g_nid_pin, PAR_CONN_LIST_LEN);
+    if (cll == HDA_VERB_TIMEOUT) {           /* L6：响应超时当错误，不臆造 */
+        kprintf("[hda] pin %u GET_CONN_LIST_LEN TIMEOUT\n", g_nid_pin);
+        return false;
+    }
     uint32_t len = cll & 0x7F;
+    /* L6 修复：异常 codec 可能报告超大连接列表长度（CONN_LIST_LEN 域仅 7 位
+     * 但可被损坏/伪造），导致无界 verb 轮询甚至读取越界的响应窗口。把长度
+     * 钳制到 64（真实 codec 连接数极少超过 4），杜绝异常拓扑下的越界读。 */
+    if (len > 64) {
+        kprintf("[hda] pin %u conn list len %u clamped to 64\n",
+                g_nid_pin, len);
+        len = 64;
+    }
     bool longform = (cll & 0x80) != 0;
     int sel = -1;
     for (uint32_t i = 0; i < len; i++) {
         uint32_t per = longform ? 2 : 4;
         uint32_t ent = hda_verb(g_nid_pin, VERB_GET_CONN_LIST,
                                 (i / per) * per);
+        if (ent == HDA_VERB_TIMEOUT) {       /* L6：单条连接项超时即放弃 */
+            kprintf("[hda] pin %u conn list entry TIMEOUT at %u\n",
+                    g_nid_pin, i);
+            break;
+        }
         uint32_t shift = (i % per) * (longform ? 16 : 8);
         uint32_t mask  = longform ? 0xFFFF : 0xFF;
         uint32_t nid   = (ent >> shift) & mask & 0x7F;

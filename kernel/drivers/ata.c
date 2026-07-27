@@ -43,7 +43,8 @@
 #define CMD_IDENTIFY      0xEC
 
 static bool     g_disk_present = false;
-static uint32_t g_total_sectors = 0;
+static uint64_t g_total_sectors = 0;      /* L2：改为 64 位，容纳 LBA48 容量 */
+static bool     g_lba48 = false;          /* L2：磁盘是否支持 LBA48 寻址 */
 
 /* 读备用状态寄存器 4 次 ≈ 400ns 通道稳定延迟 */
 static void ata_delay400(void)
@@ -124,11 +125,53 @@ bool ata_init(void)
     for (int i = 0; i < 256; i++) {
         id[i] = inw(ATA_DATA);
     }
-    g_total_sectors = (uint32_t)id[60] | ((uint32_t)id[61] << 16);
+
+    /* L2 修复：容量优先取 LBA48（word 100-103，最多 2^48-1 扇区），
+     * 避免旧实现只认 LBA28(word60-61, 上限 2^28-1≈128GiB) 导致 >128GB
+     * 盘容量被截断。word83 bit10 指示 LBA48 支持。 */
+    uint64_t lba28 = (uint64_t)id[60] | ((uint64_t)id[61] << 16);
+    uint64_t lba48 = (uint64_t)id[100]
+                   | ((uint64_t)id[101] << 16)
+                   | ((uint64_t)id[102] << 32)
+                   | ((uint64_t)id[103] << 48);
+    g_lba48 = (id[83] & 0x0400) != 0;     /* word83 bit10 = LBA48 支持 */
+    if (g_lba48 && lba48 > 0) {
+        g_total_sectors = lba48;
+    } else {
+        g_total_sectors = lba28;
+    }
     g_disk_present = true;
-    kprintf("[ata] primary master OK: %u sectors (%u MiB)\n",
-            g_total_sectors, g_total_sectors / 2048);
+    kprintf("[ata] primary master OK: %lu sectors (%lu MiB) lba48=%u\n",
+            (unsigned long)g_total_sectors, (unsigned long)(g_total_sectors / 2048),
+            (unsigned)g_lba48);
     return true;
+}
+
+/* L2 修复：统一的 LBA 选择原语。
+ * - 28 位模式：DRIVE 高 4 位装 lba[24:27]，其余经 LBA_LO/MID/HI。
+ * - 48 位模式：计数字节与 LBA 各写两次（先高 24 位、后低 24 位），
+ *   DRIVE 仅置 LBA 位(0x40)不带高 4 位；命令改用 READ/WRITE SECTORS EXT。
+ * 仅在 lba 跨越 28 位边界(0x0FFFFFFF)且磁盘支持 LBA48 时才走 48 位路径，
+ * 故 <128GiB 的常见盘（含 QEMU 64MB 测试盘）仍走 LBA28，零回归风险。 */
+static void ata_select_lba(uint64_t lba, uint8_t count, bool use48)
+{
+    if (use48) {
+        outb(ATA_SECCNT, 0);                          /* 计数字节高 8 位 */
+        outb(ATA_LBA_LO,  (lba >> 24) & 0xFF);
+        outb(ATA_LBA_MID, (lba >> 32) & 0xFF);
+        outb(ATA_LBA_HI,  (lba >> 40) & 0xFF);
+        outb(ATA_SECCNT, count);                      /* 计数字节低 8 位 */
+        outb(ATA_LBA_LO,  lba & 0xFF);
+        outb(ATA_LBA_MID, (lba >> 8) & 0xFF);
+        outb(ATA_LBA_HI,  (lba >> 16) & 0xFF);
+        outb(ATA_DRIVE, 0x40);                        /* LBA 模式（48 位寻址）*/
+    } else {
+        outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+        outb(ATA_SECCNT, count);
+        outb(ATA_LBA_LO,  lba & 0xFF);
+        outb(ATA_LBA_MID, (lba >> 8) & 0xFF);
+        outb(ATA_LBA_HI,  (lba >> 16) & 0xFF);
+    }
 }
 
 bool ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
@@ -145,12 +188,9 @@ bool ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
         return false;
     }
 
-    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));   /* LBA 模式 + 高 4 位 */
-    outb(ATA_SECCNT, count);
-    outb(ATA_LBA_LO,  lba & 0xFF);
-    outb(ATA_LBA_MID, (lba >> 8) & 0xFF);
-    outb(ATA_LBA_HI,  (lba >> 16) & 0xFF);
-    outb(ATA_CMD, CMD_READ_SECTORS);
+    bool use48 = g_lba48 && ((uint64_t)lba + count) > 0x0FFFFFFFULL;
+    ata_select_lba(lba, count, use48);
+    outb(ATA_CMD, use48 ? 0x24 : CMD_READ_SECTORS);   /* READ SECTORS EXT */
 
     uint16_t *out = (uint16_t *)buf;
     for (uint8_t s = 0; s < count; s++) {
@@ -179,12 +219,9 @@ bool ata_write_sectors(uint32_t lba, uint8_t count, const void *buf)
         return false;
     }
 
-    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(ATA_SECCNT, count);
-    outb(ATA_LBA_LO,  lba & 0xFF);
-    outb(ATA_LBA_MID, (lba >> 8) & 0xFF);
-    outb(ATA_LBA_HI,  (lba >> 16) & 0xFF);
-    outb(ATA_CMD, CMD_WRITE_SECTORS);
+    bool use48 = g_lba48 && ((uint64_t)lba + count) > 0x0FFFFFFFULL;
+    ata_select_lba(lba, count, use48);
+    outb(ATA_CMD, use48 ? 0x34 : CMD_WRITE_SECTORS);  /* WRITE SECTORS EXT */
 
     const uint16_t *in = (const uint16_t *)buf;
     for (uint8_t s = 0; s < count; s++) {
@@ -205,7 +242,7 @@ bool ata_write_sectors(uint32_t lba, uint8_t count, const void *buf)
     return !(inb(ATA_STATUS) & ST_ERR);
 }
 
-uint32_t ata_total_sectors(void)
+uint64_t ata_total_sectors(void)
 {
     return g_total_sectors;
 }

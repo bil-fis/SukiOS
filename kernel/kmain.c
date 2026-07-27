@@ -29,6 +29,10 @@
 #include <kernel/ata.h>
 #include <kernel/hda.h>
 
+/* L3：由 boot.S 在探测到 CPU 支持 SMAP 后置 1（见 syscall.c 的 copy_*_user
+ * 围栏）。此处仅用于启动日志输出以验证 SMAP 是否真正生效。 */
+extern uint8_t g_smap_enabled;
+
 /* Ring3 用户程序 blob（user/ 下的 C 程序，Makefile 嵌入内核镜像） */
 extern const uint8_t user_fs_server_start[],    user_fs_server_end[];
 extern const uint8_t user_input_server_start[], user_input_server_end[];
@@ -127,7 +131,6 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
 
     /* Unicode/中文显示自测：含中文与 U+2713 勾号（3 字节 UTF-8） */
     kprintf("[console] UTF-8 test: 中文显示正常 ✓ 操作系统启动成功\n");
-
     kprintf("========================================\n");
     kprintf("      SukiOS  x86_64  Hybrid Kernel     \n");
     kprintf("========================================\n");
@@ -135,6 +138,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
             fb_available() ? "framebuffer (graphics)" : "VGA text (fallback)");
     kprintf("[boot] usable RAM: %u MiB\n",
             (unsigned)(g_boot.mem_total / (1024 * 1024)));
+    /* L3：确认 SMAP（管理者态不可访问用户页）是否已随 boot.S 探测生效。
+     * 若 CPU 不支持（如极旧虚拟机）则为 disabled，系统仍可运行但丧失该防线。 */
+    kprintf("[boot] SMAP (user-memory protection): %s\n",
+            g_smap_enabled ? "ENABLED" : "disabled (CPU lacks SMAP)");
 
     /* ---- 阶段三：中断子系统 ---- */
     gdt_init();

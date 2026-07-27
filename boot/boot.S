@@ -31,6 +31,7 @@
 .code32
 .global _start
 .type _start, @function
+.global g_smap_enabled           /* 由 C 端 syscall.c 定义；探测到 SMAP 后置 1 */
 _start:
     cli
     cld
@@ -150,6 +151,23 @@ long_mode_start:
      * (movl 到 32 位寄存器会自动零扩展到 64 位) */
     movl save_magic, %edi          /* rdi = magic */
     movl save_mbi,   %esi          /* rsi = mbi 物理地址 */
+
+    /* L3 修复（SMAP 启用）：必须放在 64 位段——g_smap_enabled 位于高半区
+     * .bss（地址 >4GB），32 位段无法用 32 位位移寻址。此处用 movabsq 装载
+     * 其完整 64 位地址后再写。仅当 CPU 支持 SMAP(CPUID.07 EBX.bit19) 才置
+     * CR4.SMAP 并令 g_smap_enabled=1，使 syscall.c 的 copy_*_user 在该硬件
+     * 上执行 STAC/CLAC 围栏（不支持的 CPU 不置位，避免 STAC/CLAC 触发 #UD）。 */
+    movl $7, %eax
+    xorl %ecx, %ecx
+    cpuid
+    testl $(1 << 19), %ebx         /* SMAP 支持位 */
+    jz   .Lno_smap
+    movq %cr4, %rax
+    orl  $(1 << 21), %eax          /* CR4.SMAP */
+    movq %rax, %cr4
+    movabsq $g_smap_enabled, %rax
+    movb $1, (%rax)
+.Lno_smap:
 
     /* 绝对跳转到高半区入口 */
     movabs $higher_half_entry, %rax

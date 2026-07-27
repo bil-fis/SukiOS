@@ -138,6 +138,55 @@ uint32_t lapic_timer_counts_per_sec(void)
     return (uint32_t)g_lapic_counts_per_sec;
 }
 
+/* ---- IPI（P0-3 SMP）---- */
+
+/* 等待 ICR 投递完成（Delivery Status，bit12=1 表示上一条 IPI 仍在投递） */
+static void lapic_icr_wait(void)
+{
+    uint32_t guard = 0;
+    while (lapic_read(LAPIC_ICR_LOW) & (1u << 12)) {
+        __asm__ volatile("pause" ::: "memory");
+        if (++guard == 0) {
+            break;   /* 极端超时：放弃等待，避免锁死 */
+        }
+    }
+}
+
+/* 写 ICR 发送 IPI：先写 HIGH（目标），再写 LOW（触发） */
+static void lapic_icr_send(uint8_t apic_id, uint32_t low)
+{
+    lapic_write(LAPIC_ICR_HIGH, (uint32_t)apic_id << 24);
+    lapic_write(LAPIC_ICR_LOW, low);
+    lapic_icr_wait();
+}
+
+void lapic_send_init(uint8_t apic_id)
+{
+    /* INIT assert：delivery=101b(INIT)，level=assert(bit14)，trigger=level(bit15) */
+    lapic_icr_send(apic_id, 0x0000C500u);
+    /* INIT deassert（部分老平台需要；QEMU/现代 CPU 兼容） */
+    lapic_icr_send(apic_id, 0x00008500u);
+}
+
+void lapic_send_startup(uint8_t apic_id, uint8_t vector)
+{
+    /* SIPI：delivery=110b(Start-Up)，vector=物理页号（CS=vector<<8） */
+    lapic_icr_send(apic_id, 0x00004600u | vector);
+}
+
+void lapic_send_ipi(uint8_t apic_id, uint8_t vector)
+{
+    /* 固定投递（000b）、物理目标、edge、assert */
+    lapic_icr_send(apic_id, 0x00004000u | vector);
+}
+
+void lapic_broadcast_ipi(uint8_t vector)
+{
+    /* 目标简写 11b（bit19:18）= all excluding self，无需写 ICR_HIGH */
+    lapic_write(LAPIC_ICR_LOW, 0x000C4000u | vector);
+    lapic_icr_wait();
+}
+
 void lapic_timer_start(uint8_t vector, uint32_t hz)
 {
     if (g_lapic_counts_per_sec == 0 || hz == 0) {

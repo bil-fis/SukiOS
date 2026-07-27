@@ -23,6 +23,8 @@
 #define GDT_TSS_SELECTOR  0x28
 
 void gdt_init(void);
+/* AP 专用：安装该 CPU 自己的 GDT+TSS（TR 每 CPU 独立，P0-3）。cpu>=1。 */
+void gdt_init_ap(uint32_t cpu);
 /* 设置发生特权级切换（Ring3->Ring0）时使用的内核栈指针 */
 void tss_set_rsp0(uint64_t rsp0);
 

@@ -21,6 +21,8 @@
 #include <kernel/apic.h>
 #include <kernel/ioapic.h>
 #include <kernel/clock.h>
+#include <kernel/smp.h>
+#include <kernel/percpu.h>
 #include <kernel/diagnostics.h>
 #include <kernel/keyboard.h>
 #include <kernel/string.h>
@@ -166,6 +168,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     ioapic_set_dest(bsp_lapic);                    /* 中断投递到 BSP */
     pic_disable();                                 /* 屏蔽遗留 8259，防双投递 */
     clock_init();                                  /* TSC 校准 + LAPIC 100Hz 节拍 + HPET 探测 */
+
+    /* ---- P0-3：SMP —— BSP percpu 安装 + AP 启动（INIT-SIPI-SIPI）---- */
+    percpu_install(0, bsp_lapic);                  /* BSP 的 GS_BASE -> percpu[0] */
+    smp_init();                                    /* 依 MADT 唤醒全部 AP */
 
     /* ---- 阶段五：调度器 ---- */
     sched_init();

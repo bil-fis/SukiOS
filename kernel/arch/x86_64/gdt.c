@@ -7,6 +7,7 @@
  *           进入 Ring3 前须先由 tss_set_rsp0() 设定内核栈。
  */
 #include <kernel/gdt.h>
+#include <kernel/percpu.h>
 #include <kernel/console.h>
 
 /* 64 位 TSS 结构 */
@@ -139,4 +140,52 @@ void gdt_init(void)
     tss_load(GDT_TSS_SELECTOR);
 
     kprintf("[gdt] GDT+TSS loaded (kcode=0x08 kdata=0x10 ucode=0x1B udata=0x23 tss=0x28)\n");
+}
+
+/* ---- P0-3：AP 专属 GDT/TSS ----
+ * TR（任务寄存器）指向的 TSS busy 位是每 CPU 的：多个 CPU 不能共享同一
+ * TSS 描述符（第二次 ltr 会因 busy 位置位而 #GP）。故每个 AP 一套
+ * GDT + TSS + IST 栈。AP 当前不跑 Ring3 任务，TSS.rsp0 暂不使用，但
+ * IST1 必须有效（IDT 向量 8 双重错误配置了 IST1）。 */
+static uint64_t g_gdt_ap[MAX_CPUS][7];
+static struct tss_entry g_tss_ap[MAX_CPUS];
+static uint8_t g_ist_ap[MAX_CPUS][4096] __attribute__((aligned(16)));
+static struct gdt_ptr g_gdtr_ap[MAX_CPUS];
+
+void gdt_init_ap(uint32_t cpu)
+{
+    if (cpu >= MAX_CPUS) {
+        return;
+    }
+    struct tss_entry *tss = &g_tss_ap[cpu];
+    for (size_t i = 0; i < sizeof(*tss); i++) {
+        ((uint8_t *)tss)[i] = 0;
+    }
+    tss->ist[0] = (uint64_t)(g_ist_ap[cpu] + sizeof(g_ist_ap[cpu]));
+    tss->iomap_base = sizeof(struct tss_entry);
+
+    uint64_t *gdt = g_gdt_ap[cpu];
+    gdt[0] = 0;
+    gdt[1] = make_segment(true,  0, true);
+    gdt[2] = make_segment(false, 0, false);
+    gdt[3] = make_segment(true,  3, true);
+    gdt[4] = make_segment(false, 3, false);
+    /* TSS 描述符（16 字节，占槽 5/6），指向本 CPU 的 TSS */
+    {
+        uint64_t base = (uint64_t)tss;
+        uint32_t limit = sizeof(struct tss_entry) - 1;
+        uint64_t low = 0;
+        low |= (limit & 0xFFFF);
+        low |= (base & 0xFFFFFF) << 16;
+        low |= (uint64_t)0x89 << 40;
+        low |= (uint64_t)((limit >> 16) & 0xF) << 48;
+        low |= ((base >> 24) & 0xFF) << 56;
+        gdt[5] = low;
+        gdt[6] = (base >> 32) & 0xFFFFFFFF;
+    }
+
+    g_gdtr_ap[cpu].limit = sizeof(g_gdt_ap[cpu]) - 1;
+    g_gdtr_ap[cpu].base  = (uint64_t)gdt;
+    gdt_load(&g_gdtr_ap[cpu]);
+    tss_load(GDT_TSS_SELECTOR);
 }

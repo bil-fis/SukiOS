@@ -14,6 +14,12 @@
 #include <mm/pmm.h>
 #include <kernel/string.h>
 #include <kernel/console.h>
+#include <kernel/spinlock.h>
+
+/* P0-3：内核堆全局锁。锁序（外层->内层）：kmalloc -> pmm -> console，
+ * 即持本锁期间可再拿 pmm 锁（kheap_grow）与 console 锁（诊断打印），
+ * 反向（pmm/console 持锁时拿本锁）不存在，无 ABBA 环。 */
+static spinlock_t g_kheap_lock = SPINLOCK_INIT("kheap");
 
 typedef struct block {
     uint64_t      size;     /* 可用负载字节数（不含头部） */
@@ -125,21 +131,25 @@ void *kmalloc(size_t size)
         return NULL;
     }
     uint64_t want = ALIGN16(size);
+    uint64_t irqf = spin_lock_irqsave(&g_kheap_lock);
 
     for (block_t *b = g_head; b; b = b->next) {
         if (b->free && b->size >= want) {
             split_block(b, want);
             b->free = false;
+            spin_unlock_irqrestore(&g_kheap_lock, irqf);
             return (void *)((uint64_t)b + HDR_SIZE);
         }
     }
     /* 无合适块，扩容 */
     block_t *nb = kheap_extend(want);
     if (!nb) {
+        spin_unlock_irqrestore(&g_kheap_lock, irqf);
         return NULL;
     }
     split_block(nb, want);
     nb->free = false;
+    spin_unlock_irqrestore(&g_kheap_lock, irqf);
     return (void *)((uint64_t)nb + HDR_SIZE);
 }
 
@@ -158,8 +168,10 @@ void kfree(void *ptr)
         return;
     }
     block_t *b = (block_t *)((uint64_t)ptr - HDR_SIZE);
+    uint64_t irqf = spin_lock_irqsave(&g_kheap_lock);
     /* B3 项：校验哨兵，发现堆头被越界写破坏则停止，避免链表进一步崩坏 */
     if (b->canary != blk_canary(b)) {
+        spin_unlock_irqrestore(&g_kheap_lock, irqf);
         kprintf("[kheap] CORRUPTION: bad canary at %p, aborting kfree\n", (void *)b);
         return;
     }
@@ -168,6 +180,7 @@ void kfree(void *ptr)
      * next/prev 指针（释放后哨兵虽在，但 free 标志已被置位）。此处显式拒绝
      * 对已释放块的二次释放。 */
     if (b->free) {
+        spin_unlock_irqrestore(&g_kheap_lock, irqf);
         kprintf("[kheap] DOUBLE FREE at %p, ignoring\n", (void *)b);
         return;
     }
@@ -177,6 +190,7 @@ void kfree(void *ptr)
     if (b->next && b->next->free &&
         (uint64_t)b->next == (uint64_t)b + HDR_SIZE + b->size) {
         if (b->next->canary != blk_canary(b->next)) {
+            spin_unlock_irqrestore(&g_kheap_lock, irqf);
             kprintf("[kheap] CORRUPTION: bad canary in next block\n");
             return;
         }
@@ -197,4 +211,5 @@ void kfree(void *ptr)
         }
         b->prev->canary = blk_canary(b->prev);
     }
+    spin_unlock_irqrestore(&g_kheap_lock, irqf);
 }

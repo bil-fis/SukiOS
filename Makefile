@@ -83,10 +83,13 @@ QEMU        := qemu-system-x86_64
 # 执行，minimp3 解码可达实时数十倍；纯 TCG 仿真解码仅 ~1/8 实时，音频
 # 必然断续）。可用 make run QEMU_ACCEL=tcg 强制回退软件仿真。
 QEMU_ACCEL  ?= $(shell test -w /dev/kvm && echo kvm || echo tcg)
+# P0-3 SMP：-smp 4 让 SeaBIOS 生成含 4 个 LAPIC 条目的 MADT，内核经
+# INIT-SIPI-SIPI 唤醒 3 个 AP。可用 make run QEMU_SMP=1 回退单核验证。
+QEMU_SMP    ?= 4
 ifeq ($(QEMU_ACCEL),kvm)
-QEMU_FLAGS  := -machine pc,accel=kvm -cpu host -m 2G -no-shutdown
+QEMU_FLAGS  := -machine pc,accel=kvm -cpu host -smp $(QEMU_SMP) -m 2G -no-shutdown
 else
-QEMU_FLAGS  := -machine pc -cpu qemu64 -m 2G -no-shutdown
+QEMU_FLAGS  := -machine pc -cpu qemu64 -smp $(QEMU_SMP) -m 2G -no-shutdown
 endif
 QEMU_DISK   := -drive file=$(DISK),format=raw,index=0,media=disk
 QEMU_SERIAL := -serial stdio

@@ -27,6 +27,7 @@ typedef struct registers {
 typedef void (*isr_handler_t)(registers_t *);
 
 void idt_init(void);
+void idt_load_ap(void);     /* P0-3：AP 加载共享 IDT */
 void register_interrupt_handler(uint8_t vec, isr_handler_t handler);
 
 /* 开/关中断（隔离封装） */

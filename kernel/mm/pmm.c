@@ -13,7 +13,12 @@
  */
 #include <mm/pmm.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
 #include <kernel/console.h>
+
+/* P0-3（销 H8/M2 单核假设）：位图与引用计数的全部读改写路径由自旋锁
+ * 串行化。锁序：pmm < console（pmm 持锁期间允许 kprintf）。 */
+static spinlock_t g_pmm_lock = SPINLOCK_INIT("pmm");
 
 extern char __kernel_phys_end[];   /* 链接脚本：内核物理结束地址 */
 
@@ -102,24 +107,29 @@ void pmm_init(const boot_info_t *bi)
 
 void *pmm_alloc_page(void)
 {
+    uint64_t f = spin_lock_irqsave(&g_pmm_lock);
     for (uint64_t pg = g_meta_end_phys / PAGE_SIZE; pg < g_total_pages; pg++) {
         if (!bm_test(pg)) {
             bm_set(pg);
             g_used_pages++;
             g_refcount[pg] = 1;
             void *phys = (void *)(pg * PAGE_SIZE);
-            /* 清零新页（经高半区映射访问） */
+            spin_unlock_irqrestore(&g_pmm_lock, f);
+            /* 清零新页（经高半区映射访问；页已归本调用方独占，锁外安全） */
             memset(PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
             return phys;
         }
     }
+    spin_unlock_irqrestore(&g_pmm_lock, f);
     return NULL;   /* 内存耗尽 */
 }
 
 void pmm_free_page(void *phys_addr)
 {
     uint64_t pg = (uint64_t)phys_addr / PAGE_SIZE;
+    uint64_t f = spin_lock_irqsave(&g_pmm_lock);
     if (pg >= g_total_pages || !bm_test(pg)) {
+        spin_unlock_irqrestore(&g_pmm_lock, f);
         return;
     }
     /* M2 审计修复：共享页直接释放守卫。此前 pmm_free_page 无视引用计数直接
@@ -132,16 +142,19 @@ void pmm_free_page(void *phys_addr)
         if (g_refcount[pg] != PMM_REF_SATURATED) {
             g_refcount[pg]--;
         }
+        spin_unlock_irqrestore(&g_pmm_lock, f);
         return;
     }
     bm_clear(pg);
     g_refcount[pg] = 0;
     g_used_pages--;
+    spin_unlock_irqrestore(&g_pmm_lock, f);
 }
 
 void pmm_incref(void *phys_addr)
 {
     uint64_t pg = (uint64_t)phys_addr / PAGE_SIZE;
+    uint64_t f = spin_lock_irqsave(&g_pmm_lock);
     if (pg < g_total_pages) {
         /* M2 修复：引用计数溢出防护。OOL 共享页的 refcount 若被无限 incref
          * 会回绕为 0，使释放逻辑误判页已无引用而提前回收（被他任务仍持有的
@@ -156,18 +169,22 @@ void pmm_incref(void *phys_addr)
             }
         }
     }
+    spin_unlock_irqrestore(&g_pmm_lock, f);
 }
 
 uint64_t pmm_decref(void *phys_addr)
 {
     uint64_t pg = (uint64_t)phys_addr / PAGE_SIZE;
+    uint64_t f = spin_lock_irqsave(&g_pmm_lock);
     if (pg >= g_total_pages || g_refcount[pg] == 0) {
+        spin_unlock_irqrestore(&g_pmm_lock, f);
         return 0;
     }
     /* M2 审计修复（饱和粘滞）：计数曾封顶意味着有 incref 未被计入——真实
      * 持有者数 >= 计数值。若此处照常递减，计数会先于真实持有者归零并释放页，
      * 造成 use-after-free。故饱和页永不递减、永不释放（钉住，宁泄漏不悬空）。 */
     if (g_refcount[pg] == PMM_REF_SATURATED) {
+        spin_unlock_irqrestore(&g_pmm_lock, f);
         return PMM_REF_SATURATED;
     }
     g_refcount[pg]--;
@@ -178,6 +195,7 @@ uint64_t pmm_decref(void *phys_addr)
         bm_clear(pg);
         g_used_pages--;
     }
+    spin_unlock_irqrestore(&g_pmm_lock, f);
     return rem;
 }
 

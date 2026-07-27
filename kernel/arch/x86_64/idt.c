@@ -45,6 +45,8 @@ extern void isr32(void); extern void isr33(void); extern void isr34(void); exter
 extern void isr36(void); extern void isr37(void); extern void isr38(void); extern void isr39(void);
 extern void isr40(void); extern void isr41(void); extern void isr42(void); extern void isr43(void);
 extern void isr44(void); extern void isr45(void); extern void isr46(void); extern void isr47(void);
+/* IPI 向量存根（P0-3 SMP，见 isr.S） */
+extern void isr240(void); extern void isr241(void); extern void isr242(void);
 
 static void (*const g_stubs[48])(void) = {
     isr0,isr1,isr2,isr3,isr4,isr5,isr6,isr7,isr8,isr9,isr10,isr11,
@@ -121,13 +123,24 @@ void idt_init(void)
         idt_set_gate(i, (uint64_t)g_stubs[i], ist, 0x8E);
     }
 
+    /* IPI 向量（P0-3）：0xF0 重调度 / 0xF1 TLB 刷新 / 0xF2 停机 */
+    idt_set_gate(240, (uint64_t)isr240, 0, 0x8E);
+    idt_set_gate(241, (uint64_t)isr241, 0, 0x8E);
+    idt_set_gate(242, (uint64_t)isr242, 0, 0x8E);
+
     register_interrupt_handler(14, page_fault_handler);   /* #PF 隔离处理器 */
 
     g_idtr.limit = sizeof(g_idt) - 1;
     g_idtr.base  = (uint64_t)&g_idt;
     idt_load(&g_idtr);
 
-    kprintf("[idt] IDT loaded (48 vectors installed, #PF handler registered)\n");
+    kprintf("[idt] IDT loaded (48+IPI vectors installed, #PF handler registered)\n");
+}
+
+/* P0-3：AP 加载与 BSP 相同的 IDT（handler 表共享，per-CPU 行为由向量决定） */
+void idt_load_ap(void)
+{
+    idt_load(&g_idtr);
 }
 
 /* C 语言中断分发器：由 isr_common 调用 */
@@ -157,19 +170,14 @@ void isr_dispatch(registers_t *r)
         kernel_oops("Unhandled CPU exception", r);
     }
 
-    if (vec >= IRQ_BASE && vec < IRQ_BASE + 16) {
-        /* 先发送 LAPIC EOI，再调用处理器：定时器处理器可能触发上下文切换而
-         * 长时间不返回，若 EOI 滞后会导致 LAPIC 停止投递后续中断。
-         * LAPIC EOI 同时清除本地 LVT（如定时器）与 IOAPIC 电平中断的 pending。 */
+    if (vec >= 32 && vec != 0xFF) {
+        /* 硬件 IRQ 与 IPI：先发送 LAPIC EOI，再调用处理器——定时器处理器
+         * 可能触发上下文切换而长时间不返回，若 EOI 滞后会导致 LAPIC 停止
+         * 投递后续中断。0xFF 为伪中断（spurious），规范要求不发 EOI。 */
         lapic_eoi();
         if (g_handlers[vec]) {
             g_handlers[vec](r);
         }
         return;
-    }
-
-    /* 其它向量（如软件 int）暂忽略 */
-    if (g_handlers[vec]) {
-        g_handlers[vec](r);
     }
 }

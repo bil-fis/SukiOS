@@ -14,21 +14,14 @@
 #include <kernel/framebuffer.h>
 #include <kernel/vga_text.h>
 #include <kernel/diagnostics.h>
+#include <kernel/spinlock.h>
+#include <kernel/smp.h>
 #include <stdarg.h>
 
-/* 保存并关闭中断 / 恢复：保证一条 kprintf 输出的原子性（单核足够） */
-static inline uint64_t irq_save(void)
-{
-    uint64_t flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    return flags;
-}
-static inline void irq_restore(uint64_t flags)
-{
-    if (flags & (1UL << 9)) {          /* 原 IF=1 才恢复开中断 */
-        __asm__ volatile("sti" ::: "memory");
-    }
-}
+/* P0-3：kprintf 跨 CPU 串行化自旋锁。spin_lock_irqsave = 关本地中断 +
+ * ticket 锁，单核下锁必然立即成功（退化为原 cli/sti 行为，零额外开销），
+ * SMP 下保证一条消息跨 CPU 原子输出（BSP 日志 vs AP 启动日志不撕裂）。 */
+static spinlock_t g_kp_lock = SPINLOCK_INIT("kprintf");
 
 static bool g_use_fb = false;
 /* M18 修复：kprintf 重入深度计数。单核下 irq_save 已保证一条消息原子输出，
@@ -95,9 +88,9 @@ static void print_int(int64_t val)
 
 void kprintf(const char *fmt, ...)
 {
-    uint64_t irqf = irq_save();       /* 整条消息原子输出，防多任务撕裂 */
+    uint64_t irqf = spin_lock_irqsave(&g_kp_lock);  /* 整条消息跨 CPU 原子输出 */
     if (g_kp_depth >= 4) {            /* M18：重入过深，放弃输出防递归死循环 */
-        irq_restore(irqf);
+        spin_unlock_irqrestore(&g_kp_lock, irqf);
         return;
     }
     g_kp_depth++;
@@ -175,7 +168,8 @@ void kprintf(const char *fmt, ...)
             break;
         case '\0':
             va_end(ap);
-            irq_restore(irqf);
+            g_kp_depth--;
+            spin_unlock_irqrestore(&g_kp_lock, irqf);
             return;
         default:
             kputc('%');
@@ -184,12 +178,20 @@ void kprintf(const char *fmt, ...)
         }
     }
     va_end(ap);
-    irq_restore(irqf);
     g_kp_depth--;
+    spin_unlock_irqrestore(&g_kp_lock, irqf);
 }
 
 __attribute__((noreturn)) void panic(const char *fmt, ...)
 {
+    /* P0-3：先命令其它 CPU 停机（防半死状态跑坏数据），再强制重置输出锁——
+     * 若 panic 恰发生在本 CPU 持有 g_kp_lock 的 kprintf 途中（如输出时 #PF），
+     * ticket 锁不可重入会导致永久自旋。panic 不归路 + 他核已停，重置是安全的。 */
+    smp_halt_others();
+    __asm__ volatile("cli" ::: "memory");
+    spinlock_init(&g_kp_lock, "kprintf");
+    g_kp_depth = 0;
+
     va_list ap;
     kprintf("\n[PANIC] ");
     va_start(ap, fmt);

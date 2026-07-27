@@ -25,6 +25,8 @@
 #define LAPIC_DFR       0x0E0
 #define LAPIC_SVR       0x0F0   /* Spurious Vector Register */
 #define LAPIC_ISR0      0x100   /* In-Service 寄存器（只读） */
+#define LAPIC_ICR_LOW   0x300   /* 中断命令寄存器低 32 位（写触发 IPI） */
+#define LAPIC_ICR_HIGH  0x310   /* 中断命令寄存器高 32 位（目标 LAPIC ID<<24） */
 #define LAPIC_LVT_TIMER 0x320
 #define LAPIC_LVT_LINT0 0x350
 #define LAPIC_LVT_LINT1 0x360
@@ -66,5 +68,15 @@ uint64_t lapic_timer_calibrate(uint64_t tsc_hz);
 
 /* 当前 LAPIC 定时器初始计数值（校准结果，供 lapic_timer_start 使用） */
 uint32_t lapic_timer_counts_per_sec(void);
+
+/* ---- IPI（P0-3 SMP）---- */
+/* 向目标 LAPIC 发送 INIT（assert + deassert，MP 规范唤醒序列第一步） */
+void lapic_send_init(uint8_t apic_id);
+/* 向目标 LAPIC 发送 STARTUP IPI（vector = 目标物理页号，页须 <1MB 且 4K 对齐） */
+void lapic_send_startup(uint8_t apic_id, uint8_t vector);
+/* 向单个目标发送固定向量 IPI */
+void lapic_send_ipi(uint8_t apic_id, uint8_t vector);
+/* 向除自己外所有 CPU 广播固定向量 IPI（目标简写 11b=all-excluding-self） */
+void lapic_broadcast_ipi(uint8_t vector);
 
 #endif /* _SUKI_KERNEL_APIC_H */

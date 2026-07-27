@@ -15,6 +15,7 @@
 #include <mm/pmm.h>
 #include <kernel/string.h>
 #include <kernel/console.h>
+#include <kernel/smp.h>
 
 static uint64_t g_kernel_pml4;   /* 物理地址 */
 
@@ -123,6 +124,11 @@ void vmm_unmap_page(uint64_t pml4_phys, uint64_t virt)
     uint64_t *pt = table_at(pd[i2] & PTE_ADDR_MASK);
     pt[i1] = 0;
     invlpg(virt);
+    /* P0-3：内核高半区映射被所有 CPU 共享（AP 亦缓存其 TLB 项），收回内核
+     * 映射必须广播 shootdown；用户半区当前仅 BSP 调度，本地 invlpg 已足够。 */
+    if (virt >= KERNEL_BASE) {
+        smp_tlb_shootdown();
+    }
 }
 
 uint64_t vmm_translate(uint64_t pml4_phys, uint64_t virt)

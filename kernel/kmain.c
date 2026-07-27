@@ -99,6 +99,9 @@ static void mm_selftest(void)
     uint64_t as = vmm_create_address_space();
     kprintf("[mm] new address space PML4 @ phys %p\n", (void *)as);
 
+    /* M2 审计：引用计数压测（OOL 共享/饱和粘滞/共享页守卫） */
+    pmm_selftest();
+
     kprintf("[mm] selftest: free pages after = %lu\n",
             (unsigned long)pmm_free_pages());
 }

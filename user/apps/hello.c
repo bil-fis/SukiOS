@@ -13,7 +13,7 @@
 static void print_dec(uint64_t v)
 {
     char buf[24];
-    u_print(u_utoa(v, buf));
+    u_print(u_utoa_s(v, buf, sizeof(buf)));
 }
 
 int main(int argc, char **argv)

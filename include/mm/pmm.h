@@ -26,7 +26,12 @@ void   pmm_free_page(void *phys_addr);
 
 /* 引用计数（OOL 共享页） */
 void     pmm_incref(void *phys_addr);
-uint64_t pmm_decref(void *phys_addr);     /* 减 1，返回剩余计数；到 0 自动释放 */
+uint64_t pmm_decref(void *phys_addr);     /* 减 1，返回剩余计数；到 0 自动释放。
+                                           * 饱和页(0xFFFFFFFF)粘滞：永不递减/释放 */
+uint64_t pmm_refcount(void *phys_addr);   /* 审计/自检用：读取当前引用计数 */
+
+/* M2 审计自检：OOL 共享压测 + 饱和粘滞 + 共享页守卫（boot 时调用） */
+void pmm_selftest(void);
 
 /* 统计 */
 uint64_t pmm_total_pages(void);

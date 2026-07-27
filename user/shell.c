@@ -170,9 +170,9 @@ static void run_command(char *line)
                 uint64_t rc = sys_wait((uint64_t)pid);
                 u_print("  [shell] child pid=");
                 char db[24];
-                u_print(u_utoa((uint64_t)pid, db));
+                u_print(u_utoa_s((uint64_t)pid, db, sizeof(db)));
                 u_print(" exited (code=");
-                u_print(u_utoa(rc, db));
+                u_print(u_utoa_s(rc, db, sizeof(db)));
                 u_print(")\n");
             }
         }

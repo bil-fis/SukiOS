@@ -105,26 +105,38 @@ void u_printn(const char *s, size_t n)
     sys_debug_write(s, n);
 }
 
-char *u_utoa(uint64_t v, char *buf)
+/*
+ * u_utoa_s：长度安全的十进制转换（M17 接口收尾）。
+ * - size 为 buf 总容量（含 NUL）。输出最多写 size-1 个字符 + NUL。
+ * - size == 0 时不写任何字节，返回 buf（调用方错误但绝不越界）。
+ * - 容量不足以容纳完整数字时，输出被截断为高位在前的前缀并置 NUL
+ *   （uint64 十进制最长 20 位，size >= 21 即永不截断）。
+ */
+char *u_utoa_s(uint64_t v, char *buf, size_t size)
 {
-    char tmp[24];
+    if (size == 0) {
+        return buf;
+    }
+    char tmp[21];               /* uint64 十进制最长 20 位 + 冗余 */
     int i = 0;
     if (v == 0) {
         tmp[i++] = '0';
     }
-    while (v) {
+    while (v && i < 20) {
         tmp[i++] = (char)('0' + v % 10);
         v /= 10;
-        if (i >= 23) break;     /* M17：防御上界，杜绝调用方缓冲不足时越界写 */
     }
-    int j = 0;
-    while (i > 0) {
+    size_t j = 0;
+    while (i > 0 && j + 1 < size) {     /* 恒预留 1 字节 NUL */
         buf[j++] = tmp[--i];
-        if (j >= 23) {          /* 同守输出缓冲，至多写 23 字符 + NUL */
-            buf[j] = '\0';
-            return buf;
-        }
     }
     buf[j] = '\0';
     return buf;
+}
+
+/* 兼容包装：旧接口约定调用方缓冲至少 24 字节（现有调用点均为 char[24]）。
+ * 新代码一律使用 u_utoa_s。 */
+char *u_utoa(uint64_t v, char *buf)
+{
+    return u_utoa_s(v, buf, 24);
 }

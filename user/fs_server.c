@@ -112,13 +112,13 @@ static bool fat32_mount(void)
 
     char n[24];
     u_print("[fs] FAT32 mounted: spc=");
-    u_print(u_utoa(g_sec_per_clus, n));
+    u_print(u_utoa_s(g_sec_per_clus, n, sizeof(n)));
     u_print(" fat@");
-    u_print(u_utoa(g_fat_begin, n));
+    u_print(u_utoa_s(g_fat_begin, n, sizeof(n)));
     u_print(" data@");
-    u_print(u_utoa(g_data_begin, n));
+    u_print(u_utoa_s(g_data_begin, n, sizeof(n)));
     u_print(" root_clus=");
-    u_print(u_utoa(g_root_clus, n));
+    u_print(u_utoa_s(g_root_clus, n, sizeof(n)));
     u_print("\n");
     return true;
 }
@@ -202,7 +202,7 @@ static bool list_cb(const uint8_t *e, const char *name, void *priv)
         }
     } else {
         char num[24];
-        u_utoa(size, num);
+        u_utoa_s(size, num, sizeof(num));
         const char *q = num;
         while (*q) {
             line[n++] = *q++;
@@ -711,7 +711,7 @@ static bool selftest_cb(const uint8_t *e, const char *name, void *priv)
         u_print("  <DIR>");
     } else {
         u_print("  ");
-        u_print(u_utoa(size, num));
+        u_print(u_utoa_s(size, num, sizeof(num)));
         u_print(" bytes");
     }
     u_print("\n");

@@ -166,6 +166,10 @@ void  *memset(void *d, int c, size_t n);
 void  *memmove(void *d, const void *s, size_t n);
 void   u_print(const char *s);                  /* debug_write 便捷版 */
 void   u_printn(const char *s, size_t n);
-char  *u_utoa(uint64_t v, char *buf);           /* 十进制，返回 buf */
+char  *u_utoa_s(uint64_t v, char *buf, size_t size); /* 十进制，长度安全：
+                                                 * 至多写 size-1 字符 + NUL，
+                                                 * size>=21 永不截断 */
+char  *u_utoa(uint64_t v, char *buf);           /* 兼容包装(=u_utoa_s(v,buf,24))，
+                                                 * 缓冲须 >=24 字节；新代码勿用 */
 
 #endif /* _SUKI_USER_SUKI_H */

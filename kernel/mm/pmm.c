@@ -26,6 +26,12 @@ static uint64_t  g_meta_end_phys;   /* PMM 元数据物理结束（含内核） 
 #define BIT_IDX(pg)   ((pg) >> 3)
 #define BIT_OFF(pg)   ((pg) & 7)
 
+/* M2 审计：引用计数饱和哨兵。计数一旦到达该值即"永久钉住"（pinned）：
+ * 封顶时刻曾有 incref 未被计入，意味着存在未计数的持有者；此后任何 decref
+ * 都不得再递减（否则计数会先于真实持有者归零，页被提前释放 → use-after-free）。
+ * 粘滞语义 = 宁可泄漏 1 页，绝不悬空引用。正常值域 [0, SATURATED-1]。 */
+#define PMM_REF_SATURATED  0xFFFFFFFFu
+
 static inline void bm_set(uint64_t pg)   { g_bitmap[BIT_IDX(pg)] |=  (1u << BIT_OFF(pg)); }
 static inline void bm_clear(uint64_t pg) { g_bitmap[BIT_IDX(pg)] &= ~(1u << BIT_OFF(pg)); }
 static inline bool bm_test(uint64_t pg)  { return g_bitmap[BIT_IDX(pg)] & (1u << BIT_OFF(pg)); }
@@ -116,6 +122,18 @@ void pmm_free_page(void *phys_addr)
     if (pg >= g_total_pages || !bm_test(pg)) {
         return;
     }
+    /* M2 审计修复：共享页直接释放守卫。此前 pmm_free_page 无视引用计数直接
+     * 清零释放——若某路径对 refcount>1 的 OOL 共享页误调 free_page（而非
+     * decref），其它持有者的映射立即指向已释放页。此处把误用降级为 decref
+     * 语义：仅释放一份引用并告警，页保留给其余持有者；饱和页粘滞不递减。 */
+    if (g_refcount[pg] > 1) {
+        kprintf("[pmm] free_page on SHARED page %lu (ref=%u), demoted to decref\n",
+                (unsigned long)pg, (unsigned)g_refcount[pg]);
+        if (g_refcount[pg] != PMM_REF_SATURATED) {
+            g_refcount[pg]--;
+        }
+        return;
+    }
     bm_clear(pg);
     g_refcount[pg] = 0;
     g_used_pages--;
@@ -127,13 +145,15 @@ void pmm_incref(void *phys_addr)
     if (pg < g_total_pages) {
         /* M2 修复：引用计数溢出防护。OOL 共享页的 refcount 若被无限 incref
          * 会回绕为 0，使释放逻辑误判页已无引用而提前回收（被他任务仍持有的
-         * 共享页遭破坏）。此处封顶 UINT32_MAX，到顶即拒绝并告警。
+         * 共享页遭破坏）。此处封顶 PMM_REF_SATURATED，到顶即进入永久钉住态
+         * （见 pmm_decref 的粘滞语义）并告警。
          * （pmm_alloc_page/位图非原子问题随 P0-3 锁体系销账。） */
-        if (g_refcount[pg] < 0xFFFFFFFFUL) {
+        if (g_refcount[pg] < PMM_REF_SATURATED) {
             g_refcount[pg]++;
-        } else {
-            kprintf("[pmm] refcount overflow at page %lu\n",
-                    (unsigned long)pg);
+            if (g_refcount[pg] == PMM_REF_SATURATED) {
+                kprintf("[pmm] refcount SATURATED at page %lu, pinned forever\n",
+                        (unsigned long)pg);
+            }
         }
     }
 }
@@ -144,14 +164,122 @@ uint64_t pmm_decref(void *phys_addr)
     if (pg >= g_total_pages || g_refcount[pg] == 0) {
         return 0;
     }
+    /* M2 审计修复（饱和粘滞）：计数曾封顶意味着有 incref 未被计入——真实
+     * 持有者数 >= 计数值。若此处照常递减，计数会先于真实持有者归零并释放页，
+     * 造成 use-after-free。故饱和页永不递减、永不释放（钉住，宁泄漏不悬空）。 */
+    if (g_refcount[pg] == PMM_REF_SATURATED) {
+        return PMM_REF_SATURATED;
+    }
     g_refcount[pg]--;
     uint64_t rem = g_refcount[pg];
     if (rem == 0) {
-        pmm_free_page(phys_addr);
+        /* 直接走位图释放（不再递归经 pmm_free_page 的共享页守卫，此时
+         * ref 已为 0，语义就是终局释放）。 */
+        bm_clear(pg);
+        g_used_pages--;
     }
     return rem;
+}
+
+uint64_t pmm_refcount(void *phys_addr)
+{
+    uint64_t pg = (uint64_t)phys_addr / PAGE_SIZE;
+    return (pg < g_total_pages) ? g_refcount[pg] : 0;
 }
 
 uint64_t pmm_total_pages(void) { return g_total_pages; }
 uint64_t pmm_used_pages(void)  { return g_used_pages; }
 uint64_t pmm_free_pages(void)  { return g_total_pages - g_used_pages; }
+
+/*
+ * M2 审计压测自检（boot 时由 mm_selftest 调用）。
+ * 置于 pmm.c 内部：仅此处可直接操纵 g_refcount 构造饱和态（真实到达饱和需
+ * 2^32 次 incref，QEMU 下不可行）。三组用例：
+ *   T1 OOL 大规模共享压测：32 页 × 64 持有者 incref/decref 全循环，
+ *      模拟 64 个接收方共享 32 页 OOL 缓冲的极端场景，验证计数与空闲页守恒。
+ *   T2 饱和粘滞：人工置 SATURATED-1 后 incref 到顶，验证 decref 不递减、
+ *      free_page 不释放（钉住语义），最后人工恢复计数并释放。
+ *   T3 共享页守卫：ref=2 的页误调 pmm_free_page，验证被降级为 decref
+ *      （页保留），再次 free 才真正释放。
+ * 全部通过打印 PASS，任一失败打印 FAIL（不 panic，保留现场日志）。
+ */
+void pmm_selftest(void)
+{
+    uint64_t free0 = pmm_free_pages();
+    bool ok = true;
+
+    /* T1：OOL 大规模共享压测（32 页 × 64 持有者 × 8 轮 = 16384 次计数操作） */
+    void *pages[32];
+    for (int i = 0; i < 32; i++) {
+        pages[i] = pmm_alloc_page();
+        if (!pages[i]) { ok = false; }
+    }
+    for (int round = 0; ok && round < 8; round++) {
+        for (int i = 0; i < 32; i++) {
+            for (int h = 0; h < 64; h++) pmm_incref(pages[i]);   /* 64 接收方 */
+        }
+        for (int i = 0; i < 32; i++) {
+            for (int h = 0; h < 64; h++) pmm_decref(pages[i]);   /* 逐个退出 */
+        }
+    }
+    for (int i = 0; ok && i < 32; i++) {
+        if (pmm_refcount(pages[i]) != 1) {
+            kprintf("[pmm] T1 FAIL: page %d refcount=%u (expect 1)\n",
+                    i, (unsigned)pmm_refcount(pages[i]));
+            ok = false;
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        if (pages[i]) pmm_decref(pages[i]);       /* ref 1->0，终局释放 */
+    }
+    if (ok && pmm_free_pages() != free0) {
+        kprintf("[pmm] T1 FAIL: free pages leak (%lu -> %lu)\n",
+                (unsigned long)free0, (unsigned long)pmm_free_pages());
+        ok = false;
+    }
+
+    /* T2：饱和粘滞（人工构造，绕过 2^32 次 incref） */
+    void *sp = pmm_alloc_page();
+    if (sp) {
+        uint64_t spg = (uint64_t)sp / PAGE_SIZE;
+        g_refcount[spg] = PMM_REF_SATURATED - 1;
+        pmm_incref(sp);                            /* 到顶，应打印 pinned 告警 */
+        if (g_refcount[spg] != PMM_REF_SATURATED) {
+            kprintf("[pmm] T2 FAIL: incref did not saturate\n");
+            ok = false;
+        }
+        if (pmm_decref(sp) != PMM_REF_SATURATED ||
+            g_refcount[spg] != PMM_REF_SATURATED) {
+            kprintf("[pmm] T2 FAIL: decref moved a SATURATED count\n");
+            ok = false;
+        }
+        pmm_free_page(sp);                         /* 应被守卫拦截（粘滞不减） */
+        if (!bm_test(spg) || g_refcount[spg] != PMM_REF_SATURATED) {
+            kprintf("[pmm] T2 FAIL: free_page released a pinned page\n");
+            ok = false;
+        }
+        g_refcount[spg] = 1;                       /* 人工解除钉住，归还页 */
+        pmm_free_page(sp);
+    }
+
+    /* T3：共享页守卫（ref=2 误调 free_page 应降级为 decref） */
+    void *gp = pmm_alloc_page();
+    if (gp) {
+        uint64_t gpg = (uint64_t)gp / PAGE_SIZE;
+        pmm_incref(gp);                            /* ref = 2 */
+        pmm_free_page(gp);                         /* 应降级：ref 2->1，页保留 */
+        if (!bm_test(gpg) || g_refcount[gpg] != 1) {
+            kprintf("[pmm] T3 FAIL: shared-page guard did not demote\n");
+            ok = false;
+        }
+        pmm_free_page(gp);                         /* ref==1，真正释放 */
+    }
+
+    if (pmm_free_pages() != free0) {
+        kprintf("[pmm] selftest FAIL: free pages %lu -> %lu\n",
+                (unsigned long)free0, (unsigned long)pmm_free_pages());
+        ok = false;
+    }
+    kprintf("[pmm] refcount selftest (T1 stress/T2 saturate/T3 guard): %s\n",
+            ok ? "PASS" : "FAIL");
+}

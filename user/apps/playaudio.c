@@ -113,11 +113,11 @@ static uint32_t fs_read_at(const char *name, uint32_t off, uint32_t len,
             cnt++;
             char db[24];
             u_print("[pa] fs_read_at #");
-            u_print(u_utoa((uint64_t)cnt, db));
+            u_print(u_utoa_s((uint64_t)cnt, db, sizeof(db)));
             u_print(" off=");
-            u_print(u_utoa((uint64_t)off, db));
+            u_print(u_utoa_s((uint64_t)off, db, sizeof(db)));
             u_print(" got=");
-            u_print(u_utoa((uint64_t)got, db));
+            u_print(u_utoa_s((uint64_t)got, db, sizeof(db)));
             u_print("\n");
         }
     }
@@ -134,7 +134,7 @@ static int16_t  g_pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];   /* 2*1152 = 2304 */
 static void print_dec(uint64_t v)
 {
     char buf[24];
-    u_print(u_utoa(v, buf));
+    u_print(u_utoa_s(v, buf, sizeof(buf)));
 }
 
 int main(int argc, char **argv)
@@ -154,7 +154,7 @@ int main(int argc, char **argv)
         uint64_t rc = sys_port_claim(APP_PORT);
         char db[24];
         u_print("[playaudio] claim APP_PORT rc=");
-        u_print(u_utoa(rc, db));
+        u_print(u_utoa_s(rc, db, sizeof(db)));
         u_print("\n");
     }
 
@@ -184,7 +184,7 @@ int main(int argc, char **argv)
             file_off = tag;
             char db[24];
             u_print("[playaudio] ID3v2 tag detected, skipping ");
-            u_print(u_utoa((uint64_t)tag, db));
+            u_print(u_utoa_s((uint64_t)tag, db, sizeof(db)));
             u_print(" bytes (file cursor advanced)\n");
         }
     }
@@ -204,9 +204,9 @@ int main(int argc, char **argv)
                 first_read = false;
                 char db[24];
                 u_print("[playaudio] first FS read got ");
-                u_print(u_utoa((uint64_t)n, db));
+                u_print(u_utoa_s((uint64_t)n, db, sizeof(db)));
                 u_print(" bytes (in_filled=");
-                u_print(u_utoa((uint64_t)in_filled, db));
+                u_print(u_utoa_s((uint64_t)in_filled, db, sizeof(db)));
                 u_print(")\n");
             }
         }
@@ -254,11 +254,11 @@ int main(int argc, char **argv)
             {
                 char db[24];
                 u_print("[playaudio] first frame: hz=");
-                u_print(u_utoa((uint64_t)info.hz, db));
+                u_print(u_utoa_s((uint64_t)info.hz, db, sizeof(db)));
                 u_print(" ch=");
-                u_print(u_utoa((uint64_t)info.channels, db));
+                u_print(u_utoa_s((uint64_t)info.channels, db, sizeof(db)));
                 u_print(" kbps=");
-                u_print(u_utoa((uint64_t)info.bitrate_kbps, db));
+                u_print(u_utoa_s((uint64_t)info.bitrate_kbps, db, sizeof(db)));
                 u_print("\n");
             }
             if (!bench) {
@@ -316,7 +316,7 @@ int main(int argc, char **argv)
         if ((frames & 63) == 0) {
             char db[24];
             u_print("[playaudio] progress frames=");
-            u_print(u_utoa((uint64_t)frames, db));
+            u_print(u_utoa_s((uint64_t)frames, db, sizeof(db)));
             u_print("\n");
         }
     }
@@ -344,7 +344,7 @@ int main(int argc, char **argv)
     if (bench) {
         char db[24];
         u_print("[playaudio] BENCH CRC32 of decoded PCM = ");
-        u_print(u_utoa((uint64_t)g_crc, db));
+        u_print(u_utoa_s((uint64_t)g_crc, db, sizeof(db)));
         u_print("\n");
     }
     return 0;

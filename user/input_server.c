@@ -47,8 +47,9 @@ static void send_char(char c)
     mach_msg_send(&msg, sizeof(msg));
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     bool shift = false, caps = false;
 
     u_print("[input] INPUT_SERVER online (Ring3 scancode parser)\n");

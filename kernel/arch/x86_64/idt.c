@@ -97,9 +97,10 @@ static void page_fault_handler(registers_t *r)
 
     if (user) {
         task_t *t = sched_current();
-        kprintf("[pf] user #PF: cr2=%p write=%d pid=%lu '%s' -> killing task\n",
-                (void *)cr2, write, (unsigned long)t->id, t->name);
-        task_exit_current();            /* noreturn：隔离故障任务 */
+        kprintf("[pf] user #PF: cr2=%p write=%d pid=%lu '%s' rip=%p -> killing task\n",
+                (void *)cr2, write, (unsigned long)t->id, t->name,
+                (void *)r->rip);
+        task_exit_current(139);          /* noreturn：隔离故障任务（139≈SIGSEGV） */
     }
     kprintf("\n[KPF] KERNEL page fault! cr2=%p write=%d rip=%p cs=0x%lx rflags=0x%lx\n",
             (void *)cr2, write, (void *)r->rip,

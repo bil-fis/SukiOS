@@ -131,6 +131,45 @@ static void run_command(char *line)
     } else if (u_strcmp(line, "reboot") == 0) {
         u_print("rebooting...\n");
         suki_syscall5(SYS_REBOOT, 0, 0, 0, 0, 0);
+    } else if (u_strcmp(line, "exec") == 0) {
+        if (!*arg) {
+            u_print("usage: exec <FILE> [args...]\n");
+        } else {
+            /* 把命令后的剩余字符串按空格拆成 argv[]，argv[0]=程序路径 */
+            char *argv[8];
+            int ac = 0;
+            char *p = arg;
+            while (*p && ac < 7) {
+                while (*p == ' ') {
+                    p++;
+                }
+                if (!*p) {
+                    break;
+                }
+                argv[ac++] = p;
+                while (*p && *p != ' ') {
+                    p++;
+                }
+                if (*p) {
+                    *p++ = '\0';
+                }
+            }
+            argv[ac] = NULL;
+            /* spawn 一个独立子任务运行该程序，当前 shell 阻塞等待其退出，
+             * 子任务结束后 shell 重新接管（不会像 execve 那样被替换掉）。 */
+            int pid = sys_task_spawn(argv[0], argv, NULL);
+            if (pid < 0) {
+                u_print("exec failed: file not found or invalid ELF\n");
+            } else {
+                uint64_t rc = sys_wait((uint64_t)pid);
+                u_print("  [shell] child pid=");
+                char db[24];
+                u_print(u_utoa((uint64_t)pid, db));
+                u_print(" exited (code=");
+                u_print(u_utoa(rc, db));
+                u_print(")\n");
+            }
+        }
     } else {
         u_print("unknown command: ");
         u_print(line);
@@ -138,8 +177,9 @@ static void run_command(char *line)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     char line[LINE_MAX];
     uint32_t len = 0;
 

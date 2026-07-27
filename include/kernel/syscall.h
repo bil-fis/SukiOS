@@ -18,14 +18,20 @@
 
 /* 系统调用号（手册 5.2 最小集 + 调试扩展） */
 #define SYS_MACH_MSG      0
-#define SYS_TASK_CREATE   1
+#define SYS_TASK_SPAWN    1   /* 新建 Ring3 任务并装载 ELF（类 fork+exec，不替换自身） */
 #define SYS_TASK_EXIT     2
 #define SYS_YIELD         3
 #define SYS_DEBUG_WRITE   4   /* 扩展：调试输出(buf,len)，走 copy_from_user */
 #define SYS_INPUT_READ    5   /* 扩展：取原始键盘扫描码（INPUT_SERVER 专用） */
 #define SYS_REBOOT        6   /* 扩展：8042 复位重启 */
 #define SYS_PORT_CLAIM    7   /* 扩展：用户态认领端口 recv 权（A2 项） */
-#define SYSCALL_MAX       8
+#define SYS_EXECVE        8   /* 扩展：加载并执行 ELF 映像（替换当前进程） */
+#define SYS_WAIT          9   /* 扩展：阻塞等待子任务退出并返回其退出码 */
+#define SYS_AUDIO_OPEN    10  /* 扩展：打开 HDA 输出流(rate,channels,bits) */
+#define SYS_AUDIO_WRITE   11  /* 扩展：写 PCM(buf,len)，返回接受字节数 */
+#define SYS_AUDIO_QUEUED  12  /* 扩展：返回环中未播放字节数 */
+#define SYS_AUDIO_STOP    13  /* 扩展：停止并复位输出流 */
+#define SYSCALL_MAX       14
 
 /* 用户态地址空间上限（含）：0x00007FFFFFFFFFFF */
 #define USER_SPACE_TOP    0x00007FFFFFFFFFFFUL

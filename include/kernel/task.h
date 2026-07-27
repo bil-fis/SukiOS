@@ -37,6 +37,12 @@ typedef struct task {
     uint64_t kstack_top;            /* 内核栈顶（TSS.rsp0 使用） */
     uint64_t user_rip;              /* Ring3 入口（用户虚拟地址） */
     uint64_t user_stack_top;        /* Ring3 栈顶（用户虚拟地址） */
+    /* syscall 返回帧用的“暂存” RIP/RSP：进入 syscall 时保存用户 RIP/RSP，
+     * execve 改写它们以跳转到新程序。必须是“每任务”的——若用全局变量，
+     * 任务阻塞于 recv 期间另一任务执行 syscall 会覆盖该全局，导致原任务
+     * 返回时 RSP 被破坏（实测表现为用户态缺页崩溃）。 */
+    uint64_t scr_rip;               /* syscall 返回用 RIP（= 用户 RIP / execve 新入口） */
+    uint64_t scr_rsp;               /* syscall 返回用 RSP（= 用户 RSP / execve 新栈顶） */
     bool     is_user;               /* 是否 Ring3 进程 */
     bool     alive;                 /* 是否在就绪环中 */
     char     name[32];
@@ -49,6 +55,16 @@ typedef struct task {
     struct task *wait_next;         /* 端口等待队列的下一个等待者（A4 项） */
     struct task *dead_next;         /* 全局“待回收”死亡链表链接（B1 项） */
     void    *ool_maps;              /* 本任务持有的 OOL 映射链表，退出时清理（A3 项） */
+
+    /* --- 进程关系与退出同步（spawn/wait，类 Unix fork+exec+wait） --- */
+    uint64_t parent_id;             /* 父任务 PID；idle=0。用 PID 而非指针，
+                                       避免父退出后悬空指针被误用（sys_wait 仅比较值） */
+    struct task *waiters;           /* 阻塞在本任务“退出”上的等待者链表头 */
+    struct task *wait_link;         /* 等待者链表指针（链入父/子的 waiters） */
+    uint64_t exit_code;             /* 退出码（task_exit_current 写入，供父 sys_wait 读） */
+    bool     zombie;                /* 已退出、尚未被父 sys_wait 回收 */
+    uint64_t wait_result;           /* 等待者被唤醒后读取的退出码（子退出时写入） */
+    struct task *all_next;          /* 全局任务链表（g_all_tasks），供 pid 查找 */
 
     struct task *next;              /* 就绪队列（循环链表） */
 } task_t;
@@ -66,10 +82,21 @@ task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name);
 
 /* 创建 Ring3 任务：把 [blob, blob+size) 拷入新地址空间 user_rip 处执行 */
 task_t *task_create_user(const void *blob, size_t size, const char *name);
+/* 同上，但装载时构造含 argc/argv/envp 的初始栈（spawn 子进程用） */
+task_t *task_create_user_args(const void *blob, size_t size,
+                              int argc, const char *const argv[],
+                              int envc, const char *const envp[],
+                              const char *name);
 task_t *sched_current(void);
 void   schedule(void);              /* 主动触发一次调度 */
 void   task_yield(void);            /* 主动让出 CPU（sys_yield 底层） */
-__attribute__((noreturn)) void task_exit_current(void);
+__attribute__((noreturn)) void task_exit_current(uint64_t code);
+
+/* 按 PID 在全局任务表中查找任务（含尚未被回收的 zombie）；找不到返回 NULL */
+task_t *task_lookup(uint64_t pid);
+
+/* 立即回收一个已退出任务（从死亡链表与全局表摘除并释放）；供 sys_wait 使用 */
+void task_reap(task_t *t);
 
 uint64_t sched_next_pid(void);
 

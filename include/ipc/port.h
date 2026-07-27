@@ -64,7 +64,8 @@ typedef struct mach_ool_desc {
 #define CONSOLE_PORT    5               /* 内核控制台输出服务 */
 #define SHELL_PORT      6               /* Shell 接收（键盘字符 + FS 应答） */
 #define FS_REPLY_PORT   7               /* FS_SERVER 接收磁盘应答 */
-#define PORT_FIRST_DYN  8               /* 动态分配起始 */
+#define APP_PORT        8               /* 通用客户端(独立 app)可认领的应答端口 */
+#define PORT_FIRST_DYN  9               /* 动态分配起始 */
 #define PORT_MAX        64
 
 /* ---- 内核端口对象 ---- */
@@ -103,6 +104,7 @@ uint32_t  port_allocate(task_t *owner);                 /* 返回端口号，0=�
 void      port_set_owner(uint32_t name, task_t *owner);
 void      port_grant_send(uint32_t name, task_t *owner); /* 授权某任务向内核端口发送 */
 uint64_t  port_claim(uint32_t name);                    /* 用户态认领端口 recv 权 */
+void      port_release_owner(task_t *t);                /* 任务退出：释放其认领的端口所有权 */
 void      port_reap_ool(task_t *t);                     /* 回收任务持有的 OOL 映射 */
 kernel_port_t *port_lookup(uint32_t name);
 
@@ -110,6 +112,16 @@ kernel_port_t *port_lookup(uint32_t name);
 uint64_t  ipc_send_kernel(uint32_t dest, const void *msg, uint32_t size);
 uint64_t  ipc_recv_kernel(uint32_t port_name, void *buf, uint32_t buf_size,
                           uint32_t *out_size, bool block);
+
+/* 内核侧接收 OOL 消息：把 inline 部分拷入 inline_buf，把 OOL 物理页内容直接
+ * 拷入 ool_buf（不经任何用户地址空间映射，仅消费 OOL 引用计数），供内核
+ * 读文件等不需要把数据映射到用户空间的场景（如 execve 加载 ELF）。 */
+uint64_t  ipc_recv_ool_kernel(uint32_t port_name, void *inline_buf,
+                              uint32_t inline_cap, uint32_t *inline_out,
+                              void *ool_buf, uint32_t ool_cap,
+                              uint32_t *ool_out, bool block);
+/* 释放一个动态分配的端口（execve 临时申请的应答端口用完即释放） */
+void      port_free(uint32_t name);
 
 /* syscall 入口（强符号覆盖 syscall.c 中的 weak 占位） */
 uint64_t  sys_mach_msg(uint64_t msg_uptr, uint64_t option,

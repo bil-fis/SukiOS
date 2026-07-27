@@ -49,12 +49,12 @@ static inline void irq_restore(uint64_t f)
 void ipc_init(void)
 {
     memset(g_ports, 0, sizeof(g_ports));
-    /* 预留知名端口 */
-    for (uint32_t p = DISK_PORT; p <= FS_REPLY_PORT; p++) {
+    /* 预留知名端口（含 APP_PORT，供独立 app 认领应答） */
+    for (uint32_t p = DISK_PORT; p <= APP_PORT; p++) {
         g_ports[p].in_use = true;
         g_ports[p].name = p;
     }
-    kprintf("[ipc] port table ready (%d slots, well-known 1..7)\n", PORT_MAX);
+    kprintf("[ipc] port table ready (%d slots, well-known 1..8)\n", PORT_MAX);
 }
 
 kernel_port_t *port_lookup(uint32_t name)
@@ -87,6 +87,22 @@ uint64_t port_claim(uint32_t name)
     }
     p->owner = sched_current();
     return 0;
+}
+
+/* 任务退出时释放其认领的所有端口所有权（owner/send_owner 置空），避免
+ * 端口 owner 变成悬空指针导致下一个同名端口认领者被永久拒绝（A2 修复）。
+ * 知名端口（<PORT_FIRST_DYN）仅清 owner 保留槽位；动态端口不在此处理
+ * （由 port_free 显式回收）。单核：由 task_exit_current 关中断下调用。 */
+void port_release_owner(task_t *t)
+{
+    for (uint32_t i = DISK_PORT; i < PORT_MAX; i++) {
+        if (g_ports[i].owner == t) {
+            g_ports[i].owner = NULL;
+        }
+        if (g_ports[i].send_owner == t) {
+            g_ports[i].send_owner = NULL;
+        }
+    }
 }
 
 /* 任务退出时回收其持有的 OOL 映射：递减共享物理页引用并归还映射区间到
@@ -316,6 +332,70 @@ got:
                      PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX | PTE_OOL);
     }
     return base;
+}
+
+/* ---- 内核侧 OOL 接收（供 execve 等内核客户端读文件） ---- */
+uint64_t ipc_recv_ool_kernel(uint32_t port_name, void *inline_buf,
+                             uint32_t inline_cap, uint32_t *inline_out,
+                             void *ool_buf, uint32_t ool_cap,
+                             uint32_t *ool_out, bool block)
+{
+    kernel_port_t *p = port_lookup(port_name);
+    if (!p) {
+        return MACH_RCV_INVALID_NAME;
+    }
+    for (;;) {
+        uint64_t f = irq_save();
+        kernel_msg_t *m = dequeue(p);
+        if (m) {
+            irq_restore(f);
+            uint32_t n = m->size < inline_cap ? m->size : inline_cap;
+            if (inline_buf) {
+                memcpy(inline_buf, m->data, n);
+            }
+            if (inline_out) {
+                *inline_out = n;
+            }
+            uint32_t got = 0;
+            if (m->has_ool) {
+                for (uint32_t i = 0; i < m->ool_page_count; i++) {
+                    uint64_t pa = m->ool_pages[i];
+                    uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(pa);
+                    uint32_t rem = ool_cap - got;
+                    if (rem == 0) {
+                        break;
+                    }
+                    uint32_t chunk = PAGE_SIZE < rem ? PAGE_SIZE : rem;
+                    if (ool_buf) {
+                        memcpy(ool_buf + got, kva, chunk);
+                    }
+                    got += chunk;
+                    pmm_decref((void *)pa);     /* 内核消费，释放 OOL 引用 */
+                }
+            }
+            if (ool_out) {
+                *ool_out = got;
+            }
+            kfree(m);
+            return MACH_MSG_SUCCESS;
+        }
+        if (!block) {
+            irq_restore(f);
+            return MACH_RCV_TIMED_OUT;
+        }
+        port_wait_enqueue(p);
+        schedule();
+        irq_restore(f);
+    }
+}
+
+void port_free(uint32_t name)
+{
+    kernel_port_t *p = port_lookup(name);
+    if (p) {
+        memset(p, 0, sizeof(*p));
+        p->in_use = false;
+    }
 }
 
 /* ---- syscall 强符号实现（覆盖 syscall.c 中的 weak 占位） ----

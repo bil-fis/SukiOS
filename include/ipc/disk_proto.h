@@ -18,7 +18,11 @@
 #define DISK_MSG_READ      1
 #define DISK_MSG_WRITE     2
 
-/* 单次请求扇区数上限：受内联消息 3968B 限制（7*512=3584 + 头） */
+/* 单次请求扇区数上限：受内联消息 MACH_MSG_INLINE_MAX=3968B 硬限制
+ * （7*512=3584 + 头 + status 恰好放得下；8 扇区就超限）。
+ * 严禁调大：应答为内联消息，超限会被 ipc_send_kernel 拒发/被旧内核
+ * clamp 到 7，客户端按大 count 拷贝会得到"首部真实数据+尾部全零"。
+ * 需要更大吞吐请在客户端（如 fs_server 预读缓存）分批多次请求。 */
 #define DISK_MAX_SECTORS   7
 
 typedef struct disk_read_req {

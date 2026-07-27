@@ -42,6 +42,7 @@ task_trampoline:
     sti
     movq  %r13, %rdi         /* 参数 arg */
     callq *%r12              /* entry(arg) */
+    movq  $0, %rdi           /* 入口正常返回 -> 退出码 0 */
     call  task_exit_current  /* 若入口返回则退出任务 */
 1:  hlt
     jmp   1b

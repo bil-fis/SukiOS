@@ -15,13 +15,19 @@
 
 /* ---- 系统调用号（与 include/kernel/syscall.h 一致） ---- */
 #define SYS_MACH_MSG      0
-#define SYS_TASK_CREATE   1
+#define SYS_TASK_SPAWN    1
 #define SYS_TASK_EXIT     2
 #define SYS_YIELD         3
 #define SYS_DEBUG_WRITE   4
 #define SYS_INPUT_READ    5
 #define SYS_REBOOT        6
 #define SYS_PORT_CLAIM    7
+#define SYS_EXECVE        8
+#define SYS_WAIT          9
+#define SYS_AUDIO_OPEN    10
+#define SYS_AUDIO_WRITE   11
+#define SYS_AUDIO_QUEUED  12
+#define SYS_AUDIO_STOP    13
 
 /* ---- mach_msg ABI（与 include/ipc/port.h 一致） ---- */
 #define MACH_SEND_MSG   0x1
@@ -36,6 +42,7 @@
 #define CONSOLE_PORT    5
 #define SHELL_PORT      6
 #define FS_REPLY_PORT   7
+#define APP_PORT        8               /* 独立 app 可认领的通用应答端口 */
 
 typedef struct mach_msg_header {
     uint32_t msgh_bits;
@@ -82,6 +89,56 @@ static inline uint64_t sys_port_claim(uint32_t port)
     return suki_syscall5(SYS_PORT_CLAIM, (uint64_t)port, 0, 0, 0, 0);
 }
 
+/* 加载并执行 ELF 映像，替换当前进程（内核从 FS 读取 path 指向的文件） */
+static inline int sys_execve(const char *path, char *const argv[],
+                             char *const envp[])
+{
+    return (int)suki_syscall5(SYS_EXECVE, (uint64_t)path,
+                               (uint64_t)argv, (uint64_t)envp, 0, 0);
+}
+
+/* 新建一个 Ring3 子任务并装载 ELF（不替换当前进程）。内核从 FS 读取
+ * path 指向的文件。成功返回子任务 PID（>=0），失败返回 -1。
+ * 语义类 Unix fork+exec：父任务应随后调用 sys_wait(pid) 等待其结束。 */
+static inline int sys_task_spawn(const char *path, char *const argv[],
+                                 char *const envp[])
+{
+    return (int)suki_syscall5(SYS_TASK_SPAWN, (uint64_t)path,
+                               (uint64_t)argv, (uint64_t)envp, 0, 0);
+}
+
+/* 阻塞等待 PID=pid 的子任务退出，返回其退出码。pid 非本任务子进程时返回 -1。 */
+static inline uint64_t sys_wait(uint64_t pid)
+{
+    return suki_syscall5(SYS_WAIT, pid, 0, 0, 0, 0);
+}
+
+/* ---- 音频（HDA 内核驱动，类 ATA 内核态特例） ---- */
+/* 打开 PCM 输出流：成功返回 0，参数不支持/无设备返回 -1 */
+static inline int sys_audio_open(uint32_t rate, uint32_t channels, uint32_t bits)
+{
+    return (int)suki_syscall5(SYS_AUDIO_OPEN, rate, channels, bits, 0, 0);
+}
+
+/* 写 PCM（S16LE 交错）到内核播放环。返回实际接受字节数（0=环满，应
+ * sys_yield 后重试）；未打开/无设备返回 (uint64_t)-1。 */
+static inline int64_t sys_audio_write(const void *buf, uint64_t len)
+{
+    return (int64_t)suki_syscall5(SYS_AUDIO_WRITE, (uint64_t)buf, len, 0, 0, 0);
+}
+
+/* 返回环中尚未播放的字节数（用于排空等待） */
+static inline uint64_t sys_audio_queued(void)
+{
+    return suki_syscall5(SYS_AUDIO_QUEUED, 0, 0, 0, 0, 0);
+}
+
+/* 停止并复位输出流 */
+static inline void sys_audio_stop(void)
+{
+    suki_syscall5(SYS_AUDIO_STOP, 0, 0, 0, 0, 0);
+}
+
 static inline uint64_t mach_msg_send(void *msg, uint32_t size)
 {
     return suki_syscall5(SYS_MACH_MSG, (uint64_t)msg, MACH_SEND_MSG,
@@ -100,6 +157,13 @@ int    u_strcmp(const char *a, const char *b);
 int    u_strncmp(const char *a, const char *b, size_t n);
 void  *u_memcpy(void *d, const void *s, size_t n);
 void  *u_memset(void *d, int c, size_t n);
+
+/* 标准 C 名字的内存原语（供第三方库如 minimp3 链接；实现见 suki.c）。
+ * -ffreestanding 下编译器也可能对结构体/数组拷贝隐式生成 memcpy/memset
+ * 调用，故所有用户程序都提供这些强符号更稳妥。 */
+void  *memcpy(void *d, const void *s, size_t n);
+void  *memset(void *d, int c, size_t n);
+void  *memmove(void *d, const void *s, size_t n);
 void   u_print(const char *s);                  /* debug_write 便捷版 */
 void   u_printn(const char *s, size_t n);
 char  *u_utoa(uint64_t v, char *buf);           /* 十进制，返回 buf */

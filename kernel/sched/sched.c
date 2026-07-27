@@ -20,6 +20,7 @@
 #include <mm/kmalloc.h>
 #include <mm/vmm.h>
 #include <mm/pmm.h>
+#include <kernel/elf.h>
 #include <ipc/port.h>
 
 #define KSTACK_SIZE  16384
@@ -27,7 +28,9 @@
 /* 用户程序装载布局 */
 #define USER_CODE_BASE   0x0000000000400000UL
 #define USER_STACK_TOP   0x00007FFFFFFFF000UL
-#define USER_STACK_PAGES 4
+/* 32 页 = 128KiB 用户栈：playaudio 的 minimp3 解码在栈上使用较大的
+ * scratch（grbuf/syn/qmf 等约数十 KB），4 页会栈溢出触发 #PF。 */
+#define USER_STACK_PAGES 32
 /* 代码/数据 W^X 边界：链接脚本把 .text/.rodata 放在 [0, USER_DATA_SPLIT)，
  * 把 .data/.bss 放在 [USER_DATA_SPLIT, ...)。内核据此分别映射为 RX 与 RW+NX。 */
 #define USER_DATA_SPLIT  0x0000000000100000UL   /* 1 MiB */
@@ -41,6 +44,12 @@ static task_t  *g_current;
 static uint64_t g_next_pid = 0;
 static uint32_t g_task_count = 0;
 static task_t  *g_dead_list = NULL;   /* 待回收的已退出任务（B1 项） */
+static task_t  *g_all_tasks = NULL;   /* 全局任务表（含 zombie），供 pid 查找 */
+
+/* 指向“当前运行任务”的 scr_rip/scr_rsp 字段的指针（syscall_entry.S 用）。
+ * 必须在每次上下文切换到某任务后指向该任务的 scr_rip，以保证 syscall
+ * 返回帧使用的 RIP/RSP 属于正确任务（避免全局暂存被其它任务覆盖）。 */
+uint64_t *g_scratch = NULL;
 
 /* 保存/恢复 IF 的临界区原语：与无条件 sti 不同，嵌套调用安全 */
 static inline uint64_t irq_save(void)
@@ -73,6 +82,7 @@ void sched_init(void)
     strncpy(t0->name, "idle", sizeof(t0->name) - 1);
     t0->next = t0;                 /* 循环链表自环 */
     g_current = t0;
+    g_scratch = &t0->scr_rip;      /* 初始指向 idle 的返回暂存 */
     g_task_count = 1;
     kprintf("[sched] scheduler initialized, task0='idle' pid=%lu\n",
             (unsigned long)t0->id);
@@ -118,6 +128,8 @@ task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
     uint64_t f = irq_save();
     t->next = g_current->next;
     g_current->next = t;
+    t->all_next = g_all_tasks;       /* 链入全局表，供 sys_wait 按 PID 查找 */
+    g_all_tasks = t;
     g_task_count++;
     irq_restore(f);
 
@@ -150,7 +162,10 @@ static void user_task_thunk(void *arg)
     /* 不可达 */
 }
 
-task_t *task_create_user(const void *blob, size_t size, const char *name)
+task_t *task_create_user_args(const void *elf, size_t size,
+                                int argc, const char *const argv[],
+                                int envc, const char *const envp[],
+                                const char *name)
 {
     /* 1. 独立地址空间（共享内核高半区） */
     uint64_t as = vmm_create_address_space();
@@ -158,72 +173,19 @@ task_t *task_create_user(const void *blob, size_t size, const char *name)
         return NULL;
     }
 
-    /* 2. 按 W^X 拆分装载：.text/.rodata -> RX；.data/.bss -> RW+NX。
-     * 链接脚本已将两部分以 USER_DATA_SPLIT(1MiB) 为界分开（C1 项）。 */
-    size_t split = (size < USER_DATA_SPLIT) ? size : USER_DATA_SPLIT;
-
-    /* 代码/只读区：RX */
-    for (size_t off = 0; off < split; off += PAGE_SIZE) {
-        void *phys = pmm_alloc_page();
-        if (!phys) {
-            goto fail;                        /* 回滚：销毁已建地址空间（B2 项） */
-        }
-        uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(phys);
-        size_t chunk = (size - off) > PAGE_SIZE ? PAGE_SIZE : (size - off);
-        if (chunk) {
-            memcpy(kva, (const uint8_t *)blob + off, chunk);
-        }
-        if (chunk < PAGE_SIZE) {
-            memset(kva + chunk, 0, PAGE_SIZE - chunk);
-        }
-        vmm_map_page(as, USER_CODE_BASE + off, (uint64_t)phys,
-                     PTE_PRESENT | PTE_USER);          /* 可执行、不可写 */
-    }
-
-    /* 数据/BSS 区：RW + NX。
-     * 链接脚本把 .data/.bss 放到 1MiB 边界之后；objcopy -O binary 若 .data
-     * 为空则 bin 只含 text/rodata（size < 1MiB），此时数据区完全靠零页。
-     * 无论哪种情况，都必须为 [USER_DATA_SPLIT, USER_DATA_SPLIT+data+bss)
-     * 建立映射，否则用户程序访问静态缓冲即缺页。bss/堆保留 256KiB。 */
-    {
-        size_t data_bytes = (size > split) ? (size - split) : 0;
-        size_t region = data_bytes + 256 * 1024;             /* data + bss/heap */
-        for (size_t off = 0; off < region; off += PAGE_SIZE) {
-            void *phys = pmm_alloc_page();
-            if (!phys) {
-                goto fail;
-            }
-            uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(phys);
-            if (off < data_bytes) {                          /* 拷贝 .data 内容 */
-                size_t chunk = (data_bytes - off) > PAGE_SIZE
-                               ? PAGE_SIZE : (data_bytes - off);
-                memcpy(kva, (const uint8_t *)blob + split + off, chunk);
-                if (chunk < PAGE_SIZE) {
-                    memset(kva + chunk, 0, PAGE_SIZE - chunk);
-                }
-            } else {
-                memset(kva, 0, PAGE_SIZE);                   /* .bss/堆零页 */
-            }
-            vmm_map_page(as, USER_CODE_BASE + USER_DATA_SPLIT + off,
-                         (uint64_t)phys,
-                         PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX);
-        }
-    }
-
-    /* 3. 用户栈：RW + NX，栈顶 ASLR 随机下移 0..255 页（C3 项） */
+    /* 2. 用 ELF 加载器装载段 + 构造初始栈（W^X，栈 ASLR，含 argc/argv/envp）。
+     * 取代旧的“平坦二进制按 1MiB 拆分”装载：现在内核直接解析 ELF64，
+     * 支持 ET_EXEC / ET_DYN(PIE+ASLR)、清零 BSS、按 W^X 设权限、建立
+     * 含 argc/argv/envp/auxv 的初始用户栈。 */
+    elf_load_result_t res;
     uint64_t stack_top = USER_STACK_TOP - (aslr_random() & 0xFF) * PAGE_SIZE;
-    for (int i = 0; i < USER_STACK_PAGES; i++) {
-        void *phys = pmm_alloc_page();
-        if (!phys) {
-            goto fail;
-        }
-        memset(PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
-        vmm_map_page(as, stack_top - (uint64_t)(i + 1) * PAGE_SIZE,
-                     (uint64_t)phys,
-                     PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX);
+    if (!elf_load(as, elf, size, argc, argv, envc, envp, stack_top,
+                  USER_STACK_PAGES, &res)) {
+        vmm_destroy_address_space(as);     /* 回滚（B2 项） */
+        return NULL;
     }
 
-    /* 4. 复用内核任务骨架，入口为 user_task_thunk。
+    /* 3. 复用内核任务骨架，入口为 user_task_thunk。
      * 整段关中断：task_create_kernel 将任务插入就绪链表后，若定时器在
      * cr3/user_rip 补写完成前抢占并调度该任务，thunk 将以 arg=NULL 运行，
      * 从物理页 0（IVT）读出垃圾 user_rip 直接三重故障。 */
@@ -231,23 +193,39 @@ task_t *task_create_user(const void *blob, size_t size, const char *name)
     task_t *t = task_create_kernel(user_task_thunk, NULL, name);
     if (!t) {
         irq_restore(f);
-        goto fail;
+        vmm_destroy_address_space(as);
+        return NULL;
     }
     t->is_user = true;
     t->cr3 = as;
-    t->user_rip = USER_CODE_BASE;
-    t->user_stack_top = stack_top;
+    t->user_rip = res.entry;
+    t->user_stack_top = res.stack_top;
     /* 修正跳板参数：r13 槽（arg）指向任务自身（见 task_create_kernel 栈帧布局） */
     ((uint64_t *)t->rsp)[2] = (uint64_t)t;   /* [r15,r14,r13,...] 从栈顶起序 2 = r13 */
     irq_restore(f);
 
-    kprintf("[sched] user task '%s' pid=%lu cr3=%p entry=%p (W^X)\n",
-            t->name, (unsigned long)t->id, (void *)as, (void *)USER_CODE_BASE);
+    kprintf("[sched] user task '%s' pid=%lu cr3=%p entry=%p (ELF, W^X)\n",
+            t->name, (unsigned long)t->id, (void *)as, (void *)res.entry);
     return t;
+}
 
-fail:
-    /* B2 项：中途失败，销毁已建地址空间（其页表遍历会释放已映射的全部自有页） */
-    vmm_destroy_address_space(as);
+task_t *task_create_user(const void *elf, size_t size, const char *name)
+{
+    /* 启动期装载：无参数（argc=0） */
+    return task_create_user_args(elf, size, 0, NULL, 0, NULL, name);
+}
+
+/* 按 PID 在全局任务表中查找（含尚未回收的 zombie）。单核：调用方须自保证
+ * 在关中断窗口内访问以避免与 reap_dead 的摘除产生竞态。 */
+task_t *task_lookup(uint64_t pid)
+{
+    task_t *t = g_all_tasks;
+    while (t) {
+        if (t->id == pid) {
+            return t;
+        }
+        t = t->all_next;
+    }
     return NULL;
 }
 
@@ -264,15 +242,62 @@ static task_t *pick_next(void)
     return g_current;   /* 回退：无其它可运行任务 */
 }
 
+/* 立即回收一个已退出（zombie）任务：从死亡链表与全局任务表摘除并释放其
+ * task 结构与内核栈。调用方须处于关中断临界区且持有有效指针。供 sys_wait
+ * 在父任务首次回收 zombie 时调用，避免二次 wait 命中残留结构而永久阻塞，
+ * 也避免僵尸一直占用内存。 */
+void task_reap(task_t *t)
+{
+    /* 从死亡链表摘除 */
+    if (g_dead_list == t) {
+        g_dead_list = t->dead_next;
+    } else {
+        task_t *p = g_dead_list;
+        while (p && p->dead_next != t) {
+            p = p->dead_next;
+        }
+        if (p) {
+            p->dead_next = t->dead_next;
+        }
+    }
+    /* 从全局任务表摘除 */
+    if (g_all_tasks == t) {
+        g_all_tasks = t->all_next;
+    } else {
+        task_t *q = g_all_tasks;
+        while (q && q->all_next != t) {
+            q = q->all_next;
+        }
+        if (q) {
+            q->all_next = t->all_next;
+        }
+    }
+    kfree((void *)t->kstack_base);
+    kfree(t);
+}
+
 /* 回收所有已退出任务的 task 结构与内核栈（B1 项）。资源（地址空间、
  * OOL 页）已在 task_exit_current 中释放，这里仅释放无法在自身栈上释放的部分。
- * 必须在上下文切换离开该任务后进行（此时其内核栈已不再使用）。 */
+ * 必须在上下文切换离开该任务后进行（此时其内核栈已不再使用）。
+ * 同时把任务从全局表 g_all_tasks 摘除，避免 sys_wait 后续查到悬空指针。 */
 static void reap_dead(void)
 {
     task_t *t = g_dead_list;
     g_dead_list = NULL;
     while (t) {
         task_t *nx = t->dead_next;
+        /* 从全局任务表摘除（本函数运行于关中断的 schedule() 内，单核安全） */
+        if (g_all_tasks == t) {
+            g_all_tasks = t->all_next;
+        } else {
+            task_t *p = g_all_tasks;
+            while (p && p->all_next != t) {
+                p = p->all_next;
+            }
+            if (p) {
+                p->all_next = t->all_next;
+            }
+        }
         kfree((void *)t->kstack_base);
         kfree(t);
         t = nx;
@@ -304,6 +329,7 @@ void schedule(void)
     next->state = RUNNING;
     next->ticks_remaining = TIME_SLICE_TICKS;
     g_current = next;
+    g_scratch = &next->scr_rip;   /* 当前任务切换：暂存指针同步 */
 
     /* 为可能的 Ring3->Ring0 切换设置内核栈；必要时切换地址空间 */
     tss_set_rsp0(next->kstack_top);
@@ -351,13 +377,33 @@ static void unlink_task(task_t *t)
     g_task_count--;
 }
 
-__attribute__((noreturn)) void task_exit_current(void)
+__attribute__((noreturn)) void task_exit_current(uint64_t code)
 {
     interrupts_disable();
     task_t *t = g_current;
-    kprintf("[sched] task '%s' pid=%lu exited\n",
-            t->name, (unsigned long)t->id);
+    kprintf("[sched] task '%s' pid=%lu exited (code=%lu)\n",
+            t->name, (unsigned long)t->id, (unsigned long)code);
 
+    /* 唤醒所有阻塞在 sys_wait 本任务的父任务（及等待者）：把退出码写入
+     * 各自的 wait_result 并置 READY。必须在 t->waiters 仍有效时（尚未释放
+     * task 结构）完成；task 结构在后续 reap_dead 才释放，故等待者读取
+     * wait_result（自身字段）绝不触发悬空访问。 */
+    {
+        task_t *w = t->waiters;
+        while (w) {
+            task_t *wn = w->wait_link;
+            w->wait_result = code;
+            w->wait_link   = NULL;
+            w->state       = READY;
+            w = wn;
+        }
+        t->waiters = NULL;
+    }
+    t->exit_code = code;
+    t->zombie    = true;     /* 等待父任务 sys_wait 回收（仍留在 g_all_tasks） */
+
+    /* 释放本任务认领的端口所有权（避免下个 app 认领同名端口被悬空 owner 拒绝） */
+    port_release_owner(t);
     /* 释放本任务持有的 IPC OOL 共享页引用与映射区间（A3 项） */
     port_reap_ool(t);
     /* 释放地址空间：用户自有物理页 + 全部页表结构（B1 项）。
@@ -382,6 +428,7 @@ __attribute__((noreturn)) void task_exit_current(void)
     next->state = RUNNING;
     next->ticks_remaining = TIME_SLICE_TICKS;
     g_current = next;
+    g_scratch = &next->scr_rip;   /* 当前任务切换：暂存指针同步 */
     tss_set_rsp0(next->kstack_top);
     g_syscall_kstack = next->kstack_top;
 

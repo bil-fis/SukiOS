@@ -27,6 +27,7 @@
 
 #include <ipc/port.h>
 #include <kernel/ata.h>
+#include <kernel/hda.h>
 
 /* Ring3 用户程序 blob（user/ 下的 C 程序，Makefile 嵌入内核镜像） */
 extern const uint8_t user_fs_server_start[],    user_fs_server_end[];
@@ -157,6 +158,9 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     /* ---- 阶段七：Mach IPC ---- */
     ipc_init();
     task_create_kernel(console_srv, NULL, "console-srv");
+
+    /* ---- 阶段八·补：Intel HDA 音频（内核态特例，类 ATA） ---- */
+    hda_init();
 
     /* ---- 阶段八：磁盘（内核态特例）与 Ring3 FAT32 服务 ---- */
     bool disk_ok = ata_init();

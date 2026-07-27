@@ -116,6 +116,20 @@ static uint64_t elf_build_stack(uint64_t as, uint64_t stack_top,
                                 uint64_t phdr_va, uint32_t phnum, uint32_t phent,
                                 uint64_t entry, uint64_t base)
 {
+    /* ---- H1 修复：入口参数硬校验 ----
+     * 本函数曾依赖"调用方恰好也用 64 上限"的隐式约定为局部 VA 数组定容；
+     * 一旦任一调用方（sched.c / syscall.c / 未来新增）传入 argc/envc > 64，
+     * 下方 arg_va[i]/env_va[i] 即写越内核栈。现在改为：
+     *   1) 容量统一取自共享常量 ELF_ARG_MAX（include/kernel/elf.h）；
+     *   2) 入口显式拒绝 argc/envc 越限或为负、以及 argc>0 但 argv==NULL
+     *      之类的矛盾组合，失败返回 0 由调用方回滚。 */
+    if (argc < 0 || argc > ELF_ARG_MAX || envc < 0 || envc > ELF_ARG_MAX) {
+        return 0;
+    }
+    if ((argc > 0 && !argv) || (envc > 0 && !envp)) {
+        return 0;
+    }
+
     size_t cap = (size_t)stack_pages * PAGE_SIZE;
     uint8_t *img = (uint8_t *)kmalloc(cap);
     if (!img) {
@@ -124,11 +138,20 @@ static uint64_t elf_build_stack(uint64_t as, uint64_t stack_top,
     memset(img, 0, cap);   /* 栈镜像必须清零：任何空隙不得含内核堆残留数据 */
 
     uint64_t sp = cap;               /* 栈顶在 img 中的偏移 */
-    uint64_t env_va[64], arg_va[64];
+    uint64_t env_va[ELF_ARG_MAX], arg_va[ELF_ARG_MAX];
+
+    /* 字符串区写入的下界哨兵：sp 低于此值即栈容量不足。
+     * 若不设防，超长字符串会令 uint64_t sp 减法回绕成巨大偏移，
+     * memcpy(img + sp, ...) 直接越界写内核堆（与 H1 同源的边界缺陷）。 */
+    const uint64_t sp_floor = 64;    /* 预留底部保护带 */
 
     /* 1) 环境变量字符串（从顶向下，记录 VA） */
     for (int i = envc - 1; i >= 0; i--) {
         size_t l = strlen(envp[i]) + 1;
+        if (sp < sp_floor + l) {
+            kfree(img);
+            return 0;                /* 栈空间不足，拒绝加载 */
+        }
         sp -= l;
         memcpy(img + sp, envp[i], l);
         env_va[i] = stack_top - cap + sp;
@@ -136,6 +159,10 @@ static uint64_t elf_build_stack(uint64_t as, uint64_t stack_top,
     /* 2) argv 字符串 */
     for (int i = argc - 1; i >= 0; i--) {
         size_t l = strlen(argv[i]) + 1;
+        if (sp < sp_floor + l) {
+            kfree(img);
+            return 0;                /* 栈空间不足，拒绝加载 */
+        }
         sp -= l;
         memcpy(img + sp, argv[i], l);
         arg_va[i] = stack_top - cap + sp;
@@ -145,20 +172,35 @@ static uint64_t elf_build_stack(uint64_t as, uint64_t stack_top,
     for (int i = 0; i < 16; i++) {
         rnd[i] = (uint8_t)(elf_random_base() >> (i & 7));
     }
+    if (sp < sp_floor + 16) {
+        kfree(img);
+        return 0;
+    }
     sp -= 16;
     memcpy(img + sp, rnd, 16);
     uint64_t rand_va = stack_top - cap + sp;
 
-    /* 4) auxv 数组（AT_NULL 收尾） */
-    struct { uint64_t a; uint64_t b; } auxv[16];
+    /* 4) auxv 数组（AT_NULL 收尾）。H2 修复：auxv[] 按 ELF_AUXV_MAX 定容，
+     * 每条追加前先校验 na < ELF_AUXV_MAX，越限则释放镜像返回 0，彻底杜绝
+     * "硬编码 16 容量 + na 无上界" 的越界写栈缺陷（含 AT_NULL 在内共填
+     * 8 条，上限 16 留余量）。 */
+    struct { uint64_t a; uint64_t b; } auxv[ELF_AUXV_MAX];
     int na = 0;
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_PHDR;   auxv[na++].b = phdr_va;
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_PHENT;  auxv[na++].b = phent;
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_PHNUM;  auxv[na++].b = phnum;
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_PAGESZ; auxv[na++].b = PAGE_SIZE;
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_ENTRY;  auxv[na++].b = entry;
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_BASE;   auxv[na++].b = (base != 0) ? base : 0;  /* PIE 基址 */
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_RANDOM; auxv[na++].b = rand_va;
+    if (na >= ELF_AUXV_MAX) { kfree(img); return 0; }
     auxv[na].a = AT_NULL;   auxv[na++].b = 0;
 
     /* 5) 关键：argc/argv/envp/auxv 必须“连续无空隙”（System V ABI：

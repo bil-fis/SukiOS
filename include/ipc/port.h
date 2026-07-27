@@ -53,6 +53,8 @@ typedef struct mach_ool_desc {
 #define MACH_RCV_INVALID_NAME   0x10002002UL
 #define MACH_RCV_TOO_LARGE      0x10004004UL
 #define MACH_RCV_TIMED_OUT      0x10004003UL
+/* OOL 接收窗口耗尽（H4）：无更多映射区间且复用链表无法满足需求 */
+#define MACH_RCV_NO_SPACE       0x10005005UL
 #define MACH_INVALID_ARGUMENT   0x10000002UL
 
 /* ---- 知名端口号（1 起始；0 = PORT_NULL）---- */

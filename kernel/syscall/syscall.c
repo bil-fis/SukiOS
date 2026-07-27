@@ -164,7 +164,7 @@ static uint64_t sys_port_claim(uint64_t port)
 
 /* 8: sys_execve / 1: sys_task_spawn —— ELF 加载（替换自身 或 新建子任务） */
 #define EXEC_PATH_MAX   256
-#define EXEC_ARG_MAX    64
+#define EXEC_ARG_MAX    ELF_ARG_MAX   /* 与 elf_build_stack 容量共享同一常量（H1） */
 #define EXEC_STR_MAX    512
 #define EXEC_ELF_MAX    (16 * 4096)   /* 与 OOL 单条 16 页上限一致 */
 

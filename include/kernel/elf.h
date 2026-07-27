@@ -24,6 +24,24 @@
 #define ELF_CLASS_64   2
 #define ELF_DATA_LE    1
 
+/*
+ * 初始栈 argv[]/envp[] 元素个数硬上限（H1 修复）。
+ * elf_build_stack() 内部用该值定容局部 VA 数组并在入口强制校验
+ * argc/envc <= ELF_ARG_MAX；syscall.c 的 EXEC_ARG_MAX 直接引用本常量，
+ * 保证"拷贝上限"与"栈构造容量"永远一致，杜绝两处硬编码漂移导致的
+ * 数组越界（曾列为审计 H1 项）。
+ */
+#define ELF_ARG_MAX    64
+
+/*
+ * 初始栈 auxv[] 条目数硬上限（H2 修复）。
+ * elf_build_stack() 局部 auxv[] 数组按此值定容，且每追加一条都先校验
+ * na < ELF_AUXV_MAX；一旦越限立即 kfree 镜像并返回 0 由调用方回滚。
+ * 防止未来扩展 auxv 类型时写越界（曾列为审计 H2 项）。当前实际写入 8 条
+ * （含 AT_NULL 收尾），留足余量到 16。
+ */
+#define ELF_AUXV_MAX   16
+
 /* ---- e_type ---- */
 #define ET_NONE   0
 #define ET_REL    1

@@ -26,6 +26,11 @@ static kernel_port_t g_ports[PORT_MAX];
 
 /* OOL 接收窗口：映射进接收方用户空间的基址（优先复用空闲区间） */
 #define OOL_RECV_BASE  0x0000600000000000UL
+/* OOL 窗口上界（H4 修复）：g_ool_bump 单调递增到此处即视为耗尽，
+ * 不再允许新的映射，强制复用空闲链表或返回失败，杜绝无限向上爬升
+ * 撞入内核/其它区域导致 #PF panic。1TiB 窗口对单条 <=16 页(64KiB) 的
+ * OOL 消息而言足以支撑千万级映射，纯属安全网。 */
+#define OOL_RECV_LIMIT 0x0000700000000000UL
 static uint64_t g_ool_bump = 0;
 
 /* OOL 区域空闲链表：任务退出后回收映射区间，避免 g_ool_bump 单调递增耗尽（A3 项） */
@@ -49,12 +54,21 @@ static inline void irq_restore(uint64_t f)
 void ipc_init(void)
 {
     memset(g_ports, 0, sizeof(g_ports));
+    /* H3 修复：将 PORT_NULL(0) 永久保留为"空端口"哨兵——标记为 in_use 使
+     * 其永远不可被 port_allocate 分配（分配循环本就从 PORT_FIRST_DYN 起，
+     * 此处置位是双保险），且 port_lookup(0) 仍因 name==PORT_NULL 短路返回
+     * NULL，故 0 在任何上下文都只表示"无端口/失败"，与合法端口号 1..63
+     * 彻底分离，杜绝"耗尽返回 0 与空端口语义混淆"导致的泄漏/静默失败。 */
+    g_ports[PORT_NULL].in_use = true;
+    g_ports[PORT_NULL].name   = PORT_NULL;
+    g_ports[PORT_NULL].owner  = NULL;
     /* 预留知名端口（含 APP_PORT，供独立 app 认领应答） */
     for (uint32_t p = DISK_PORT; p <= APP_PORT; p++) {
         g_ports[p].in_use = true;
         g_ports[p].name = p;
     }
-    kprintf("[ipc] port table ready (%d slots, well-known 1..8)\n", PORT_MAX);
+    kprintf("[ipc] port table ready (%d slots, well-known 1..8, 0=sentinel)\n",
+            PORT_MAX);
 }
 
 kernel_port_t *port_lookup(uint32_t name)
@@ -144,6 +158,11 @@ uint32_t port_allocate(task_t *owner)
         }
     }
     irq_restore(f);
+    /* H3 修复：端口表耗尽。返回 PORT_NULL(0) 现在是明确的"失败"语义
+     * （0 号槽已被永久保留为哨兵，绝不可能是合法端口号），调用方（如
+     * exec_read_file）据 `if (!rp)` 判定失败并清理，不再产生歧义。
+     * 此处留日志便于观测资源泄漏型长稳问题。 */
+    kprintf("[ipc] port_allocate: table exhausted (max=%u)\n", PORT_MAX);
     return PORT_NULL;
 }
 
@@ -322,7 +341,16 @@ static uint64_t ool_map_into_receiver(kernel_msg_t *m)
         }
         pp = &(*pp)->next;
     }
+    /* H4 修复：单调分配前先检查是否越过窗口上界；越界则返回 0（失败哨兵，
+     * 因合法映射基址恒 >= OOL_RECV_BASE 非 0），由调用方 sys_mach_msg 释放
+     * 消息并返回错误，而非让 g_ool_bump 无限增长撞区。 */
     base = OOL_RECV_BASE + g_ool_bump;
+    if (base + need > OOL_RECV_LIMIT) {
+        irq_restore(f);
+        kprintf("[ipc] OOL recv window exhausted (bump=%p limit=%p)\n",
+                (void *)(uintptr_t)g_ool_bump, (void *)(uintptr_t)OOL_RECV_LIMIT);
+        return 0;
+    }
     g_ool_bump += need;
     irq_restore(f);
 
@@ -486,6 +514,10 @@ uint64_t sys_mach_msg(uint64_t msg_uptr, uint64_t option,
         /* OOL：映射进接收方并改写描述符为接收方 VA；登记到任务 OOL 链表（A3） */
         if (m->has_ool) {
             uint64_t va = ool_map_into_receiver(m);
+            if (va == 0) {                       /* H4：窗口耗尽，映射失败 */
+                kfree(m);
+                return MACH_RCV_NO_SPACE;
+            }
             mach_ool_desc_t *d =
                 (mach_ool_desc_t *)(m->data + sizeof(mach_msg_header_t));
             d->address = va;

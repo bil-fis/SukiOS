@@ -135,8 +135,14 @@ static void run_command(char *line)
         if (!*arg) {
             u_print("usage: exec <FILE> [args...]\n");
         } else {
-            /* 把命令后的剩余字符串按空格拆成 argv[]，argv[0]=程序路径 */
+            /* 把命令后的剩余字符串按空格拆成 argv[]，argv[0]=程序路径。
+             * D2 修复（防御）：显式清零整个 argv 数组，保证即便参数个数
+             * 触顶(ac<7)也不会有未初始化栈垃圾被内核误当作额外指针读取，
+             * 从而避免 exec 传参 argv 错乱（审计 D2 项）。 */
             char *argv[8];
+            for (int zi = 0; zi < 8; zi++) {
+                argv[zi] = NULL;
+            }
             int ac = 0;
             char *p = arg;
             while (*p && ac < 7) {

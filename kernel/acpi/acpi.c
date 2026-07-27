@@ -16,6 +16,16 @@
 
 acpi_info_t g_acpi;
 
+/* P0-6：Multiboot2 tag 14/15 提供的 RSDP 副本物理地址（0=未提供）。
+ * UEFI 启动时 RSDP 位于 EFI 配置表指向的任意物理页，EBDA/0xE0000 传统
+ * 扫描必然落空，此提示是 UEFI 路径的唯一可靠 RSDP 来源。 */
+static uint64_t g_rsdp_hint_phys;
+
+void acpi_set_rsdp_hint(uint64_t rsdp_phys)
+{
+    g_rsdp_hint_phys = rsdp_phys;
+}
+
 /* ---- RSDP / 表头结构 ---- */
 struct acpi_rsdp {
     char     signature[8];     /* "RSD PTR " */
@@ -223,14 +233,32 @@ bool acpi_init(void)
     memset(&g_acpi, 0, sizeof(g_acpi));
     g_acpi.lapic_phys = 0xFEE00000ULL;   /* 默认本地 APIC 基址（xAPIC） */
 
-    /* 1) EBDA：BDA 0x40:0x0E 存 EBDA 段基址（实模式段，*16 得线性地址） */
-    const uint16_t *bda_ebda =
-        (const uint16_t *)PHYS_TO_VIRT(0x40E);
-    uint16_t ebda_seg = *bda_ebda;
-    uint64_t ebda_base = (uint64_t)ebda_seg << 4;
     const struct acpi_rsdp *rsdp = NULL;
-    if (ebda_base >= 0x400 && ebda_base < 0xA0000) {
-        rsdp = acpi_scan_rsdp(ebda_base, ebda_base + 1024);
+
+    /* 0) P0-6：Multiboot2 RSDP 副本（UEFI 路径唯一可靠来源）。副本同样
+     *    做签名+校验和验证——不信任引导器给的任何数据。 */
+    if (g_rsdp_hint_phys) {
+        const struct acpi_rsdp *r =
+            (const struct acpi_rsdp *)PHYS_TO_VIRT(g_rsdp_hint_phys);
+        if (memcmp(r->signature, ACPI_SIG_RSDP, 8) == 0 &&
+            acpi_checksum_ok(r, (r->revision == 0) ? 20
+                                                   : sizeof(struct acpi_rsdp))) {
+            rsdp = r;
+            kprintf("[acpi] RSDP from Multiboot2 tag (UEFI-safe path)\n");
+        } else {
+            kprintf("[acpi] MB2 RSDP copy invalid, falling back to scan\n");
+        }
+    }
+
+    /* 1) EBDA：BDA 0x40:0x0E 存 EBDA 段基址（实模式段，*16 得线性地址） */
+    if (!rsdp) {
+        const uint16_t *bda_ebda =
+            (const uint16_t *)PHYS_TO_VIRT(0x40E);
+        uint16_t ebda_seg = *bda_ebda;
+        uint64_t ebda_base = (uint64_t)ebda_seg << 4;
+        if (ebda_base >= 0x400 && ebda_base < 0xA0000) {
+            rsdp = acpi_scan_rsdp(ebda_base, ebda_base + 1024);
+        }
     }
     /* 2) 固定范围 0xE0000..0xFFFFF */
     if (!rsdp) {

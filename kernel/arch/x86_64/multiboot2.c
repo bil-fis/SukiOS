@@ -67,6 +67,24 @@ bool multiboot2_parse(uint64_t mbi_phys, boot_info_t *out)
             }
             break;
         }
+        case MULTIBOOT_TAG_TYPE_EFI64:
+            /* P0-6：存在 EFI64 系统表标签即 UEFI 启动（GRUB-EFI 注入）。
+             * 系统表指针本身暂不使用（Boot Services 已被 GRUB ExitBootServices
+             * 终结，Runtime Services 需虚拟地址重映射，P1 再接）。 */
+            out->efi_boot = true;
+            break;
+        case MULTIBOOT_TAG_TYPE_ACPI_OLD:
+        case MULTIBOOT_TAG_TYPE_ACPI_NEW: {
+            /* P0-6：GRUB 把固件 RSDP 整体复制到 tag 数据区（头后 8 字节起）。
+             * 记录其物理地址供 acpi_init 优先使用；tag 15（ACPI 2.0+ 36 字节，
+             * 含 XSDT 指针）出现时覆盖 tag 14（1.0 副本，仅 RSDT）。 */
+            uint64_t data_off = (uint64_t)(ptr - base) + 8;
+            if (tag->type == MULTIBOOT_TAG_TYPE_ACPI_NEW ||
+                out->rsdp_copy_phys == 0) {
+                out->rsdp_copy_phys = mbi_phys + data_off;
+            }
+            break;
+        }
         default:
             break;
         }

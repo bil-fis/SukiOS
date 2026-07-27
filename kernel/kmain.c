@@ -153,6 +153,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     kprintf("========================================\n");
     kprintf("[boot] display: %s\n",
             fb_available() ? "framebuffer (graphics)" : "VGA text (fallback)");
+    /* P0-6：报告固件形态。UEFI 下帧缓冲来自 GOP（GRUB 经 MB2 tag8 转交），
+     * RSDP 来自 MB2 tag14/15 副本（acpi_set_rsdp_hint 通路）。 */
+    kprintf("[boot] firmware: %s\n",
+            g_boot.efi_boot ? "UEFI (OVMF/GOP path)" : "Legacy BIOS");
     kprintf("[boot] usable RAM: %u MiB\n",
             (unsigned)(g_boot.mem_total / (1024 * 1024)));
     /* L3：确认 SMAP（管理者态不可访问用户页）是否已随 boot.S 探测生效。
@@ -176,6 +180,7 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     security_init();
 
     /* ---- P0-1/P0-2/P0-4：ACPI 拓扑发现 + LAPIC/IOAPIC 取代 8259 PIC+PIT ---- */
+    acpi_set_rsdp_hint(g_boot.rsdp_copy_phys);     /* P0-6：UEFI 下唯一 RSDP 来源 */
     acpi_init();                                   /* 解析 RSDP/XSDT/MADT/HPET */
     uint8_t bsp_lapic = lapic_init();              /* 启用本地 APIC */
     ioapic_init();                                 /* 初始化 I/O APIC（屏蔽全部） */

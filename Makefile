@@ -99,6 +99,15 @@ QEMU_AHCI_DISK := -device ahci,id=myahci \
                   -device ide-hd,drive=ahdisk0,bus=myahci.0
 QEMU_SERIAL := -serial stdio
 
+# ---- P0-6 UEFI：OVMF 固件（pflash 双闪存：CODE 只读 + VARS 可写副本） ----
+# grub-mkrescue 产的 ISO 本身是 BIOS+UEFI 混合镜像（借助 /usr/lib/grub/
+# x86_64-efi 模块生成 El Torito EFI 引导项），无需改 ISO 生成流程。
+OVMF_CODE := /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS_SRC := /usr/share/OVMF/OVMF_VARS_4M.fd
+OVMF_VARS := $(BUILD)/OVMF_VARS.fd
+QEMU_UEFI := -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+             -drive if=pflash,format=raw,file=$(OVMF_VARS)
+
 # ---- 音频：Intel HDA 控制器 (8086:2668, ICH6) + 输出编解码器 ----
 # 我们的内核驱动通过 PCI class 0x04/subclass 0x03 探测该控制器。
 # QEMU_AUDIODRV 可覆盖后端：pa(PulseAudio，WSLg/桌面默认)、alsa、sdl、
@@ -108,7 +117,7 @@ QEMU_AUDIODRV ?= pa
 QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
                -device intel-hda -device hda-duplex,audiodev=snd0
 
-.PHONY: all iso run run-headless run-ahci run-ahci-headless debug clean info disk
+.PHONY: all iso run run-headless run-ahci run-ahci-headless run-uefi run-uefi-headless debug clean info disk
 
 all: $(KERNEL)
 
@@ -240,6 +249,20 @@ run-ahci: $(ISO) $(DISK)
 
 run-ahci-headless: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+
+# ---- P0-6 UEFI：OVMF 启动（GRUB-EFI -> multiboot2 -> 同一 kernel.elf） ----
+# VARS 每次从模板复制（保持只读模板干净；EFI 变量写入进副本）。
+# 注意 UEFI 显示走 GOP：GRUB 依 MB2 tag5 请求 1024x768x32，OVMF GOP 提供
+# 线性帧缓冲经 tag8 转交内核，与 BIOS VBE 路径在内核侧完全同构。
+$(OVMF_VARS): $(OVMF_VARS_SRC)
+	@mkdir -p $(BUILD)
+	cp $< $@
+
+run-uefi: $(ISO) $(DISK) $(OVMF_VARS)
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_UEFI) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+
+run-uefi-headless: $(ISO) $(DISK) $(OVMF_VARS)
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_UEFI) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 # ---- GDB 调试 (配合 .gdbinit) ----
 debug: $(ISO) $(DISK)

@@ -7,11 +7,12 @@
  * 中断路由（GSI 映射）所需信息；FADT 给出电源/复位；HPET 表给出高精时钟。
  * 设计原则：只解析、只记录，不在此处做设备初始化（初始化在 apic/hpet 驱动）。
  *
- * RSDP 定位（按 ACPI 规范 5.2.5）：
+ * RSDP 定位（P0-6 更新，三级回退）：
+ *   0) Multiboot2 ACPI 标签（tag 14/15）给出的 RSDP 副本——UEFI 启动的
+ *      **唯一**可靠来源（UEFI 下 RSDP 在 EFI 配置表任意页，不在传统区域）；
  *   1) 若 EBDA 存在（BIOS 经 BDA 0x40:0x0E 给出段基址），扫描其前 1KiB；
- *   2) 扫描固定范围 0x000E0000..0x000FFFFF（含 0x10 字节对齐的 "RSD PTR "）。
- * 不依赖 bootloader 是否提供 Multiboot2 ACPI 标签（GRUB/SeaBIOS 行为不一致），
- * 直接内存扫描最稳健。
+ *   2) 扫描固定范围 0x000E0000..0x000FFFFF（0x10 对齐的 "RSD PTR "）。
+ * BIOS 机型上 0) 缺失时 1)/2) 兜底，两种固件形态统一覆盖。
  */
 #ifndef _SUKI_KERNEL_ACPI_H
 #define _SUKI_KERNEL_ACPI_H
@@ -59,7 +60,12 @@ typedef struct acpi_info {
 /* 调用 acpi_init() 后读取全局结果（只读共享） */
 extern acpi_info_t g_acpi;
 
-/* 扫描内存定位 RSDP 并遍历 XSDT，填充 g_acpi。返回是否找到 ACPI。 */
+/* P0-6：登记 Multiboot2 提供的 RSDP 副本物理地址（kmain 在 acpi_init 之前
+ * 调用，传 boot_info.rsdp_copy_phys；0 表示引导器未提供，走传统扫描）。 */
+void acpi_set_rsdp_hint(uint64_t rsdp_phys);
+
+/* 定位 RSDP（MB2 提示优先，其次 EBDA/固定区扫描）并遍历 XSDT/RSDT，
+ * 填充 g_acpi。返回是否找到 ACPI。 */
 bool acpi_init(void);
 
 /* 在已解析的 ACPI 表中查找指定签名（如 "HPET"）的表物理地址；未找到返回 0。 */

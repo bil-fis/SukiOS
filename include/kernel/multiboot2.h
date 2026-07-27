@@ -14,6 +14,10 @@
 #define MULTIBOOT_TAG_TYPE_END        0
 #define MULTIBOOT_TAG_TYPE_MMAP       6
 #define MULTIBOOT_TAG_TYPE_FRAMEBUFFER 8
+/* P0-6：UEFI 启动路径新增标签 */
+#define MULTIBOOT_TAG_TYPE_EFI64      12   /* EFI 64 位系统表指针（UEFI 启动标识） */
+#define MULTIBOOT_TAG_TYPE_ACPI_OLD   14   /* ACPI 1.0 RSDP 副本（20 字节） */
+#define MULTIBOOT_TAG_TYPE_ACPI_NEW   15   /* ACPI 2.0+ RSDP 副本（36 字节） */
 
 /* 通用标签头 */
 struct mb2_tag {
@@ -64,6 +68,12 @@ typedef struct boot_info {
     uint64_t mem_highest;         /* 最高可用物理地址 */
     /* 内存映射标签指针（虚拟地址），供 PMM 遍历 */
     const struct mb2_tag_mmap *mmap;
+    /* ---- P0-6：UEFI 启动路径 ----
+     * GRUB 会把固件 RSDP 复制进 MBI（tag 14/15）。UEFI 机器上 RSDP 位于
+     * EFI 配置表指向的任意物理页，不在 EBDA/0xE0000 传统扫描区——acpi_init
+     * 必须优先使用这里的副本地址。 */
+    bool     efi_boot;            /* MBI 含 EFI64 系统表标签 => UEFI 启动 */
+    uint64_t rsdp_copy_phys;      /* MBI 内 RSDP 副本的物理地址（0=无） */
 } boot_info_t;
 
 /* 解析物理地址处的 Multiboot2 info，填充 out。返回 true 成功。 */

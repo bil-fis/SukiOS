@@ -115,10 +115,15 @@ char *u_utoa(uint64_t v, char *buf)
     while (v) {
         tmp[i++] = (char)('0' + v % 10);
         v /= 10;
+        if (i >= 23) break;     /* M17：防御上界，杜绝调用方缓冲不足时越界写 */
     }
     int j = 0;
     while (i > 0) {
         buf[j++] = tmp[--i];
+        if (j >= 23) {          /* 同守输出缓冲，至多写 23 字符 + NUL */
+            buf[j] = '\0';
+            return buf;
+        }
     }
     buf[j] = '\0';
     return buf;

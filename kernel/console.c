@@ -30,6 +30,11 @@ static inline void irq_restore(uint64_t flags)
 }
 
 static bool g_use_fb = false;
+/* M18 修复：kprintf 重入深度计数。单核下 irq_save 已保证一条消息原子输出，
+ * 但若在输出途中触发 #PF 等异常二次进入 kprintf（如 panic 路径），会递归
+ * 打印导致栈耗尽。超过阈值即放弃本次输出，既保证普通场景正常又防致命递归。
+ * SMP 后的跨 CPU 串行化自旋锁随 P0-3 引入。 */
+static volatile int g_kp_depth = 0;
 
 void console_init(void)
 {
@@ -90,6 +95,11 @@ static void print_int(int64_t val)
 void kprintf(const char *fmt, ...)
 {
     uint64_t irqf = irq_save();       /* 整条消息原子输出，防多任务撕裂 */
+    if (g_kp_depth >= 4) {            /* M18：重入过深，放弃输出防递归死循环 */
+        irq_restore(irqf);
+        return;
+    }
+    g_kp_depth++;
     va_list ap;
     va_start(ap, fmt);
 
@@ -174,6 +184,7 @@ void kprintf(const char *fmt, ...)
     }
     va_end(ap);
     irq_restore(irqf);
+    g_kp_depth--;
 }
 
 __attribute__((noreturn)) void panic(const char *fmt, ...)

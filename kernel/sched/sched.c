@@ -24,6 +24,10 @@
 #include <ipc/port.h>
 
 #define KSTACK_SIZE  16384
+#define MAX_TASKS       256
+/* M7 修复：内核栈底守卫哨兵。任务内核栈从高地址向下增长，栈底写入哨兵；
+ * 若向下溢出破坏相邻堆块，哨兵会被覆盖。每次调度前校验当前任务栈底哨兵。 */
+#define KSTACK_CANARY   0xCDC1FEEDDEADBEEFUL
 
 /* 用户程序装载布局 */
 #define USER_CODE_BASE   0x0000000000400000UL
@@ -90,6 +94,11 @@ void sched_init(void)
 
 task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
 {
+    /* M7 修复：任务数硬上限。无上限时 PID/物理页耗尽无保护，恶意/失控 spawn
+     * 会拖垮整系统。达到上限即拒绝创建。 */
+    if (g_task_count >= MAX_TASKS) {
+        return NULL;
+    }
     task_t *t = (task_t *)kzalloc(sizeof(task_t));
     if (!t) {
         return NULL;
@@ -108,6 +117,7 @@ task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
     t->alive = true;
     t->kstack_base = (uint64_t)stack;
     t->kstack_top  = (uint64_t)stack + KSTACK_SIZE;
+    *(uint64_t *)stack = KSTACK_CANARY;   /* M7：内核栈底守卫哨兵 */
     strncpy(t->name, name ? name : "kthread", sizeof(t->name) - 1);
 
     /* 构造初始内核栈帧，令首次 context_switch 落到 task_trampoline */
@@ -307,6 +317,16 @@ static void reap_dead(void)
 /* 执行一次调度（调用时须处于关中断状态） */
 void schedule(void)
 {
+    /* M7 修复：内核栈溢出守卫。任务内核栈从高地址向下增长，栈底 8 字节写入
+     * 哨兵；若向下溢出破坏了相邻堆块，哨兵会被覆盖。每次调度前校验当前任务
+     * 栈底哨兵，遭破坏即 panic，把"静默内存损坏"转为可诊断的崩溃，而非任其
+     * 蔓延污染其它任务。idle 任务(t0)无独立内核栈(kstack_base==0)，跳过。 */
+    if (g_current && g_current->kstack_base) {
+        if (*(const uint64_t *)g_current->kstack_base != KSTACK_CANARY) {
+            panic("kernel stack overflow detected (task '%s' pid=%lu)",
+                  g_current->name, (unsigned long)g_current->id);
+        }
+    }
     task_t *prev = g_current;
     task_t *next = pick_next();
     if (next == prev) {

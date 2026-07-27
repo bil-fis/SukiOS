@@ -82,10 +82,17 @@ bool elf_validate(const void *elf, size_t size)
     if (h->e_phoff == 0 || h->e_phnum == 0) {
         return false;
     }
+    if (h->e_phnum > ELF_PHDR_MAX) {     /* M9：程序头表条目数硬上限 */
+        return false;
+    }
     if (h->e_phentsize < sizeof(elf64_phdr_t)) {
         return false;
     }
-    if (h->e_phoff + (uint64_t)h->e_phnum * h->e_phentsize > size) {
+    /* M9 修复：e_phoff + e_phnum*phentsize 加法回绕校验（防恶意 ELF 让下标
+     * 计算回绕后通过长度检查，继而越界读程序头表）。 */
+    uint64_t phtab = (uint64_t)h->e_phoff
+                   + (uint64_t)h->e_phnum * h->e_phentsize;
+    if (phtab < h->e_phoff || phtab > size) {
         return false;
     }
 
@@ -96,7 +103,15 @@ bool elf_validate(const void *elf, size_t size)
             return false;            /* 本系统无动态链接器 */
         }
         if (ph[i].p_type == PT_LOAD) {
+            /* M9 修复：文件偏移与虚拟地址加法回绕校验，杜绝恶意字段令下标
+             * 回绕后通过上限检查、把段映射到内核区或越界读内存。 */
+            if (ph[i].p_offset + ph[i].p_filesz < ph[i].p_offset) {
+                return false;
+            }
             if (ph[i].p_offset + ph[i].p_filesz > size) {
+                return false;
+            }
+            if (ph[i].p_vaddr + ph[i].p_memsz < ph[i].p_vaddr) {
                 return false;
             }
             uint64_t vend = ph[i].p_vaddr + ph[i].p_memsz;

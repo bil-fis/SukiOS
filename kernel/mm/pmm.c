@@ -125,7 +125,16 @@ void pmm_incref(void *phys_addr)
 {
     uint64_t pg = (uint64_t)phys_addr / PAGE_SIZE;
     if (pg < g_total_pages) {
-        g_refcount[pg]++;
+        /* M2 修复：引用计数溢出防护。OOL 共享页的 refcount 若被无限 incref
+         * 会回绕为 0，使释放逻辑误判页已无引用而提前回收（被他任务仍持有的
+         * 共享页遭破坏）。此处封顶 UINT32_MAX，到顶即拒绝并告警。
+         * （pmm_alloc_page/位图非原子问题随 P0-3 锁体系销账。） */
+        if (g_refcount[pg] < 0xFFFFFFFFUL) {
+            g_refcount[pg]++;
+        } else {
+            kprintf("[pmm] refcount overflow at page %lu\n",
+                    (unsigned long)pg);
+        }
     }
 }
 

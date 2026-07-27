@@ -193,7 +193,7 @@ static bool exec_copy_args(uint64_t path_uptr, uint64_t argv_uptr,
     size_t pl = 0;
     for (; pl < EXEC_PATH_MAX - 1; pl++) {
         if (copy_from_user(path + pl, (const void *)(path_uptr + pl), 1) != 1) {
-            return false;
+            goto fail;
         }
         if (path[pl] == '\0') {
             break;
@@ -218,13 +218,13 @@ static bool exec_copy_args(uint64_t path_uptr, uint64_t argv_uptr,
             }
             argv_k[argc] = (char *)kmalloc(EXEC_STR_MAX);
             if (!argv_k[argc]) {
-                return false;
+                goto fail;
             }
             char *p = (char *)a;
             int j = 0;
             for (; j < EXEC_STR_MAX - 1; j++) {
                 if (copy_from_user(argv_k[argc] + j, p + j, 1) != 1) {
-                    return false;
+                    goto fail;
                 }
                 if (argv_k[argc][j] == '\0') {
                     break;
@@ -249,13 +249,13 @@ static bool exec_copy_args(uint64_t path_uptr, uint64_t argv_uptr,
             }
             envp_k[envc] = (char *)kmalloc(EXEC_STR_MAX);
             if (!envp_k[envc]) {
-                return false;
+                goto fail;
             }
             char *p = (char *)a;
             int j = 0;
             for (; j < EXEC_STR_MAX - 1; j++) {
                 if (copy_from_user(envp_k[envc] + j, p + j, 1) != 1) {
-                    return false;
+                    goto fail;
                 }
                 if (envp_k[envc][j] == '\0') {
                     break;
@@ -267,6 +267,18 @@ static bool exec_copy_args(uint64_t path_uptr, uint64_t argv_uptr,
     }
     *envc_out = envc;
     return true;
+
+fail:
+    /* M8 修复：任一拷贝/分配失败时，释放已成功分配的 argv/envp 字符串，
+     * 避免中途失败路径泄漏内核堆（原实现 return false 后调用方以 argc=0
+     * 调 exec_free_args 不会释放这些已分配块）。成功路径由调用方负责释放。 */
+    for (int i = 0; i < argc; i++) {
+        kfree(argv_k[i]);
+    }
+    for (int i = 0; i < envc; i++) {
+        kfree(envp_k[i]);
+    }
+    return false;
 }
 
 static void exec_free_args(char *argv_k[EXEC_ARG_MAX], int argc,

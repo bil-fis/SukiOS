@@ -22,6 +22,9 @@
 typedef struct { uint64_t address; uint64_t size; } ool_desc_t;
 
 #define SECTOR 512
+/* M13 修复：单条簇链最大遍历步数（远超任何实际 FAT32 卷的簇数），用于
+ * 在 read_dir/read_file/read_file_at 中给簇链跟随循环兜底，拦截环簇链死循环。 */
+#define FAT_WALK_LIMIT  0x400000U
 
 /* ---- 与内核 disk-srv 的通信 ---- */
 static uint8_t g_diskbuf[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t)
@@ -29,6 +32,10 @@ static uint8_t g_diskbuf[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t)
 
 static bool disk_read(uint32_t lba, uint32_t count, void *out)
 {
+    /* M16 修复：拒绝越界/非法扇区数拷贝，防止后续 memcpy 越出调用方缓冲。 */
+    if (count == 0 || count > DISK_MAX_SECTORS) {
+        return false;
+    }
     struct {
         mach_msg_header_t h;
         disk_read_req_t   r;
@@ -62,6 +69,9 @@ static bool disk_read(uint32_t lba, uint32_t count, void *out)
 
 /* ---- FAT32 卷参数 ---- */
 static uint32_t g_sec_per_clus, g_fat_begin, g_data_begin, g_root_clus;
+/* M13/M14 修复：卷总簇数，用于校验簇号落于数据区有效范围，并作为簇链遍历
+ * 步数上限的依据，防止损坏文件系统的环簇链导致无限循环/读飞。 */
+static uint32_t g_total_clusters = 0;
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static uint32_t rd32(const uint8_t *p)
@@ -88,6 +98,17 @@ static bool fat32_mount(void)
     }
     g_fat_begin  = rsvd;
     g_data_begin = rsvd + nfats * fatsz32;
+
+    /* M13/M14：计算总簇数，供簇号范围校验与遍历步数上限。 */
+    uint32_t tot_sec = rd32(bpb + 32);
+    if (tot_sec == 0) {
+        tot_sec = rd16(bpb + 19);
+    }
+    if (tot_sec > g_data_begin && g_sec_per_clus != 0) {
+        g_total_clusters = (tot_sec - g_data_begin) / g_sec_per_clus;
+    } else {
+        g_total_clusters = 0;
+    }
 
     char n[24];
     u_print("[fs] FAT32 mounted: spc=");
@@ -301,8 +322,14 @@ static void read_dir(uint32_t start_clus, dir_cb cb, void *priv)
 {
     uint8_t sec[SECTOR];
     uint32_t clus = start_clus;
+    uint32_t hops = 0;
     lfn_reset();
-    while (clus >= 2 && clus < 0x0FFFFFF8) {
+    while (clus >= 2 && clus < 0x0FFFFFF8 && hops++ < FAT_WALK_LIMIT) {
+        /* M14 修复：簇号须落在数据区有效范围 [2, 2+g_total_clusters)。
+         * 越界簇号（损坏 FS）会令 clus_to_lba 算出非法 LBA 误读任意扇区。 */
+        if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
+            break;
+        }
         for (uint32_t s = 0; s < g_sec_per_clus; s++) {
             if (!disk_read(clus_to_lba(clus) + s, 1, sec)) {
                 return;
@@ -359,10 +386,16 @@ static void resolve_path(const char *path, path_cb_t *out)
     while (*p && ncomp < 8) {
         char *c = comp[ncomp];
         int i = 0;
-        while (*p && *p != '/') {
+        /* M15 修复：组件长度上限 12（留 1 字节 NUL），超长非法 8.3 名不再
+         * 静默截断后误匹配。 */
+        while (*p && *p != '/' && i < 12) {
             c[i++] = *p++;
         }
         c[i] = '\0';
+        if (i == 12 && *p && *p != '/') {     /* 组件超长 → 必然不是 8.3 名 */
+            *out = (path_cb_t){ 0 };
+            return;
+        }
         upcase_str(c);
         ncomp++;
         if (*p == '/') {
@@ -371,6 +404,11 @@ static void resolve_path(const char *path, path_cb_t *out)
     }
     *out = (path_cb_t){ 0 };
     if (ncomp == 0) {
+        return;
+    }
+    /* M15 修复：路径深度超过 8 级时显式返回未找到，而非静默丢弃深层组件
+     * 后拿前 8 级去匹配（曾可能命中错误文件）。 */
+    if (*p != 0) {
         return;
     }
     uint32_t clus = g_root_clus;
@@ -397,7 +435,12 @@ static uint32_t read_file(uint32_t clus, uint32_t size, char *out, uint32_t cap)
     uint8_t sec[SECTOR];
     uint32_t done = 0;
     uint32_t remain = size < cap ? size : cap;
-    while (remain > 0 && clus >= 2 && clus < 0x0FFFFFF8) {
+    uint32_t hops_rf = 0;
+    while (remain > 0 && clus >= 2 && clus < 0x0FFFFFF8
+           && hops_rf++ < FAT_WALK_LIMIT) {
+        if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
+            break;
+        }
         for (uint32_t s = 0; s < g_sec_per_clus && remain > 0; s++) {
             if (!disk_read(clus_to_lba(clus) + s, 1, sec)) {
                 return done;
@@ -465,6 +508,9 @@ static uint32_t read_file_at(uint32_t first_clus, uint32_t size,
     if (clus < 2 || clus >= 0x0FFFFFF8) {
         return 0;
     }
+    if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
+        return 0;
+    }
     g_ra_first = first_clus;
     g_ra_idx   = idx;
     g_ra_clus  = clus;
@@ -476,7 +522,12 @@ static uint32_t read_file_at(uint32_t first_clus, uint32_t size,
     uint32_t within = offset % clus_bytes;     /* 当前簇内字节偏移 */
     uint32_t done = 0;
 
-    while (remain > 0 && clus >= 2 && clus < 0x0FFFFFF8) {
+    uint32_t hops_rfa = 0;
+    while (remain > 0 && clus >= 2 && clus < 0x0FFFFFF8
+           && hops_rfa++ < FAT_WALK_LIMIT) {
+        if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
+            break;
+        }
         /* 探测从 clus 起的连续簇（fat 项 = 上一簇+1 即物理连续），
          * 上限为预读窗口 RA_SECS。fat_next 有 FAT 扇区缓存，此探测
          * 几乎不产生磁盘读。 */

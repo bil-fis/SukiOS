@@ -123,12 +123,14 @@ void port_release_owner(task_t *t)
  * 空闲链表（A3 项）。由调度器在回收死任务时调用。 */
 void port_reap_ool(task_t *t)
 {
+    /* M4 修复：OOL 共享物理页的引用释放已统一移交给
+     * vmm_destroy_address_space()（其销毁接收方地址空间时对 PTE_OOL 页执行
+     * pmm_decref，仅释放本地址空间的引用，杜绝误释放他任务页）。此处仅回收
+     * 映射区间（VA 区域）到空闲链表供后续复用，不再对物理页做 decref
+     * （避免与 vmm_destroy 重复计数导致双重释放）。 */
     ool_map_node_t *n = (ool_map_node_t *)t->ool_maps;
     while (n) {
         ool_map_node_t *nx = n->next;
-        for (uint32_t i = 0; i < n->count; i++) {
-            pmm_decref((void *)n->pages[i]);
-        }
         ool_free_t *fr = kmalloc(sizeof(ool_free_t));
         if (fr) {                       /* 回收映射区间供后续复用 */
             fr->base = n->va;
@@ -234,6 +236,14 @@ static uint64_t deliver(uint32_t dest, kernel_msg_t *m)
         irq_restore(f);
         kfree(m);
         return MACH_SEND_INVALID_DEST;
+    }
+    /* M5 修复：消息队列长度上限，避免恶意/失控任务狂发耗尽内核堆。
+     * 超出则拒绝投递并返回 NO_BUFFER，形成背压（发送方收到错误后可重试/
+     * 限流），而非无界增长。 */
+    if (p->queue_len >= PORT_QUEUE_MAX) {
+        irq_restore(f);
+        kfree(m);
+        return MACH_SEND_NO_BUFFER;
     }
     enqueue(p, m);
     irq_restore(f);
@@ -506,6 +516,27 @@ uint64_t sys_mach_msg(uint64_t msg_uptr, uint64_t option,
             port_wait_enqueue(p);
             schedule();
             irq_restore(f);
+        }
+        /* M6 修复：接收侧防御性校验。
+         * - recv_limit 至少须容纳消息头，否则无法安全拷出 → 拒绝。
+         * - 若消息携带 OOL，重验 ool_page_count 在合法区间内，防止 SEND 侧
+         *   ool_capture 之外的任何伪造/损坏导致越界映射或越界访问 ool_pages[]。
+         *   （ool_pages[] 定容 MACH_MSG_OOL_MAX_PAGES，越界即数组越界读。） */
+        if (recv_limit < sizeof(mach_msg_header_t)) {
+            kfree(m);
+            return MACH_RCV_INVALID_NAME;
+        }
+        if (m->has_ool) {
+            uint32_t pc = (m->ool_page_count > MACH_MSG_OOL_MAX_PAGES)
+                          ? MACH_MSG_OOL_MAX_PAGES : m->ool_page_count;
+            if (m->ool_page_count == 0 ||
+                m->ool_page_count > MACH_MSG_OOL_MAX_PAGES) {
+                for (uint32_t i = 0; i < pc; i++) {
+                    pmm_decref((void *)m->ool_pages[i]);
+                }
+                kfree(m);
+                return MACH_RCV_NO_SPACE;
+            }
         }
         if (m->size > recv_limit) {
             kfree(m);                      /* 超限即丢弃 */

@@ -56,6 +56,8 @@ typedef struct mach_ool_desc {
 /* OOL 接收窗口耗尽（H4）：无更多映射区间且复用链表无法满足需求 */
 #define MACH_RCV_NO_SPACE       0x10005005UL
 #define MACH_INVALID_ARGUMENT   0x10000002UL
+/* 消息队列已满（M5）：背压信号，发送方应限流/重试 */
+#define MACH_SEND_NO_BUFFER     0x10000005UL
 
 /* ---- 知名端口号（1 起始；0 = PORT_NULL）---- */
 #define PORT_NULL       0
@@ -69,6 +71,9 @@ typedef struct mach_ool_desc {
 #define APP_PORT        8               /* 通用客户端(独立 app)可认领的应答端口 */
 #define PORT_FIRST_DYN  9               /* 动态分配起始 */
 #define PORT_MAX        64
+/* 单端口消息队列长度上限（M5 修复）：防止失控/恶意任务狂发消息耗尽内核堆，
+ * 超出即拒绝投递并返回 MACH_SEND_NO_BUFFER 形成背压。 */
+#define PORT_QUEUE_MAX  64
 
 /* ---- 内核端口对象 ---- */
 typedef struct kernel_msg {

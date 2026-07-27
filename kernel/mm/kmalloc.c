@@ -163,6 +163,14 @@ void kfree(void *ptr)
         kprintf("[kheap] CORRUPTION: bad canary at %p, aborting kfree\n", (void *)b);
         return;
     }
+    /* M1 修复：双重释放防护。原代码仅校验 canary（防堆头被覆写），但未检测
+     * 块是否已进入 free 状态；重复 kfree 会让下方合并逻辑再次执行，破坏链表
+     * next/prev 指针（释放后哨兵虽在，但 free 标志已被置位）。此处显式拒绝
+     * 对已释放块的二次释放。 */
+    if (b->free) {
+        kprintf("[kheap] DOUBLE FREE at %p, ignoring\n", (void *)b);
+        return;
+    }
     b->free = true;
 
     /* 与后继合并 */

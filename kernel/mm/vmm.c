@@ -91,6 +91,19 @@ bool vmm_map_page(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t fla
     if (!pt_phys) return false;
 
     uint64_t *pt = table_at(pt_phys);
+    if (pt[i1] & PTE_PRESENT) {
+        /* M3 修复：重复映射同一虚拟页。原实现直接覆盖 PTE，旧物理页既不释放
+         * （内核页泄漏）又可能静默降级权限。这里先释放旧物理页（OOL 共享页
+         * 由引用计数管理，不在此释放），再建立新映射，使语义明确。
+         * ELF 多段页边界重叠等场景因此不再泄漏内核页。 */
+        uint64_t old = pt[i1] & PTE_ADDR_MASK;
+        if (!(pt[i1] & PTE_OOL)) {
+            pmm_free_page((void *)old);
+        } else {
+            kprintf("[vmm] remap over OOL page va=%p (refcount retained)\n",
+                    (void *)virt);
+        }
+    }
     pt[i1] = (phys & PTE_ADDR_MASK) | (flags & ~PTE_ADDR_MASK) | PTE_PRESENT;
     invlpg(virt);
     return true;
@@ -230,22 +243,33 @@ void vmm_destroy_address_space(uint64_t pml4_phys)
             uint64_t *p2 = table_at(p3[i3] & PTE_ADDR_MASK);
             for (int i2 = 0; i2 < 512; i2++) {
                 if (!(p2[i2] & PTE_PRESENT)) continue;
-                if (p2[i2] & PTE_HUGE) { p2[i2] = 0; continue; }
+                if (p2[i2] & PTE_HUGE) {
+                    /* M4：2MB 大页（内核映射）直接释放其引用 */
+                    pmm_decref((void *)(p2[i2] & PTE_ADDR_MASK));
+                    p2[i2] = 0;
+                    continue;
+                }
                 uint64_t *pt = table_at(p2[i2] & PTE_ADDR_MASK);
                 for (int i1 = 0; i1 < 512; i1++) {
                     if (pt[i1] & PTE_PRESENT) {
-                        if (!(pt[i1] & PTE_OOL))
-                            pmm_free_page((void *)(pt[i1] & PTE_ADDR_MASK));
+                        /* M4 修复：用 pmm_decref 替代 pmm_free_page。
+                         * 普通用户页 ref==1 时 decref 即释放；OOL 共享页
+                         * (ref>1) 仅释放本地址空间的引用，避免误释放他任务
+                         * 仍持有的共享物理页（此前 vmm_destroy 用
+                         * pmm_free_page 无条件释放，曾可令映射到同一物理页
+                         * 的其它任务页表指向已释放内存）。物理页引用释放已
+                         * 统一移交给此处，port_reap_ool 不再重复 decref。 */
+                        pmm_decref((void *)(pt[i1] & PTE_ADDR_MASK));
                         pt[i1] = 0;
                     }
                 }
-                pmm_free_page((void *)(p2[i2] & PTE_ADDR_MASK));
+                pmm_decref((void *)(p2[i2] & PTE_ADDR_MASK));
             }
-            pmm_free_page((void *)(p3[i3] & PTE_ADDR_MASK));
+            pmm_decref((void *)(p3[i3] & PTE_ADDR_MASK));
         }
-        pmm_free_page((void *)(pml4[i4] & PTE_ADDR_MASK));
+        pmm_decref((void *)(pml4[i4] & PTE_ADDR_MASK));
     }
-    pmm_free_page((void *)(pml4_phys & PTE_ADDR_MASK));
+    pmm_decref((void *)(pml4_phys & PTE_ADDR_MASK));
 }
 
 void vmm_init(void)

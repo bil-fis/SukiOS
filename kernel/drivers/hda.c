@@ -35,6 +35,9 @@
 #include <kernel/task.h>          /* sched_current()：H6 所有权校验 */
 #include <mm/pmm.h>
 
+/* M11 修复：hda_verb_raw 的忙等循环中将周期性让出 CPU（见下方实现） */
+extern void task_yield(void);
+
 /* ---- 控制器寄存器偏移（HDA spec §3.3） ---- */
 #define REG_GCAP        0x00    /* u16: OSS[15:12] ISS[11:8] BSS[7:3] */
 #define REG_VMIN        0x02
@@ -272,6 +275,12 @@ static uint32_t hda_verb_raw(uint32_t cmd)
      * 非 unsolicited（solicited）响应。单次可能夹带 unsolicited 响应，故
      * 扫描整段窗口而非只读一条。 */
     for (uint32_t i = 0; i < 100000; i++) {
+        /* M11 修复：codec 无响应时原 100000 次 io_wait 忙等会长期占死 CPU。
+         * 每 8192 次迭代让出一次（单核下切换到其它就绪任务），缩短占死窗口；
+         * 控制器响应与 CPU 调度无关，让出不影响 verb 完成。 */
+        if ((i & 0x1FFF) == 0) {
+            task_yield();
+        }
         uint32_t hw_wp = r16(REG_RIRBWP) & 0xFF;
         uint32_t last_resp = 0;
         bool     found = false;
@@ -575,6 +584,14 @@ bool hda_init(void)
     for (uint32_t i = 0; i < HDA_BDL_ENTRIES; i++) {
         void *p = pmm_alloc_page();
         if (!p) {
+            /* M12 修复：BDL/数据页分配中途失败需回滚，释放已分配的 BDL 页
+             * 与前面各数据页，避免物理页泄漏（此前直接 return 致泄漏）。 */
+            for (uint32_t k = 0; k < i; k++) {
+                pmm_free_page((void *)g_buf_phys[k]);
+            }
+            pmm_free_page((void *)g_bdl_phys);
+            g_bdl_phys = 0;
+            kprintf("[hda] BDL buffer alloc failed, rolled back\n");
             return false;
         }
         g_buf_phys[i] = (uint64_t)p;

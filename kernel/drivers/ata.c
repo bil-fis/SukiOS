@@ -136,6 +136,11 @@ bool ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
     if (!g_disk_present || count == 0) {
         return false;
     }
+    /* M10 修复：读路径补上越界读盘防护（此前仅写路径有）。lba+count 越过
+     * 卷尾会令控制器读无效扇区/越界 DMA；无符号回绕一并防范。 */
+    if ((uint64_t)lba + count > g_total_sectors || (uint64_t)lba + count < lba) {
+        return false;
+    }
     if (!ata_wait_not_busy()) {
         return false;
     }

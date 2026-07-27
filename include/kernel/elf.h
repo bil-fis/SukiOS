@@ -32,6 +32,9 @@
  * 数组越界（曾列为审计 H1 项）。
  */
 #define ELF_ARG_MAX    64
+/* 程序头表条目数硬上限（M9 修复）：恶意 ELF 可设极大 e_phnum 使下标计算
+ * 回绕越界读；此处定容并强制校验，与 ELF_ARG_MAX/ELF_AUXV_MAX 同理。 */
+#define ELF_PHDR_MAX   64
 
 /*
  * 初始栈 auxv[] 条目数硬上限（H2 修复）。

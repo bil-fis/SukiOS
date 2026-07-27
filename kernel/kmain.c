@@ -17,6 +17,11 @@
 #include <kernel/interrupts.h>
 #include <kernel/pic.h>
 #include <kernel/pit.h>
+#include <kernel/acpi.h>
+#include <kernel/apic.h>
+#include <kernel/ioapic.h>
+#include <kernel/clock.h>
+#include <kernel/diagnostics.h>
 #include <kernel/keyboard.h>
 #include <kernel/string.h>
 #include <kernel/task.h>
@@ -143,11 +148,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     kprintf("[boot] SMAP (user-memory protection): %s\n",
             g_smap_enabled ? "ENABLED" : "disabled (CPU lacks SMAP)");
 
-    /* ---- 阶段三：中断子系统 ---- */
+    /* ---- 阶段三：中断/异常子系统（IDT 先就位，APIC 向量才能投递）---- */
     gdt_init();
     fpu_init();                     /* 启用 FPU/SSE 状态保存（D2 项） */
     idt_init();
-    pic_remap();
 
     /* ---- 阶段四：内存管理 ---- */
     pmm_init(&g_boot);
@@ -155,11 +159,18 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     kheap_init();
     mm_selftest();
 
+    /* ---- P0-1/P0-2/P0-4：ACPI 拓扑发现 + LAPIC/IOAPIC 取代 8259 PIC+PIT ---- */
+    acpi_init();                                   /* 解析 RSDP/XSDT/MADT/HPET */
+    uint8_t bsp_lapic = lapic_init();              /* 启用本地 APIC */
+    ioapic_init();                                 /* 初始化 I/O APIC（屏蔽全部） */
+    ioapic_set_dest(bsp_lapic);                    /* 中断投递到 BSP */
+    pic_disable();                                 /* 屏蔽遗留 8259，防双投递 */
+    clock_init();                                  /* TSC 校准 + LAPIC 100Hz 节拍 + HPET 探测 */
+
     /* ---- 阶段五：调度器 ---- */
     sched_init();
 
-    keyboard_init();
-    pit_init(100);            /* 100 Hz 系统节拍，驱动抢占 */
+    keyboard_init();              /* 经 I/O APIC GSI1 -> IRQ1 */
     interrupts_enable();
 
     /* ---- 阶段六：syscall + Ring3 ---- */

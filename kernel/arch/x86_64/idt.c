@@ -8,7 +8,8 @@
  */
 #include <kernel/interrupts.h>
 #include <kernel/console.h>
-#include <kernel/pic.h>
+#include <kernel/apic.h>
+#include <kernel/diagnostics.h>
 #include <kernel/task.h>
 
 /* 64 位 IDT 门描述符（16 字节） */
@@ -105,7 +106,8 @@ static void page_fault_handler(registers_t *r)
     kprintf("\n[KPF] KERNEL page fault! cr2=%p write=%d rip=%p cs=0x%lx rflags=0x%lx\n",
             (void *)cr2, write, (void *)r->rip,
             (unsigned long)r->cs, (unsigned long)r->rflags);
-    panic("Kernel page fault (copy_from_user should have pre-validated)");
+    kernel_oops("Kernel page fault (copy_from_user should have pre-validated)",
+                r);
 }
 
 void idt_init(void)
@@ -152,13 +154,14 @@ void isr_dispatch(registers_t *r)
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
             kprintf("  CR2 (fault addr) = %p\n", (void *)cr2);
         }
-        panic("Unhandled CPU exception %u", (unsigned)vec);
+        kernel_oops("Unhandled CPU exception", r);
     }
 
     if (vec >= IRQ_BASE && vec < IRQ_BASE + 16) {
-        /* 先发送 EOI，再调用处理器：定时器处理器可能触发上下文切换而长时间
-         * 不返回，若 EOI 滞后会导致 PIC 停止投递后续中断。 */
-        pic_send_eoi((uint8_t)(vec - IRQ_BASE));
+        /* 先发送 LAPIC EOI，再调用处理器：定时器处理器可能触发上下文切换而
+         * 长时间不返回，若 EOI 滞后会导致 LAPIC 停止投递后续中断。
+         * LAPIC EOI 同时清除本地 LVT（如定时器）与 IOAPIC 电平中断的 pending。 */
+        lapic_eoi();
         if (g_handlers[vec]) {
             g_handlers[vec](r);
         }

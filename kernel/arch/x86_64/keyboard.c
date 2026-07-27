@@ -8,7 +8,7 @@
  */
 #include <kernel/keyboard.h>
 #include <kernel/interrupts.h>
-#include <kernel/pic.h>
+#include <kernel/ioapic.h>
 #include <kernel/io.h>
 #include <kernel/console.h>
 
@@ -104,8 +104,10 @@ void keyboard_init(void)
 {
     g_head = g_tail = 0;
     register_interrupt_handler(IRQ1, kbd_irq_handler);
-    pic_clear_mask(1);                  /* 放开 IRQ1 */
-    kprintf("[kbd] PS/2 keyboard ready (IRQ1)\n");
+    /* P0-2：键盘走 I/O APIC（GSI1 -> 向量 IRQ1）。边沿触发、高电平有效，
+     * 目标为 BSP 的 LAPIC（QEMU 下单核 LAPIC ID=0）。见 kmain 的 ioapic_init。 */
+    ioapic_route(1, IRQ1, false, false, 0);
+    kprintf("[kbd] PS/2 keyboard ready (IOAPIC GSI1 -> IRQ1)\n");
 }
 
 char keyboard_getchar(void)

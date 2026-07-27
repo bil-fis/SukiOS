@@ -46,6 +46,14 @@ void pic_send_eoi(uint8_t irq)
     outb(PIC1_CMD, PIC_EOI);
 }
 
+/* P0-2：切换到 APIC 后彻底屏蔽 8259 PIC，避免其与 I/O APIC 双投递。
+ * 仅置数据端口屏蔽位即可（不再依赖 ICW 重映射）。 */
+void pic_disable(void)
+{
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+}
+
 void pic_set_mask(uint8_t irq)
 {
     uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;

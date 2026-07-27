@@ -13,6 +13,7 @@
 #include <kernel/serial.h>
 #include <kernel/framebuffer.h>
 #include <kernel/vga_text.h>
+#include <kernel/diagnostics.h>
 #include <stdarg.h>
 
 /* 保存并关闭中断 / 恢复：保证一条 kprintf 输出的原子性（单核足够） */
@@ -217,6 +218,7 @@ __attribute__((noreturn)) void panic(const char *fmt, ...)
     }
     va_end(ap);
     kprintf("\n[PANIC] system halted.\n");
+    diag_dump_self();            /* P0-9：打印当前执行流的栈回溯，便于事后定位 */
 
     for (;;) {
         __asm__ volatile("cli; hlt");

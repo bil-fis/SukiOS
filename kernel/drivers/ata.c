@@ -10,6 +10,7 @@
  *           FS_SERVER --mach_msg--> DISK_PORT --disk_srv 任务--> ata_read_sectors。
  */
 #include <kernel/ata.h>
+#include <kernel/ahci.h>     /* P0-7：disk-srv 统一分发（AHCI DMA 优先） */
 #include <kernel/io.h>
 #include <kernel/console.h>
 #include <kernel/task.h>
@@ -247,8 +248,26 @@ uint64_t ata_total_sectors(void)
     return g_total_sectors;
 }
 
+/* ---- P0-7：块设备统一分发 ----
+ * AHCI 控制器在位则走中断驱动 DMA（ahci.c），否则回退传统 IDE PIO。
+ * disk-srv 及其 IPC 协议完全不感知底层是哪条路径。 */
+static bool blk_read(uint64_t lba, uint8_t count, void *buf)
+{
+    if (ahci_present()) {
+        return ahci_read_sectors(lba, count, buf);
+    }
+    return ata_read_sectors((uint32_t)lba, count, buf);
+}
+static bool blk_write(uint64_t lba, uint8_t count, const void *buf)
+{
+    if (ahci_present()) {
+        return ahci_write_sectors(lba, count, buf);
+    }
+    return ata_write_sectors((uint32_t)lba, count, buf);
+}
+
 /* ---- DISK_PORT 内核服务任务 ----
- * 消息循环：RECV DISK_PORT -> ata_read_sectors -> SEND 应答到请求方端口。 */
+ * 消息循环：RECV DISK_PORT -> blk_read/blk_write -> SEND 应答到请求方端口。 */
 static void disk_srv_task(void *arg)
 {
     (void)arg;
@@ -287,7 +306,7 @@ static void disk_srv_task(void *arg)
             disk_read_resp_t *rr = (disk_read_resp_t *)(resp + sizeof(*h));
             uint8_t *data = resp + sizeof(*h) + sizeof(*rr);
 
-            bool ok = ata_read_sectors((uint32_t)r->lba, (uint8_t)count, data);
+            bool ok = blk_read(r->lba, (uint8_t)count, data);
             rr->status = ok ? 0 : 1;
 
             uint32_t total = sizeof(*h) + sizeof(*rr)
@@ -311,7 +330,7 @@ static void disk_srv_task(void *arg)
                      + count * ATA_SECTOR_SIZE) {
                 const uint8_t *data = req + sizeof(mach_msg_header_t)
                                     + sizeof(disk_write_req_t);
-                ok = ata_write_sectors((uint32_t)w->lba, (uint8_t)count, data);
+                ok = blk_write(w->lba, (uint8_t)count, data);
             }
 
             mach_msg_header_t *h = (mach_msg_header_t *)resp;

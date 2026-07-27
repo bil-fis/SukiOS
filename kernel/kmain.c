@@ -35,6 +35,7 @@
 
 #include <ipc/port.h>
 #include <kernel/ata.h>
+#include <kernel/ahci.h>      /* P0-7：AHCI DMA 优先探测 */
 #include <kernel/hda.h>
 
 /* L3：由 boot.S 在探测到 CPU 支持 SMAP 后置 1（见 syscall.c 的 copy_*_user
@@ -193,8 +194,11 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     /* ---- 阶段八·补：Intel HDA 音频（内核态特例，类 ATA） ---- */
     hda_init();
 
-    /* ---- 阶段八：磁盘（内核态特例）与 Ring3 FAT32 服务 ---- */
-    bool disk_ok = ata_init();
+    /* ---- 阶段八：磁盘（内核态特例）与 Ring3 FAT32 服务 ----
+     * P0-7：先探测 AHCI（中断驱动 DMA），无控制器/无盘再回退 ATA PIO；
+     * disk-srv 内部经 blk_read/blk_write 自动选路。 */
+    bool ahci_ok = ahci_init();
+    bool disk_ok = ata_init() || ahci_ok;
     if (disk_ok) {
         disk_srv_start();
         task_t *fs_task = task_create_user(user_fs_server_start,

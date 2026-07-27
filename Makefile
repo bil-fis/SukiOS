@@ -92,6 +92,11 @@ else
 QEMU_FLAGS  := -machine pc -cpu qemu64 -smp $(QEMU_SMP) -m 2G -no-shutdown
 endif
 QEMU_DISK   := -drive file=$(DISK),format=raw,index=0,media=disk
+# P0-7 AHCI：盘挂 AHCI 控制器（DMA+中断路径）而非 i440FX 传统 IDE。
+# 用 make run-ahci / run-ahci-headless 验证 ahci.c；默认 run 仍走 IDE PIO。
+QEMU_AHCI_DISK := -device ahci,id=myahci \
+                  -drive file=$(DISK),format=raw,if=none,id=ahdisk0 \
+                  -device ide-hd,drive=ahdisk0,bus=myahci.0
 QEMU_SERIAL := -serial stdio
 
 # ---- 音频：Intel HDA 控制器 (8086:2668, ICH6) + 输出编解码器 ----
@@ -103,7 +108,7 @@ QEMU_AUDIODRV ?= pa
 QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
                -device intel-hda -device hda-duplex,audiodev=snd0
 
-.PHONY: all iso run run-headless debug clean info disk
+.PHONY: all iso run run-headless run-ahci run-ahci-headless debug clean info disk
 
 all: $(KERNEL)
 
@@ -228,6 +233,13 @@ run: $(ISO) $(DISK)
 # ---- 无头运行 (仅串口，用于自动化验证) ----
 run-headless: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
+
+# P0-7：磁盘挂 AHCI（DMA+中断），验证 kernel/drivers/ahci.c
+run-ahci: $(ISO) $(DISK)
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+
+run-ahci-headless: $(ISO) $(DISK)
+	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 # ---- GDB 调试 (配合 .gdbinit) ----
 debug: $(ISO) $(DISK)

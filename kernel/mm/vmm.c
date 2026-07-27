@@ -286,3 +286,93 @@ void vmm_init(void)
     kprintf("[vmm] kernel PML4 @ phys %p (4-level paging active)\n",
             (void *)g_kernel_pml4);
 }
+
+/* ========================================================================= */
+/*  P0-5：写时复制（COW）                                                     */
+/* ========================================================================= */
+
+/* 取叶级 PTE 槽位指针（不存在返回 NULL；不建表）。COW 只作用于 4KB 叶页。 */
+static uint64_t *pte_slot(uint64_t pml4_phys, uint64_t virt)
+{
+    size_t i4, i3, i2, i1;
+    split_indices(virt, &i4, &i3, &i2, &i1);
+    uint64_t *pml4 = table_at(pml4_phys);
+    if (!(pml4[i4] & PTE_PRESENT)) return NULL;
+    uint64_t *p3 = table_at(pml4[i4] & PTE_ADDR_MASK);
+    if (!(p3[i3] & PTE_PRESENT) || (p3[i3] & PTE_HUGE)) return NULL;
+    uint64_t *p2 = table_at(p3[i3] & PTE_ADDR_MASK);
+    if (!(p2[i2] & PTE_PRESENT) || (p2[i2] & PTE_HUGE)) return NULL;
+    uint64_t *pt = table_at(p2[i2] & PTE_ADDR_MASK);
+    return &pt[i1];
+}
+
+bool vmm_fork_cow(uint64_t src_pml4, uint64_t dst_pml4)
+{
+    uint64_t *s4 = table_at(src_pml4);
+    for (size_t i4 = 0; i4 < 256; i4++) {              /* 仅用户半区 */
+        if (!(s4[i4] & PTE_PRESENT)) continue;
+        uint64_t *s3 = table_at(s4[i4] & PTE_ADDR_MASK);
+        for (size_t i3 = 0; i3 < 512; i3++) {
+            if (!(s3[i3] & PTE_PRESENT) || (s3[i3] & PTE_HUGE)) continue;
+            uint64_t *s2 = table_at(s3[i3] & PTE_ADDR_MASK);
+            for (size_t i2 = 0; i2 < 512; i2++) {
+                if (!(s2[i2] & PTE_PRESENT) || (s2[i2] & PTE_HUGE)) continue;
+                uint64_t *st = table_at(s2[i2] & PTE_ADDR_MASK);
+                for (size_t i1 = 0; i1 < 512; i1++) {
+                    uint64_t pte = st[i1];
+                    if (!(pte & PTE_PRESENT)) continue;
+                    if (pte & PTE_OOL) continue;       /* OOL 窗口不继承 */
+
+                    uint64_t va = (i4 << 39) | (i3 << 30)
+                                | (i2 << 21) | (i1 << 12);
+                    uint64_t phys = pte & PTE_ADDR_MASK;
+
+                    uint64_t shared = pte;
+                    if (pte & PTE_WRITE) {
+                        /* 可写页 -> 双方降为只读 + COW 标记 */
+                        shared = (pte & ~PTE_WRITE) | PTE_COW;
+                        st[i1] = shared;
+                        invlpg(va);                    /* src 正在使用，需刷 */
+                    }
+                    /* dst 建同样的（只读共享）映射；vmm_map_page 会自动
+                     * 建中间页表。注意 flags 要剥掉地址位。 */
+                    if (!vmm_map_page(dst_pml4, va, phys,
+                                      shared & ~PTE_ADDR_MASK)) {
+                        return false;
+                    }
+                    pmm_incref((void *)phys);          /* 双空间共享 +1 */
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool vmm_cow_break(uint64_t pml4_phys, uint64_t virt)
+{
+    uint64_t va = virt & ~((uint64_t)PAGE_SIZE - 1);
+    uint64_t *slot = pte_slot(pml4_phys, va);
+    if (!slot || !(*slot & PTE_PRESENT) || !(*slot & PTE_COW)) {
+        return false;
+    }
+    uint64_t pte  = *slot;
+    uint64_t phys = pte & PTE_ADDR_MASK;
+
+    if (pmm_refcount((void *)phys) > 1) {
+        /* 仍被他空间共享：拷贝到新页，本空间独占可写 */
+        void *np = pmm_alloc_page();
+        if (!np) {
+            return false;
+        }
+        memcpy(PHYS_TO_VIRT(np), PHYS_TO_VIRT(phys), PAGE_SIZE);
+        *slot = ((uint64_t)np & PTE_ADDR_MASK)
+              | ((pte & ~(PTE_ADDR_MASK | PTE_COW)) | PTE_WRITE);
+        invlpg(va);
+        pmm_decref((void *)phys);      /* 释放本空间对旧页的引用 */
+    } else {
+        /* 最后持有者：直接改回可写（零拷贝快路径） */
+        *slot = (pte & ~PTE_COW) | PTE_WRITE;
+        invlpg(va);
+    }
+    return true;
+}

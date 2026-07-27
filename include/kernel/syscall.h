@@ -31,7 +31,9 @@
 #define SYS_AUDIO_WRITE   11  /* 扩展：写 PCM(buf,len)，返回接受字节数 */
 #define SYS_AUDIO_QUEUED  12  /* 扩展：返回环中未播放字节数 */
 #define SYS_AUDIO_STOP    13  /* 扩展：停止并复位输出流 */
-#define SYSCALL_MAX       14
+#define SYS_MMAP          14  /* P0-5：匿名映射 mmap(len, prot)，返回基址或 0 */
+#define SYS_MUNMAP        15  /* P0-5：munmap(addr, len)，返回 0 成功 */
+#define SYSCALL_MAX       16
 
 /* 用户态地址空间上限（含）：0x00007FFFFFFFFFFF */
 #define USER_SPACE_TOP    0x00007FFFFFFFFFFFUL

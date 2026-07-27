@@ -11,6 +11,7 @@
 #include <kernel/apic.h>
 #include <kernel/diagnostics.h>
 #include <kernel/task.h>
+#include <mm/vma.h>          /* P0-5：#PF 按需分页救援 vma_populate */
 
 /* 64 位 IDT 门描述符（16 字节） */
 struct idt_entry {
@@ -100,6 +101,11 @@ static void page_fault_handler(registers_t *r)
 
     if (user) {
         task_t *t = sched_current();
+        /* P0-5：先尝试按需分页救援——命中 VMA 的缺页补零页 / COW 写故障
+         * 拷贝断开，成功则 iretq 原地重试指令（对用户完全透明）。 */
+        if (vma_populate(t, cr2, write)) {
+            return;
+        }
         kprintf("[pf] user #PF: cr2=%p write=%d pid=%lu '%s' rip=%p -> killing task\n",
                 (void *)cr2, write, (unsigned long)t->id, t->name,
                 (void *)r->rip);

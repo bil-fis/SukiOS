@@ -16,6 +16,7 @@
 #include <kernel/keyboard.h>
 #include <kernel/io.h>
 #include <mm/vmm.h>
+#include <mm/vma.h>
 #include <mm/kmalloc.h>
 #include <ipc/port.h>
 #include <kernel/elf.h>
@@ -39,15 +40,25 @@ static bool user_access_ok(const void *uptr, size_t n, bool write)
     if (end > USER_SPACE_TOP) {
         return false;
     }
-    uint64_t cr3 = sched_current()->cr3;
+    task_t *t = sched_current();
+    uint64_t cr3 = t->cr3;
     uint64_t base = start & ~((uint64_t)PAGE_SIZE - 1);
     for (uint64_t a = base; a <= end; a += PAGE_SIZE) {
         uint64_t pte = vmm_pte(cr3, a);
         if (!(pte & PTE_PRESENT)) {
-            return false;
+            /* P0-5：未映射页可能落在按需 VMA（mmap 匿名区/栈增长区）内——
+             * 内核代替用户先行补页（等价于用户自己触发 #PF），成功则该页
+             * 立即可用；失败才判 EFAULT。 */
+            if (!vma_populate(t, a, write)) {
+                return false;
+            }
+            continue;
         }
         if (write && !(pte & PTE_WRITE)) {
-            return false;
+            /* P0-5：只读 PTE 若带 COW 位，代替用户执行写时复制断开 */
+            if (!((pte & PTE_COW) && vma_populate(t, a, true))) {
+                return false;
+            }
         }
     }
     return true;
@@ -434,10 +445,17 @@ static uint64_t sys_execve(uint64_t path_uptr, uint64_t argv_uptr,
 
     /* 切换地址空间：先切内核，再销毁旧用户空间，避免悬空 CR3 */
     vmm_switch(vmm_kernel_pml4());
+    vma_destroy_all(t);                    /* P0-5：旧映像的 VMA 登记随空间作废 */
     vmm_destroy_address_space(old_cr3);
     t->cr3 = new_as;
     t->user_rip = res.entry;
     t->user_stack_top = res.stack_top;
+    /* P0-5：为新映像登记栈自动增长区（已映射 4 页之下的按需区） */
+    {
+        uint64_t mapped_lo = stack_top - 4UL * PAGE_SIZE;
+        vma_insert(t, mapped_lo - (uint64_t)VMA_STACK_GROW_PAGES * PAGE_SIZE,
+                   mapped_lo, PTE_WRITE | PTE_NX, VMA_TYPE_STACK);
+    }
     /* 任务名替换为新映像名（取路径最后一段），便于日志辨识 */
     {
         const char *bn = path;
@@ -585,6 +603,43 @@ static uint64_t sys_audio_stop(void)
     return 0;
 }
 
+/* 14: sys_mmap(len, prot) —— P0-5 匿名按需映射。
+ * prot：bit0=可写（映射恒不可执行 NX，W^X 红线：mmap 区绝不给执行权）。
+ * 语义：仅登记 VMA，不分配物理页；首次触碰经 #PF -> vma_populate 零页
+ * 填充（demand zero-fill）。返回基址，失败返回 0。 */
+static uint64_t sys_mmap(uint64_t len, uint64_t prot)
+{
+    task_t *t = sched_current();
+    if (len == 0 || len > VMA_MMAP_MAX) {
+        return 0;
+    }
+    len = (len + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+    uint64_t base = vma_find_free(t, VMA_MMAP_BASE, VMA_MMAP_TOP, len);
+    if (!base) {
+        return 0;
+    }
+    uint64_t vprot = PTE_NX | ((prot & 1) ? PTE_WRITE : 0);
+    if (!vma_insert(t, base, base + len, vprot, VMA_TYPE_ANON)) {
+        return 0;
+    }
+    return base;
+}
+
+/* 15: sys_munmap(addr, len) —— 解除映射并释放已填充页。0=成功。
+ * 限定 mmap 区间内操作，禁止用户 munmap 自己的代码段/栈（那属 execve/exit
+ * 的整空间销毁路径）。 */
+static uint64_t sys_munmap(uint64_t addr, uint64_t len)
+{
+    task_t *t = sched_current();
+    if (len == 0 || (addr & (PAGE_SIZE - 1)) ||
+        addr < VMA_MMAP_BASE || addr + len > VMA_MMAP_TOP ||
+        addr + len < addr) {
+        return (uint64_t)-1;
+    }
+    len = (len + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+    return vma_unmap_range(t, addr, addr + len) ? 0 : (uint64_t)-1;
+}
+
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5)
 {
@@ -603,6 +658,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_AUDIO_WRITE: return sys_audio_write(a1, a2);
     case SYS_AUDIO_QUEUED:return sys_audio_queued();
     case SYS_AUDIO_STOP:  return sys_audio_stop();
+    case SYS_MMAP:        return sys_mmap(a1, a2);
+    case SYS_MUNMAP:      return sys_munmap(a1, a2);
     default:
         kprintf("[syscall] unknown syscall %lu from pid=%lu (user_rip=%p)\n",
                 (unsigned long)num, (unsigned long)sched_current()->id,

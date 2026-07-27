@@ -18,6 +18,8 @@
 #define PTE_HUGE      (1UL << 7)
 #define PTE_NX        (1UL << 63)
 #define PTE_OOL       (1UL << 9)   /* 软件位：该 PTE 映射的是 IPC OOL 共享页 */
+#define PTE_COW       (1UL << 10)  /* 软件位：写时复制页（只读共享，写故障时
+                                    * 由 vmm_cow_break 拷贝断开，P0-5） */
 
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000UL
 
@@ -50,5 +52,21 @@ void     vmm_extend_kernel_mapping(uint64_t highest);
 
 /* 切换当前地址空间（加载 CR3） */
 void     vmm_switch(uint64_t pml4_phys);
+
+/* ---- P0-5：写时复制（COW） ----
+ * vmm_fork_cow：把 src 用户半区(0..255)的全部已映射页共享给 dst：
+ *   - 可写页：双方 PTE 均改为 只读+PTE_COW，物理页引用计数 +1；
+ *   - 只读页：直接共享（引用计数 +1，无需 COW 位）；
+ *   - PTE_OOL 页跳过（OOL 生命周期由 IPC 引用计数独立管理，fork 语义
+ *     不复制 OOL 窗口——与 XNU 对 VM_INHERIT_NONE 区域的处理一致）。
+ * 完整 fork() syscall（复制内核栈/寄存器上下文）随 P1-5 落地，本函数是
+ * 其地址空间层地基，当前由 vma_selftest 全链路验证。 */
+bool     vmm_fork_cow(uint64_t src_pml4, uint64_t dst_pml4);
+
+/* 对带 PTE_COW 位的页执行写时复制断开：
+ *   引用计数 >1 -> 分配新页拷贝内容，改映射为可写，旧页 decref；
+ *   引用计数==1 -> 最后持有者，直接改回可写并清 COW 位。
+ * 返回 false 表示该 PTE 不是 COW 页或资源不足。 */
+bool     vmm_cow_break(uint64_t pml4_phys, uint64_t virt);
 
 #endif /* _SUKI_MM_VMM_H */

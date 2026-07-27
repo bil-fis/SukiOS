@@ -27,6 +27,7 @@
 #include <kernel/keyboard.h>
 #include <kernel/string.h>
 #include <kernel/task.h>
+#include <mm/vma.h>           /* P0-5：vma_selftest */
 #include <kernel/syscall.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -112,6 +113,9 @@ static void mm_selftest(void)
 
     /* M2 审计：引用计数压测（OOL 共享/饱和粘滞/共享页守卫） */
     pmm_selftest();
+
+    /* P0-5：VMA 链表 + 按需分页 + COW fork/断开 + munmap 全链路自检 */
+    vma_selftest();
 
     kprintf("[mm] selftest: free pages after = %lu\n",
             (unsigned long)pmm_free_pages());

@@ -55,6 +55,8 @@ typedef struct task {
     struct task *wait_next;         /* 端口等待队列的下一个等待者（A4 项） */
     struct task *dead_next;         /* 全局“待回收”死亡链表链接（B1 项） */
     void    *ool_maps;              /* 本任务持有的 OOL 映射链表，退出时清理（A3 项） */
+    void    *vma_list;              /* P0-5：VMA 链表头（vm_area_t*，按地址升序），
+                                       mmap/栈增长区登记于此，#PF 按需补页查询 */
 
     /* --- 进程关系与退出同步（spawn/wait，类 Unix fork+exec+wait） --- */
     uint64_t parent_id;             /* 父任务 PID；idle=0。用 PID 而非指针，

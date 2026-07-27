@@ -28,6 +28,8 @@
 #define SYS_AUDIO_WRITE   11
 #define SYS_AUDIO_QUEUED  12
 #define SYS_AUDIO_STOP    13
+#define SYS_MMAP          14
+#define SYS_MUNMAP        15
 
 /* ---- mach_msg ABI（与 include/ipc/port.h 一致） ---- */
 #define MACH_SEND_MSG   0x1
@@ -137,6 +139,21 @@ static inline uint64_t sys_audio_queued(void)
 static inline void sys_audio_stop(void)
 {
     suki_syscall5(SYS_AUDIO_STOP, 0, 0, 0, 0, 0);
+}
+
+/* ---- P0-5：匿名内存映射（按需分页，首次触碰才耗物理页） ---- */
+/* prot bit0=可写；恒不可执行（内核 W^X 红线）。返回基址，失败 NULL。 */
+#define SUKI_PROT_READ   0
+#define SUKI_PROT_WRITE  1
+static inline void *sys_mmap(uint64_t len, uint64_t prot)
+{
+    return (void *)suki_syscall5(SYS_MMAP, len, prot, 0, 0, 0);
+}
+
+/* 解除 sys_mmap 建立的映射。返回 0 成功，-1 失败。 */
+static inline int sys_munmap(void *addr, uint64_t len)
+{
+    return (int)suki_syscall5(SYS_MUNMAP, (uint64_t)addr, len, 0, 0, 0);
 }
 
 static inline uint64_t mach_msg_send(void *msg, uint32_t size)

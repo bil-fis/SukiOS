@@ -31,6 +31,31 @@ int main(int argc, char **argv)
         u_print("\n");
     }
 
+    /* ---- P0-5 端到端验证：Ring3 mmap 匿名映射 + 按需分页 ----
+     * sys_mmap 只登记 VMA 不给物理页；下面第一次写 buf[i] 触发真实 #PF，
+     * 由内核 page_fault_handler -> vma_populate 补零页后 iretq 原地重试。
+     * 若按需分页链路损坏，本进程会被杀（打印 killing task），测试即失败。 */
+    {
+        uint64_t len = 64 * 1024;                        /* 16 页 */
+        volatile uint8_t *buf = (volatile uint8_t *)
+            sys_mmap(len, SUKI_PROT_WRITE);
+        if (!buf) {
+            u_print("mmap test: FAIL (sys_mmap returned NULL)\n");
+        } else {
+            int ok = 1;
+            for (uint64_t i = 0; i < len; i += 4096) {
+                if (buf[i] != 0) ok = 0;                 /* 应为零页 */
+                buf[i] = (uint8_t)(i >> 12) + 1;         /* 写触发 #PF 补页 */
+            }
+            for (uint64_t i = 0; i < len; i += 4096) {
+                if (buf[i] != (uint8_t)((i >> 12) + 1)) ok = 0;
+            }
+            if (sys_munmap((void *)buf, len) != 0) ok = 0;
+            u_print(ok ? "mmap demand-paging test: PASS\n"
+                       : "mmap demand-paging test: FAIL\n");
+        }
+    }
+
     u_print("hello from a freshly spawned ELF process; exiting now.\n");
     sys_exit(0);
     return 0;   /* 不可达 */

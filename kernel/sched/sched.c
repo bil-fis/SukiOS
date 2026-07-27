@@ -20,6 +20,7 @@
 #include <mm/kmalloc.h>
 #include <mm/vmm.h>
 #include <mm/pmm.h>
+#include <mm/vma.h>          /* P0-5：栈自动增长区登记 / 退出清理 */
 #include <kernel/elf.h>
 #include <ipc/port.h>
 
@@ -213,6 +214,15 @@ task_t *task_create_user_args(const void *elf, size_t size,
     t->cr3 = as;
     t->user_rip = res.entry;
     t->user_stack_top = res.stack_top;
+    /* P0-5：栈自动增长区——已立即映射的 USER_STACK_PAGES 之下再登记
+     * VMA_STACK_GROW_PAGES 页按需区（不占物理页）。用户深递归/大局部数组
+     * 越过已映射栈底时 #PF -> vma_populate 补零页，而非直接被杀。 */
+    {
+        uint64_t mapped_lo = stack_top - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
+        uint64_t grow_lo   = mapped_lo
+                           - (uint64_t)VMA_STACK_GROW_PAGES * PAGE_SIZE;
+        vma_insert(t, grow_lo, mapped_lo, PTE_WRITE | PTE_NX, VMA_TYPE_STACK);
+    }
     /* 修正跳板参数：r13 槽（arg）指向任务自身（见 task_create_kernel 栈帧布局） */
     ((uint64_t *)t->rsp)[2] = (uint64_t)t;   /* [r15,r14,r13,...] 从栈顶起序 2 = r13 */
     irq_restore(f);
@@ -429,6 +439,8 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     port_release_owner(t);
     /* 释放本任务持有的 IPC OOL 共享页引用与映射区间（A3 项） */
     port_reap_ool(t);
+    /* P0-5：回收 VMA 链表元数据（物理页由下面的 destroy_address_space 统一收） */
+    vma_destroy_all(t);
     /* 释放地址空间：用户自有物理页 + 全部页表结构（B1 项）。
      * 关键顺序：必须先把 CR3 切回内核 PML4，再销毁旧地址空间——
      * 否则 destroy 会释放 CR3 正指向的 PML4 页（悬空根页表）。

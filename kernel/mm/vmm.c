@@ -16,8 +16,34 @@
 #include <kernel/string.h>
 #include <kernel/console.h>
 #include <kernel/smp.h>
+#include <kernel/security.h>   /* IST_GUARD_BASE/IST_VA：KPTI 影子映射 IST 栈 */
 
 static uint64_t g_kernel_pml4;   /* 物理地址 */
+
+/* P0-8 KASLR：高半区基址随机滑动量（字节，1GB 对齐）。由 boot.S 在引导期
+ * （切页表前、经旧基址映射）写入，供 security.c 报告与诊断路径使用。 */
+uint64_t g_kernel_slide = 0;
+
+/* P0-8 KASLR：运行期高半区实际基址 = KERNEL_BASE + g_kernel_slide。
+ * PHYS_TO_VIRT/VIRT_TO_PHYS（types.h）以此为偏移。必须放 .data（带初值）：
+ * 若放 .bss 且 boot.S 未写（如构建异常），至少退化为固定基址仍可启动。
+ * boot.S 在应用重定位后、切 CR3 前写入随机值。 */
+uint64_t g_virt_base = KERNEL_BASE;
+
+/* P0-R2 KPTI：全局开关。security_init 依 IA32_ARCH_CAPABILITIES.RDCL_NO
+ * 检测置位（不免疫/未知 -> 1）。置位时刻在任何会进入 Ring3 的地址空间创建
+ * 之前（kmain: security_init 先于 sched_init/task_create_user），且此后
+ * 永不改变——vmm_create/destroy 据此判断地址空间是否成对，二者必须见到
+ * 同一值（mm_selftest 的临时空间创建/销毁均在置位前，同样自洽）。
+ * syscall_entry.S / isr.S / enter_user_mode 以字节读取（movabsq 取址，
+ * KASLR 重定位循环自动修补）。 */
+uint8_t g_kpti_enabled = 0;
+
+/* 链接脚本符号：内核映像分段边界（KPTI 影子映射按段赋权） */
+extern char __text_start[], __text_end[];
+extern char __rodata_start[], __rodata_end[];
+extern char __data_start[];
+extern char __kernel_end[];
 
 /* 读取 CR3 */
 static __attribute__((noinline)) uint64_t read_cr3(void)
@@ -73,6 +99,20 @@ static void split_indices(uint64_t virt, size_t *i4, size_t *i3, size_t *i2, siz
     *i1 = (virt >> 12) & 0x1FF;
 }
 
+/* P0-R2 KPTI：把用户地址空间「内核视图 PML4」的用户半区第 i4 项同步进
+ * 影子 PML4（影子与内核视图共享同一批用户半区下级页表——PDPT 及以下的
+ * 增删改自动对两个视图生效，唯 PML4 顶层项新建时需要手工镜像一次）。
+ * 判据：g_kpti_enabled（启用后创建的空间必成对）且非内核 PML4 且 i4<256。 */
+static void kpti_sync_user_slot(uint64_t pml4_phys, size_t i4)
+{
+    if (!g_kpti_enabled || pml4_phys == g_kernel_pml4 || i4 >= 256) {
+        return;
+    }
+    uint64_t *kview  = table_at(pml4_phys);
+    uint64_t *shadow = table_at(pml4_phys + PAGE_SIZE);
+    shadow[i4] = kview[i4];
+}
+
 bool vmm_map_page(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags)
 {
     size_t i4, i3, i2, i1;
@@ -82,6 +122,7 @@ bool vmm_map_page(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t fla
     uint64_t *pml4 = table_at(pml4_phys);
     uint64_t pdpt_phys = next_level(pml4, i4, true, user);
     if (!pdpt_phys) return false;
+    kpti_sync_user_slot(pml4_phys, i4);   /* 顶层项可能刚新建，镜像到影子 */
 
     uint64_t *pdpt = table_at(pdpt_phys);
     uint64_t pd_phys = next_level(pdpt, i3, true, user);
@@ -172,22 +213,124 @@ uint64_t vmm_pte(uint64_t pml4_phys, uint64_t virt)
     return pt[i1];
 }
 
+/* ========================================================================= */
+/*  P0-R2 KPTI：影子页表（KAISER 式最小内核窗口）                              */
+/* ========================================================================= */
+
+/* 在影子 PML4 的【内核半区】建立一个 4KB 映射。与 vmm_map_page 的区别：
+ *   - 中间页表全部新建于影子树内（绝不复用内核 PML4 的下级表——否则会把
+ *     完整内核映射带进影子，KPTI 形同虚设）；
+ *   - 中间项不带 PTE_USER（内核窗口 Ring3 不可见，仅供 CPL0 入口路径取指/
+ *     压栈；Meltdown 泄露面被压缩到映像+栈，物理直映区完全不可达）；
+ *   - 叶项已存在时直接覆写（同一页被重复登记是幂等操作）。 */
+static bool shadow_map_page(uint64_t shadow_pml4, uint64_t virt,
+                            uint64_t phys, uint64_t flags)
+{
+    size_t i4, i3, i2, i1;
+    split_indices(virt, &i4, &i3, &i2, &i1);
+
+    uint64_t *pml4 = table_at(shadow_pml4);
+    uint64_t pdpt_phys = next_level(pml4, i4, true, false);
+    if (!pdpt_phys) return false;
+    uint64_t *pdpt = table_at(pdpt_phys);
+    uint64_t pd_phys = next_level(pdpt, i3, true, false);
+    if (!pd_phys) return false;
+    uint64_t *pd = table_at(pd_phys);
+    uint64_t pt_phys = next_level(pd, i2, true, false);
+    if (!pt_phys) return false;
+    uint64_t *pt = table_at(pt_phys);
+    pt[i1] = (phys & PTE_ADDR_MASK) | (flags & ~PTE_ADDR_MASK) | PTE_PRESENT;
+    return true;
+}
+
+/* 把一段【内核直映/高半区】虚拟区间逐页映射进影子（VA -> 经内核 PML4 翻译
+ * 的物理页）。区间端点自动页对齐（base 向下、end 向上）。未映射页跳过。 */
+static void shadow_map_range(uint64_t shadow_pml4, uint64_t va_start,
+                             uint64_t va_end, uint64_t flags)
+{
+    uint64_t va = va_start & ~(PAGE_SIZE - 1);
+    uint64_t end = (va_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (; va < end; va += PAGE_SIZE) {
+        uint64_t pa = vmm_translate(g_kernel_pml4, va);
+        if (!pa) {
+            continue;   /* 空洞（如尚未建立的 IST 栈）：跳过 */
+        }
+        shadow_map_page(shadow_pml4, va, pa & ~(PAGE_SIZE - 1), flags);
+    }
+}
+
+/* 填充影子 PML4 的最小内核窗口：
+ *   1) 内核映像三段（按段赋权：.text RX / .rodata RO+NX / .data+.bss RW+NX）。
+ *      入口路径的全部代码（syscall_entry/isr 存根）、数据（IDT/GDT/TSS/
+ *      g_percpu/g_syscall_kstack/g_kpti_enabled）都落在映像内；
+ *   2) IST 守卫栈映射页（#DF/NMI 从 Ring3 进入时 CPU 直接向 IST 压栈，
+ *      影子里必须可写；守卫页刻意不映射，保留溢出即 #PF 语义）。
+ *   注意（KASLR 自洽）：__text_start 等符号引用经 movabsq 绝对寻址，boot 期
+ *   重定位循环已修补为「随机滑动后」的运行期 VA；VIRT_TO_PHYS 基于运行期
+ *   g_virt_base——二者同源，影子映射的 VA/PA 与内核视图严格一致。 */
+static void kpti_shadow_populate(uint64_t shadow_pml4)
+{
+    shadow_map_range(shadow_pml4, (uint64_t)__text_start,
+                     (uint64_t)__text_end, 0);                 /* RX（只读） */
+    shadow_map_range(shadow_pml4, (uint64_t)__rodata_start,
+                     (uint64_t)__rodata_end, PTE_NX);          /* RO+NX */
+    shadow_map_range(shadow_pml4, (uint64_t)__data_start,
+                     (uint64_t)__kernel_end, PTE_WRITE | PTE_NX);
+    for (int idx = 0; idx < 2; idx++) {
+        shadow_map_range(shadow_pml4, IST_VA(idx, 0),
+                         IST_VA(idx, IST_STACK_PAGES),
+                         PTE_WRITE | PTE_NX);
+    }
+}
+
+void vmm_kpti_map_kstack(uint64_t pml4_phys, uint64_t kstack_base,
+                         uint64_t kstack_top)
+{
+    if (!g_kpti_enabled || !pml4_phys || pml4_phys == g_kernel_pml4) {
+        return;
+    }
+    /* 内核栈来自 kmalloc（内核堆 VA），可能不页对齐：映射所有与栈区间相交
+     * 的页。相邻堆对象随之进入影子属已知取舍（KAISER 同样映射内核栈）；
+     * 物理直映区/其余堆页仍不可达。 */
+    shadow_map_range(pml4_phys + PAGE_SIZE, kstack_base, kstack_top,
+                     PTE_WRITE | PTE_NX);
+}
+
 uint64_t vmm_create_address_space(void)
 {
-    void *pml4_page = pmm_alloc_page();
-    if (!pml4_page) {
-        return 0;
+    /* KPTI 启用：分配 8KB 对齐的物理连续对（偶页=内核视图，奇页=影子）。
+     * 未启用：单页 PML4（与旧行为完全一致）。 */
+    uint64_t new_pml4;
+    if (g_kpti_enabled) {
+        void *pair = pmm_alloc_pages_aligned(2, 2);
+        if (!pair) {
+            return 0;
+        }
+        new_pml4 = (uint64_t)pair;
+    } else {
+        void *pml4_page = pmm_alloc_page();
+        if (!pml4_page) {
+            return 0;
+        }
+        new_pml4 = (uint64_t)pml4_page;
     }
-    uint64_t new_pml4 = (uint64_t)pml4_page;
+
     uint64_t *dst = table_at(new_pml4);
     uint64_t *src = table_at(g_kernel_pml4);
 
-    /* 用户半区(0..255)清零，内核半区(256..511)共享内核映射 */
+    /* 内核视图：用户半区(0..255)清零，内核半区(256..511)共享内核映射 */
     for (int i = 0; i < 256; i++) {
         dst[i] = 0;
     }
     for (int i = 256; i < 512; i++) {
         dst[i] = src[i];
+    }
+
+    if (g_kpti_enabled) {
+        /* 影子视图：pmm_alloc_pages_aligned 已整体清零（用户半区空、内核
+         * 半区空），此处只需填充最小内核窗口。用户半区 PML4 项由
+         * vmm_map_page 建立下级表时同步（见 kpti_sync_user_slot）。 */
+        kpti_shadow_populate(new_pml4 + PAGE_SIZE);
     }
     return new_pml4;
 }
@@ -216,7 +359,13 @@ void vmm_extend_kernel_mapping(uint64_t highest)
         for (int half = 0; half < 2; half++) {
             size_t p4idx = (half == 0) ? 0 : 256;
             uint64_t *p3 = table_at(pml4[p4idx] & PTE_ADDR_MASK);
-            size_t p3i = (gb >> 30) & 0x1FF;
+            /* P0-8 KASLR：高半区基址已随机滑动 slide_v，内核半区窗口的 PDP
+             * 索引须基于“随机后的虚拟地址”计算，而非固定 gb>>30。
+             * vbase = KERNEL_BASE + slide_v（PHYS_TO_VIRT(0) 在 boot 期已被
+             * 重定位为随机基址），phys gb 在该窗口中的 PDP 索引即：
+             *   ((vbase + gb) >> 30) & 0x1FF = slide_idx + (gb>>30)。 */
+            uint64_t vbase = (uint64_t)PHYS_TO_VIRT(0);
+            size_t p3i = ((vbase + gb) >> 30) & 0x1FF;
             uint64_t p2_phys = p3[p3i] & PTE_ADDR_MASK;
             if (!(p3[p3i] & PTE_PRESENT)) {
                 void *pg = pmm_alloc_page();
@@ -276,11 +425,47 @@ void vmm_destroy_address_space(uint64_t pml4_phys)
         pmm_decref((void *)(pml4[i4] & PTE_ADDR_MASK));
     }
     pmm_decref((void *)(pml4_phys & PTE_ADDR_MASK));
+
+    /* KPTI：影子 PML4（pair+4K）仅持有「最小内核窗口」的下级页表（PDPT/PD/
+     * PT，叶指向内核映像与栈的物理页——不可释放），与内核视图不共享任何
+     * 下级表。逐层走查影子内核半区(256..511) 释放这些表页；用户半区(0..255)
+     * 只是内核视图 PML4 项的镜像，下级表已被上方释放，此处跳过避免双重释放。
+     * 最后释放影子 PML4 自身（与内核视图 PML4 各自独立 decref）。 */
+    if (g_kpti_enabled && pml4_phys != g_kernel_pml4) {
+        uint64_t sp = pml4_phys + PAGE_SIZE;
+        uint64_t *sp4 = table_at(sp);
+        for (int i4 = 256; i4 < 512; i4++) {
+            if (!(sp4[i4] & PTE_PRESENT)) continue;
+            uint64_t *s3 = table_at(sp4[i4] & PTE_ADDR_MASK);
+            for (int i3 = 0; i3 < 512; i3++) {
+                if (!(s3[i3] & PTE_PRESENT) || (s3[i3] & PTE_HUGE)) continue;
+                uint64_t *s2 = table_at(s3[i3] & PTE_ADDR_MASK);
+                for (int i2 = 0; i2 < 512; i2++) {
+                    if (!(s2[i2] & PTE_PRESENT) || (s2[i2] & PTE_HUGE)) continue;
+                    /* PT 内叶项指向内核映像/IST/内核栈物理页，属内核所有，
+                     * 不释放；只回收 PT 表页本身 */
+                    pmm_decref((void *)(s2[i2] & PTE_ADDR_MASK));
+                }
+                pmm_decref((void *)(s3[i3] & PTE_ADDR_MASK));
+            }
+            pmm_decref((void *)(sp4[i4] & PTE_ADDR_MASK));
+        }
+        pmm_decref((void *)(sp & PTE_ADDR_MASK));
+    }
 }
 
 void vmm_init(void)
 {
     g_kernel_pml4 = read_cr3() & PTE_ADDR_MASK;
+    /* KPTI 不变量防回归断言：内核 PML4 物理地址 bit12 必须为 0。
+     * KPTI 用 CR3 bit12 标记影子视图（成对 8KB 分配：偶页=内核视图，奇页=
+     * 影子）；boot.S 已将 p4_table 按 8KB 对齐。若此断言失败（如未来更换
+     * 引导页表来源），中断入口会把内核 CR3 误判为影子并清 bit12，引发取指
+     * #PF(RSVD) 三重故障——宁可启动期 panic 也不可带病运行。 */
+    if (g_kernel_pml4 & (1UL << 12)) {
+        panic("vmm_init: kernel PML4 %p has bit12=1 (breaks KPTI CR3 tagging; "
+              "p4_table must be 8KB-aligned)", (void *)g_kernel_pml4);
+    }
     /* 扩展内核映射以覆盖全部 RAM（>4GB 支持，B4） */
     vmm_extend_kernel_mapping(pmm_total_pages() * PAGE_SIZE);
     kprintf("[vmm] kernel PML4 @ phys %p (4-level paging active)\n",

@@ -124,6 +124,42 @@ void *pmm_alloc_page(void)
     return NULL;   /* 内存耗尽 */
 }
 
+/* P0-8 KPTI：连续对齐多页分配。位图线性扫描：从元数据区之后第一个满足
+ * align_pages 对齐的页帧起，检查 count 个连续空闲页；命中即整体标记已用
+ * （每页 refcount=1），锁外统一清零。失败返回 NULL。
+ * 复杂度 O(total_pages)（与 pmm_alloc_page 同阶）；本函数仅在创建用户
+ * 地址空间时调用（count=2），非热路径。 */
+void *pmm_alloc_pages_aligned(size_t count, size_t align_pages)
+{
+    if (count == 0 || align_pages == 0 ||
+        (align_pages & (align_pages - 1)) != 0) {
+        return NULL;
+    }
+    uint64_t f = spin_lock_irqsave(&g_pmm_lock);
+    uint64_t start = (g_meta_end_phys / PAGE_SIZE + align_pages - 1)
+                     & ~((uint64_t)align_pages - 1);
+    for (uint64_t pg = start; pg + count <= g_total_pages; pg += align_pages) {
+        bool ok = true;
+        for (size_t k = 0; k < count; k++) {
+            if (bm_test(pg + k)) { ok = false; break; }
+        }
+        if (!ok) {
+            continue;
+        }
+        for (size_t k = 0; k < count; k++) {
+            bm_set(pg + k);
+            g_refcount[pg + k] = 1;
+        }
+        g_used_pages += count;
+        void *phys = (void *)(pg * PAGE_SIZE);
+        spin_unlock_irqrestore(&g_pmm_lock, f);
+        memset(PHYS_TO_VIRT(phys), 0, count * PAGE_SIZE);
+        return phys;
+    }
+    spin_unlock_irqrestore(&g_pmm_lock, f);
+    return NULL;
+}
+
 void pmm_free_page(void *phys_addr)
 {
     uint64_t pg = (uint64_t)phys_addr / PAGE_SIZE;

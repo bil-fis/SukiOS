@@ -40,6 +40,10 @@
 
 void syscall_init(void);
 
+/* 在当前 CPU 上写 syscall MSR 组（LSTAR/STAR/FMASK/EFER.SCE 每核私有）。
+ * AP 必须在 ap_main 中调用，否则该核上的用户任务执行 syscall 即 #DF。 */
+void syscall_init_cpu(void);
+
 /*
  * 极度安全的内存操作（手册 9.1）：
  * 所有用户指针严禁直接解引用，必须经 copy_from_user/copy_to_user。

@@ -22,6 +22,7 @@
 #include <kernel/elf.h>
 #include <ipc/fs_proto.h>
 #include <kernel/hda.h>
+#include <kernel/percpu.h>   /* cpu_index()/MAX_CPUS：H8 per-CPU syscall 缓冲 */
 
 /* ---- 用户指针校验（A1 项）----
  * 合法用户区间：[0, USER_SPACE_TOP]，且 [ptr, ptr+n) 不得回绕/越界；
@@ -240,6 +241,10 @@ static bool exec_copy_args(uint64_t path_uptr, uint64_t argv_uptr,
                            char *argv_k[EXEC_ARG_MAX], int *argc_out,
                            char *envp_k[EXEC_ARG_MAX], int *envc_out)
 {
+    /* argc/envc 必须在任何 goto fail 之前初始化：fail 路径按二者释放已分配
+     * 缓冲，早期 goto（如 path 拷贝失败）读未初始化值是未定义行为。 */
+    int argc = 0;
+    int envc = 0;
     size_t pl = 0;
     for (; pl < EXEC_PATH_MAX - 1; pl++) {
         if (copy_from_user(path + pl, (const void *)(path_uptr + pl), 1) != 1) {
@@ -255,13 +260,12 @@ static bool exec_copy_args(uint64_t path_uptr, uint64_t argv_uptr,
     }
     *pl_out = pl;
 
-    int argc = 0;
     if (argv_uptr) {
         for (int i = 0; i < EXEC_ARG_MAX; i++) {
             uint64_t a;
             if (copy_from_user(&a, (const void *)(argv_uptr + (uint64_t)i * 8),
                                8) != 8) {
-                return false;
+                goto fail;   /* M8：不可 return false——会泄漏已分配字符串 */
             }
             if (a == 0) {
                 break;
@@ -286,13 +290,12 @@ static bool exec_copy_args(uint64_t path_uptr, uint64_t argv_uptr,
     }
     *argc_out = argc;
 
-    int envc = 0;
     if (envp_uptr) {
         for (int i = 0; i < EXEC_ARG_MAX; i++) {
             uint64_t a;
             if (copy_from_user(&a, (const void *)(envp_uptr + (uint64_t)i * 8),
                                8) != 8) {
-                return false;
+                goto fail;   /* M8：不可 return false——会泄漏已分配字符串 */
             }
             if (a == 0) {
                 break;
@@ -448,6 +451,9 @@ static uint64_t sys_execve(uint64_t path_uptr, uint64_t argv_uptr,
     vma_destroy_all(t);                    /* P0-5：旧映像的 VMA 登记随空间作废 */
     vmm_destroy_address_space(old_cr3);
     t->cr3 = new_as;
+    /* P0-R2 KPTI：新地址空间的影子 PML4 需要映射本任务（沿用的）内核栈——
+     * 旧空间连同旧影子已销毁，缺此步则 iretq 回 Ring3 后首个中断即三重故障 */
+    vmm_kpti_map_kstack(new_as, t->kstack_base, t->kstack_top);
     t->user_rip = res.entry;
     t->user_stack_top = res.stack_top;
     /* P0-5：为新映像登记栈自动增长区（已映射 4 页之下的按需区） */
@@ -538,28 +544,13 @@ static uint64_t sys_task_spawn(uint64_t path_uptr, uint64_t argv_uptr,
  * 时直接返回其退出码，随后该 zombie 被回收（仅此一次）。 */
 static uint64_t sys_wait(uint64_t child_pid)
 {
-    task_t *cur = sched_current();
-    uint64_t f = irq_save();
-    task_t *child = task_lookup(child_pid);
-    if (!child || child->parent_id != cur->id) {
-        irq_restore(f);
+    /* P0-R1：全部逻辑移入 sched.c task_wait_child（g_sched_lock 保护），
+     * 原"仅关本地中断"的实现与其它核上子任务退出路径存在数据竞争。 */
+    uint64_t rc = 0;
+    if (task_wait_child(child_pid, &rc) < 0) {
         return (uint64_t)-1;
     }
-    if (child->zombie) {
-        uint64_t rc = child->exit_code;
-        task_reap(child);            /* 立即回收：二次 wait 将 lookup 失败返回 -1 */
-        irq_restore(f);
-        return rc;
-    }
-    /* 阻塞：登记到子任务的等待者链表，关中断下切换；子退出时唤醒本任务
-     * 并写入退出码。注意：schedule() 须在中断关闭下调用（与 port.c 一致）。 */
-    cur->state     = BLOCKED;
-    cur->wait_link = child->waiters;
-    child->waiters = cur;
-    schedule();                      /* 关中断下切换；被唤醒后继续 */
-    irq_restore(f);
-    /* 被唤醒：退出码已由子任务 task_exit_current 写入 cur->wait_result */
-    return cur->wait_result;
+    return rc;
 }
 
 /* 10: sys_audio_open(rate, channels, bits) —— 打开 HDA 输出流 */
@@ -574,11 +565,15 @@ static uint64_t sys_audio_open(uint64_t rate, uint64_t channels, uint64_t bits)
  * 分块拷贝，单次上限 = 内核暂存缓冲；返回实际写入驱动环的字节数。 */
 static uint64_t sys_audio_write(uint64_t buf_uptr, uint64_t len)
 {
-    static uint8_t kbuf[8192];      /* syscall 串行执行（无并发），静态即可 */
+    /* H8 修复（P0-R1）：对称多核后 syscall 可在多核并发执行，静态单例
+     * 缓冲会被互踩 —— 改为 per-CPU 缓冲（本核 syscall 路径天然串行：
+     * 单任务单核运行，中断处理不会重入 syscall）。 */
+    static uint8_t kbuf_cpu[MAX_CPUS][8192];
+    uint8_t *kbuf = kbuf_cpu[cpu_index()];
     if (len == 0) {
         return 0;
     }
-    uint64_t chunk = len < sizeof(kbuf) ? len : sizeof(kbuf);
+    uint64_t chunk = len < sizeof(kbuf_cpu[0]) ? len : sizeof(kbuf_cpu[0]);
     size_t got = copy_from_user(kbuf, (const void *)buf_uptr, (size_t)chunk);
     if (got == 0) {
         return (uint64_t)-1;        /* 非法用户指针 */

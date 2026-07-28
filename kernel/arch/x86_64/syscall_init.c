@@ -14,6 +14,7 @@
  */
 #include <kernel/syscall.h>
 #include <kernel/console.h>
+#include <kernel/percpu.h>   /* MAX_CPUS：per-CPU syscall 数组维度 */
 
 #define MSR_EFER   0xC0000080U
 #define MSR_STAR   0xC0000081U
@@ -25,8 +26,12 @@
 
 extern void syscall_entry(void);   /* syscall_entry.S */
 
-/* 每次上下文切换更新：当前任务的内核栈顶，syscall_entry 用它切栈 */
-uint64_t g_syscall_kstack = 0;
+/* P0-R1：syscall 快速路径的 per-CPU 全局量（[MAX_CPUS] 数组）。
+ * syscall_entry.S 经 %gs:0 取 cpu 索引后索引这些数组，避免多核并发
+ * syscall 互相踩踏（全局单例会让 CPU1 用 CPU0 的内核栈/暂存）。 */
+uint64_t  g_syscall_kstack[MAX_CPUS];
+uint64_t *g_scratch[MAX_CPUS];
+uint64_t  g_utmp_rsp[MAX_CPUS];
 
 /* ---- 特权指令隔离封装（手册 9.2）---- */
 
@@ -58,7 +63,11 @@ static __attribute__((noinline)) uint64_t rdmsr_isolated(uint32_t msr)
     return ((uint64_t)hi << 32) | lo;
 }
 
-void syscall_init(void)
+/* 在当前 CPU 上写 syscall MSR 组。LSTAR/STAR/FMASK/EFER.SCE 都是每核私有
+ * MSR —— 只在 BSP 初始化会让 AP 上的用户任务执行 syscall 时直接 #UD/#DF
+ * （P0-R1 真实故障：cpu2/cpu3 的 fs-server/input-server 双重故障）。
+ * BSP 由 syscall_init() 调用；每个 AP 在 ap_main() 中调用。 */
+void syscall_init_cpu(void)
 {
     /* 1. EFER.SCE=1 启用 syscall；EFER.NXE=1 启用 NX（用户栈页带 PTE_NX） */
     uint64_t efer = rdmsr_isolated(MSR_EFER);
@@ -72,7 +81,11 @@ void syscall_init(void)
 
     /* 4. FMASK：进入内核即清 IF(0x200)|TF(0x100)|DF(0x400) */
     wrmsr_isolated(MSR_FMASK, 0x700);
+}
 
-    kprintf("[syscall] LSTAR=%p EFER.SCE=1 FMASK=0x700\n",
+void syscall_init(void)
+{
+    syscall_init_cpu();
+    kprintf("[syscall] LSTAR=%p EFER.SCE=1 FMASK=0x700 (per-CPU MSRs)\n",
             (void *)syscall_entry);
 }

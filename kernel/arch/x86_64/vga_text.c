@@ -9,11 +9,14 @@
 #define VGA_PHYS  0xB8000
 #define VGA_ATTR  0x0F   /* 黑底白字 */
 
-static volatile uint16_t *g_vga = (volatile uint16_t *)PHYS_TO_VIRT(VGA_PHYS);
+/* KASLR 后 PHYS_TO_VIRT 依赖运行期 g_virt_base，不再是编译期常量表达式，
+ * 故指针改为 vga_init() 运行期求值（kmain 早期调用，先于任何 vga 输出）。 */
+static volatile uint16_t *g_vga;
 static uint32_t g_row = 0, g_col = 0;
 
 void vga_init(void)
 {
+    g_vga = (volatile uint16_t *)PHYS_TO_VIRT(VGA_PHYS);
     g_row = 0;
     g_col = 0;
     for (uint32_t i = 0; i < VGA_COLS * VGA_ROWS; i++) {
@@ -36,6 +39,9 @@ static void vga_scroll(void)
 
 void vga_putc(char c)
 {
+    if (!g_vga) {                    /* 防御：vga_init 前被 panic 路径调用 */
+        g_vga = (volatile uint16_t *)PHYS_TO_VIRT(VGA_PHYS);
+    }
     if (c == '\n') {
         g_col = 0;
         if (++g_row >= VGA_ROWS) {

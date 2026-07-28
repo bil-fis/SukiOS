@@ -33,6 +33,7 @@
 #include <kernel/console.h>
 #include <kernel/string.h>
 #include <kernel/task.h>          /* sched_current()：H6 所有权校验 */
+#include <kernel/spinlock.h>      /* P0-R1：SMP 下 PCM 状态机需自旋锁串行化 */
 #include <mm/pmm.h>
 
 /* M11 修复：hda_verb_raw 的忙等循环中将周期性让出 CPU（见下方实现） */
@@ -125,6 +126,11 @@ static uint64_t g_wr_ofs = 0;               /* 环内写偏移（< HDA_BUF_BYTES
  * 正在播放的流。现在 open 时登记 owner，非 owner 的后续 open/write/
  * queued/stop 一律拒绝，把"音频资源"纳入与端口同款的 owner 能力体系。 */
 static task_t  *g_owner  = NULL;
+
+/* P0-R1(H8)：PCM 状态机（g_opened/g_running/g_wr_ofs/g_owner + MMIO 流寄存器）
+ * 的 SMP 串行化锁。单核时代靠 syscall 串行天然互斥；对称多核后两个核可能
+ * 同时进入 hda_pcm_write（owner 任务 + 其 fork 子进程等），必须加锁。 */
+static spinlock_t g_hda_lock = SPINLOCK_INIT("hda");
 
 /* ---- MMIO 访问原语（非特权指令，内联即可；volatile 禁止重排/合并） ---- */
 static inline uint32_t r32(uint32_t off) { return *(volatile uint32_t *)(g_mmio + off); }
@@ -630,14 +636,18 @@ int hda_pcm_open(uint32_t rate, uint32_t channels, uint32_t bits)
      * 本次 open（避免重置 DMA / 覆盖 BDL 破坏正在进行的播放）。owner 自身
      * 重复 open 视为重新配置，放行（将重建 BDL 与流格式）。 */
     task_t *cur = sched_current();
+    uint64_t irqf = spin_lock_irqsave(&g_hda_lock);
     if (g_opened && g_owner != cur) {
+        uint64_t owner_pid = g_owner ? g_owner->id : 0;
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         kprintf("[hda] pcm open denied: stream owned by pid=%lu\n",
-                (unsigned long)(g_owner ? g_owner->id : 0));
+                (unsigned long)owner_pid);
         return -1;
     }
 
     uint32_t fmt = hda_format(rate, channels, bits);
     if (fmt == HDA_VERB_TIMEOUT) {
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         kprintf("[hda] unsupported format %u Hz %u ch %u bit\n",
                 rate, channels, bits);
         return -1;
@@ -671,6 +681,7 @@ int hda_pcm_open(uint32_t rate, uint32_t channels, uint32_t bits)
     g_running = false;
     g_wr_ofs = 0;
     g_owner = cur;                          /* H6：登记当前任务为流 owner */
+    spin_unlock_irqrestore(&g_hda_lock, irqf);
     kprintf("[hda] pcm open: %u Hz, %u ch, %u bit (fmt=0x%x) owner pid=%lu\n",
             rate, channels, bits, fmt, (unsigned long)cur->id);
     return 0;
@@ -708,15 +719,19 @@ static uint64_t hda_free_space(void)
 
 int64_t hda_pcm_write(const void *buf, size_t len)
 {
+    uint64_t irqf = spin_lock_irqsave(&g_hda_lock);
     if (!g_present || !g_opened) {
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         return -1;
     }
     /* H6 修复：仅 owner 可写入播放环；非 owner 写入会污染他人流，拒绝。 */
     if (g_owner != sched_current()) {
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         return -1;
     }
     uint64_t free = hda_free_space();
     if (free == 0) {
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         return 0;                                /* 环满：调用方 yield 重试 */
     }
     uint64_t n = len < free ? len : free;        /* n 恒 <= HDA_BUF_BYTES-GUARD */
@@ -760,16 +775,20 @@ int64_t hda_pcm_write(const void *buf, size_t len)
         w8(sd_base() + SD_CTL0, 0x02);           /* RUN=1，启动流 DMA */
         g_running = true;
     }
+    spin_unlock_irqrestore(&g_hda_lock, irqf);
     return (int64_t)n;
 }
 
 uint64_t hda_pcm_queued(void)
 {
+    uint64_t irqf = spin_lock_irqsave(&g_hda_lock);
     if (!g_present || !g_opened) {
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         return 0;
     }
     /* H6 修复：仅 owner 可查询/触发其流尾播放；非 owner 返回 0 不误触。 */
     if (g_owner != sched_current()) {
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         return 0;
     }
     /* 尚未启动（数据不足预填充水位）时也要能启动尾声播放 */
@@ -777,7 +796,9 @@ uint64_t hda_pcm_queued(void)
         w8(sd_base() + SD_CTL0, 0x02);
         g_running = true;
     }
-    return hda_queued_bytes();
+    uint64_t q = hda_queued_bytes();
+    spin_unlock_irqrestore(&g_hda_lock, irqf);
+    return q;
 }
 
 void hda_pcm_stop(void)
@@ -785,11 +806,14 @@ void hda_pcm_stop(void)
     if (!g_present) {
         return;
     }
+    uint64_t irqf = spin_lock_irqsave(&g_hda_lock);
     /* H6 修复：仅 owner（或尚未被认领）可停止流；防止任意任务 kill 掉
      * 他人正在进行的播放。非 owner 直接返回，不触动 DMA。 */
     if (g_opened && g_owner != sched_current()) {
+        uint64_t owner_pid = g_owner ? g_owner->id : 0;
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
         kprintf("[hda] pcm stop denied: stream owned by pid=%lu\n",
-                (unsigned long)(g_owner ? g_owner->id : 0));
+                (unsigned long)owner_pid);
         return;
     }
     w8(sd_base() + SD_CTL0, 0);                  /* RUN=0 */
@@ -799,5 +823,31 @@ void hda_pcm_stop(void)
     g_opened = false;
     g_wr_ofs = 0;
     g_owner = NULL;                             /* H6：释放 owner */
+    spin_unlock_irqrestore(&g_hda_lock, irqf);
     kprintf("[hda] pcm stopped\n");
+}
+
+/* P0-R1：任务退出清理钩子 —— 若退出任务是 PCM 流 owner，停流并释放所有权。
+ * 否则 owner 崩溃/退出后 g_owner 悬空指向已释放 task_t，且音频永久锁死。
+ * 由 task_exit_current() 调用（与 port_release_owner 同位）。 */
+void hda_release_owner(task_t *t)
+{
+    if (!g_present) {
+        return;
+    }
+    uint64_t irqf = spin_lock_irqsave(&g_hda_lock);
+    if (g_owner != t) {
+        spin_unlock_irqrestore(&g_hda_lock, irqf);
+        return;
+    }
+    w8(sd_base() + SD_CTL0, 0);                  /* RUN=0 */
+    udelay(100);
+    hda_stream_reset();
+    g_running = false;
+    g_opened = false;
+    g_wr_ofs = 0;
+    g_owner = NULL;
+    spin_unlock_irqrestore(&g_hda_lock, irqf);
+    kprintf("[hda] stream owner pid=%lu exited, stream released\n",
+            (unsigned long)t->id);
 }

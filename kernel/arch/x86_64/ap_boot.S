@@ -85,16 +85,15 @@ ap_pm32:
 /* ========================================================================= */
 .code64
 ap_lm64:
+    movq    ap_mb_stack(%rip), %rsp        /* 先切到本 AP 独立内核栈（64 位地址） */
+    andq    $-16, %rsp
+    subq    $8, %rsp                       /* 模拟 call 后的栈相位（SysV ABI） */
     movw    $0x10, %ax
     movw    %ax, %ds
     movw    %ax, %es
     movw    %ax, %ss
     movw    %ax, %fs
     movw    %ax, %gs                       /* GS_BASE 稍后由 percpu_install 设置 */
-
-    movq    ap_mb_stack(%rip), %rsp        /* 本 AP 的独立内核栈顶 */
-    andq    $-16, %rsp                     /* 16 字节对齐 */
-    subq    $8, %rsp                       /* 模拟 call 后的栈相位（SysV ABI） */
     xorq    %rbp, %rbp                     /* 终止栈回溯链 */
 
     movq    ap_mb_idx(%rip), %rdi          /* 参数：CPU 逻辑索引 */

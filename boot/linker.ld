@@ -68,6 +68,17 @@ SECTIONS
     __kernel_end = .;                 /* 高半区虚拟结束地址 */
     __kernel_phys_end = . - KERNEL_VMA;
 
+    /* KASLR 重定位表（build/relk.c 生成）：放 .bss 之后，避免改变 .text/
+     * .rodata/.data/.bss 的虚拟地址，从而保证 gen_relk.py 由预链接 ELF
+     * 抽取的重定位偏移与最终链接一致。本段位于高半区，boot 期经旧基址映射
+     * 读取，重载 CR3 后旧基址失效，但运行期不再访问，无需映射。 */
+    .relk ALIGN(8) : AT(ADDR(.relk) - KERNEL_VMA)
+    {
+        __relk_start = .;
+        *(.relk)
+        __relk_end = .;
+    }
+
     /DISCARD/ :
     {
         *(.eh_frame)

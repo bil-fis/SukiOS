@@ -85,7 +85,21 @@ ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
 
-/* 公共存根：保存寄存器 -> 调用 C -> 恢复 -> iretq */
+/* 公共存根：保存寄存器 -> KPTI 切内核页表 -> 调用 C -> KPTI 还原 -> iretq
+ *
+ * P0-R2 KPTI 设计（KAISER 式）：
+ *   入口：压完 GPR 后读 CR3 压栈（registers_t.saved_cr3，帧首字段）。若
+ *   bit12=1（来自 Ring3 影子视图），清 bit12 切到本地址空间内核视图——
+ *   在此之前 CPU 压 iretq 帧 / 本存根压 GPR 全部落在「已映射进影子」的
+ *   任务内核栈或 IST 栈上，不会缺页。
+ *   出口：弹出 saved_cr3，与当前 CR3 不同才写回（避免每次中断白刷 TLB）。
+ *   「原样还原」而非「按目标 CS 推断」的关键收益：NMI 若命中 syscall 出口
+ *   「已切影子、尚未 iretq/sysret」的 1~2 条指令微窗口（CPL0 + 影子 CR3），
+ *   出口会如实还原影子视图继续退出——不会把内核视图带回 Ring3 造成 KPTI
+ *   旁路（Linux 用跳板页解决的同一竞态，这里以保存-还原语义闭合）。
+ *   任务切换安全性：schedule() 在 isr_dispatch 内切走后，本帧连同 saved_cr3
+ *   一起“停泊”在旧任务内核栈上；旧任务恢复时 CR3 已由 schedule 恢复为其
+ *   内核视图，弹出的 saved_cr3 也属于同一地址空间对，语义自洽。 */
 isr_common:
     /* 按 registers_t 约定顺序压入通用寄存器 */
     pushq %rax
@@ -104,10 +118,33 @@ isr_common:
     pushq %r14
     pushq %r15
 
+    /* KPTI 入口：保存 CR3 原值到帧首（registers_t.saved_cr3），必要时切内核视图。
+     * 必须先查 g_kpti_enabled：CR3 bit12 属 PML4 物理基址（osdev CPU_Registers_
+     * x86-64），只有 KPTI 启用时「成对 8KB 分配 + 内核 PML4 8KB 对齐」才保证
+     * bit12=1 ⇔ 影子视图；KPTI 未启用时任务 PML4 为单页分配，物理地址 bit12
+     * 可为 1，无条件清位会把合法 CR3 改成垃圾页表 -> 取指 #PF(RSVD) -> 三重
+     * 故障（实测：boot p4_table 落在 0x101000 时 AP 首个中断即崩）。 */
+    movq %cr3, %rax
+    pushq %rax
+    movabsq $g_kpti_enabled, %rcx
+    cmpb $0, (%rcx)
+    je 1f                    /* KPTI 未启用：CR3 原样使用 */
+    testq $0x1000, %rax      /* bit12=1 -> 影子视图（来自 Ring3） */
+    jz 1f
+    andq $-4097, %rax        /* 清 bit12（-4097 = ~0x1000，32 位符号扩展立即数） */
+    movq %rax, %cr3
+1:
     cld
-    movq %rsp, %rdi          /* 参数：registers_t * */
+    movq %rsp, %rdi          /* 参数：registers_t *（首字段 saved_cr3） */
     call isr_dispatch
 
+    /* KPTI 出口：还原入口时的 CR3 视图（不同才写，省去无谓 TLB 冲刷） */
+    popq %rax                /* saved_cr3 */
+    movq %cr3, %rcx
+    cmpq %rax, %rcx
+    je 2f
+    movq %rax, %cr3
+2:
     popq %r15
     popq %r14
     popq %r13

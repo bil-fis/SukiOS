@@ -25,7 +25,26 @@
  * 守卫页 IST 栈安装（替换启动期静态 IST 栈）、汇总报告。 */
 void security_init(void);
 
+/* 在当前 CPU 上按 CPUID 探测结果应用安全控制位：CR4.SMEP / CR4.SMAP /
+ * CR4.UMIP 与 EFER.NXE。BSP 由 security_init 调用；AP 在 ap_main 中调用，
+ * 以保证每个逻辑核的用户内存保护位一致（单核假设下 AP 漏设会留下安全缺口）。 */
+void cpu_apply_security_features(void);
+
 /* 金丝雀熵重播种（实现于 stack_canary.c，-fno-stack-protector 编译） */
 void stack_canary_reseed(void);
+
+/* ---- P0-8 KPTI 守卫页 IST 栈布局（与 security.c 实现一致，供 vmm.c 在
+ *      影子页表内映射这两条栈，使 NMI/#DF 从用户态进入时仍能压栈不 #PF）----
+ *   窗口基址 0xFFFFD00000000000；每个 idx（0=#DF/IST1, 1=NMI/IST2）占
+ *   (1 守卫页 + IST_STACK_PAGES 映射页 + 1 隔离页)，映射页 VA 从窗口基址
+ *   +1 页起。vmm.c 的 vmm_shadow_populate 据此把页 1..IST_STACK_PAGES
+ *   映射进影子（守卫页刻意不映射）。 */
+#define IST_GUARD_BASE    0xFFFFD00000000000UL
+#define IST_STACK_PAGES   4
+#define IST_WINDOW_PAGES  (1 + IST_STACK_PAGES + 1)
+#define IST_PAGE_SIZE     4096UL
+#define IST_VA(idx, page) (IST_GUARD_BASE + (uint64_t)(idx) * \
+                           IST_WINDOW_PAGES * IST_PAGE_SIZE + \
+                           (uint64_t)(1 + (page)) * IST_PAGE_SIZE)
 
 #endif /* _SUKI_KERNEL_SECURITY_H */

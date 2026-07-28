@@ -24,6 +24,12 @@ void   pmm_init(const boot_info_t *bi);
 void  *pmm_alloc_page(void);              /* 返回物理地址，失败返回 NULL */
 void   pmm_free_page(void *phys_addr);
 
+/* P0-8 KPTI：分配 count 个物理连续页，首页按 align_pages 页对齐（须为 2 的幂）。
+ * 用于「内核视图 PML4 + 影子 PML4」成对分配（count=2, align=2，8KB 对齐对），
+ * 使 CR3 仅翻转 bit12 即可在两视图间切换（syscall/isr 入口无需查任务表）。
+ * 每页独立登记引用计数，可用 pmm_free_page/pmm_decref 逐页释放。 */
+void  *pmm_alloc_pages_aligned(size_t count, size_t align_pages);
+
 /* 引用计数（OOL 共享页） */
 void     pmm_incref(void *phys_addr);
 uint64_t pmm_decref(void *phys_addr);     /* 减 1，返回剩余计数；到 0 自动释放。

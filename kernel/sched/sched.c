@@ -1,32 +1,40 @@
 /*
  * kernel/sched/sched.c
  * -----------------------------------------------------------------------------
- * 抢占式轮转调度器 (Round-Robin)。
+ * 抢占式轮转调度器 (Round-Robin)，P0-R1 对称多核版本。
  *
- * 模型：所有可运行任务组成循环链表。PIT (IRQ0) 每个节拍调用 sched_tick()，
- * 递减当前任务时间片；耗尽即切换到下一个就绪任务。任务也可 task_yield()
- * 主动让出。上下文切换由 switch.S 的 context_switch() 完成。
+ * 模型（相较单核版的关键变化）：
+ *   - 每 CPU 一套独立运行队列（percpu.rq_head/tail/count），任务在创建时按
+ *     RR 绑定到某个 CPU，仅在该 CPU 上被调度（无跨核迁移，故无需 TLB 跨核
+ *     失效与“双 CPU 同跑一任务”竞态）。
+ *   - 全局 g_current 改为 percpu.current_task（sched_current() 经 %gs 取本核）。
+ *   - 所有运行队列/全局任务表/死亡链表的修改统一由 g_sched_lock 自旋锁串行化，
+ *     取代单核时代的 cli/sti 临界区（cli/sti 在 SMP 下不隔离其它核）。
+ *   - 每 CPU 自带 LAPIC 周期定时器（100Hz）触发本核 sched_tick -> schedule()。
+ *   - 新任务入队到非空歇 CPU 时，向该 CPU 发 IPI_RESCHED 唤醒其 hlt 空闲循环。
  *
- * 注意：schedule() 在关中断下执行上下文切换。IRQ 路径中 EOI 已由
- * isr_dispatch 在调用处理器之前发送（见 idt.c），避免切走后 EOI 丢失。
- *
- * 调用关系：kmain -> sched_init/task_create_kernel; IRQ0 -> sched_tick -> schedule。
+ * 调用关系：kmain -> sched_init（建 BSP idle）；smp_init -> sched_create_idle
+ *           （为各 AP 建 idle 并入队）；每核 LAPIC 定时器 -> sched_tick ->
+ *           schedule；syscall/中断路径 -> schedule。
  */
 #include <kernel/task.h>
 #include <kernel/interrupts.h>
 #include <kernel/gdt.h>
 #include <kernel/string.h>
 #include <kernel/console.h>
+#include <kernel/spinlock.h>
+#include <kernel/smp.h>
+#include <kernel/apic.h>
+#include <kernel/percpu.h>
 #include <mm/kmalloc.h>
 #include <mm/vmm.h>
 #include <mm/pmm.h>
 #include <mm/vma.h>          /* P0-5：栈自动增长区登记 / 退出清理 */
 #include <kernel/elf.h>
+#include <kernel/hda.h>      /* hda_release_owner：任务退出释放音频流 */
 #include <ipc/port.h>
 
-/* 每任务内核栈大小（字节）。注意：这是 Ring0 内核栈（syscall/中断/调度时
- * 使用），与用户态栈(USER_STACK_PAGES，32 页=128KiB)是两套完全独立的栈，
- * 二者单位与用途都不同，切勿混淆。 */
+/* 每任务内核栈大小（字节）。Ring0 内核栈与用户态栈(USER_STACK_PAGES)独立。 */
 #define KERNEL_STACK_BYTES  16384
 #define MAX_TASKS       256
 /* M7 修复：内核栈底守卫哨兵。任务内核栈从高地址向下增长，栈底写入哨兵；
@@ -36,49 +44,106 @@
 /* 用户程序装载布局 */
 #define USER_CODE_BASE   0x0000000000400000UL
 #define USER_STACK_TOP   0x00007FFFFFFFF000UL
-/* 32 页 = 128KiB 用户栈：playaudio 的 minimp3 解码在栈上使用较大的
- * scratch（grbuf/syn/qmf 等约数十 KB），4 页会栈溢出触发 #PF。 */
 #define USER_STACK_PAGES 32
-/* 代码/数据 W^X 边界：链接脚本把 .text/.rodata 放在 [0, USER_DATA_SPLIT)，
- * 把 .data/.bss 放在 [USER_DATA_SPLIT, ...)。内核据此分别映射为 RX 与 RW+NX。 */
 #define USER_DATA_SPLIT  0x0000000000100000UL   /* 1 MiB */
 
 extern void context_switch(uint64_t *old_rsp_save, uint64_t new_rsp);
 extern void task_trampoline(void);
 extern void enter_user_mode(uint64_t rip, uint64_t rsp);  /* syscall_entry.S */
-extern uint64_t g_syscall_kstack;                          /* syscall_init.c */
+extern uint8_t kernel_stack_top;   /* boot.S：BSP 引导内核栈顶（idle0 复用） */
+/* syscall 快速路径的 per-CPU 全局量（syscall_init.c 定义，[MAX_CPUS] 数组） */
+extern uint64_t  g_syscall_kstack[MAX_CPUS];
+extern uint64_t *g_scratch[MAX_CPUS];
+extern uint64_t  g_utmp_rsp[MAX_CPUS];
 
-static task_t  *g_current;
+/* 调度器内部共享状态：统一由自旋锁保护，取代单核 cli/sti 临界区（P0-R1） */
+static spinlock_t g_sched_lock;
 static uint64_t g_next_pid = 0;
 static uint32_t g_task_count = 0;
-static task_t  *g_dead_list = NULL;   /* 待回收的已退出任务（B1 项） */
+static task_t  *g_dead_list = NULL;   /* 待回收的已退出任务 */
 static task_t  *g_all_tasks = NULL;   /* 全局任务表（含 zombie），供 pid 查找 */
+static uint32_t g_rr_counter = 0;     /* 新任务 RR 绑定 CPU 的轮转计数器 */
 
-/* 指向“当前运行任务”的 scr_rip/scr_rsp 字段的指针（syscall_entry.S 用）。
- * 必须在每次上下文切换到某任务后指向该任务的 scr_rip，以保证 syscall
- * 返回帧使用的 RIP/RSP 属于正确任务（避免全局暂存被其它任务覆盖）。 */
-uint64_t *g_scratch = NULL;
-
-/* 保存/恢复 IF 的临界区原语：与无条件 sti 不同，嵌套调用安全 */
-static inline uint64_t irq_save(void)
+uint64_t sched_next_pid(void)
 {
-    uint64_t flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
-    return flags;
+    /* 多核并发创建任务时 PID 必须原子分配（P0-R1） */
+    return __atomic_fetch_add(&g_next_pid, 1, __ATOMIC_RELAXED);
 }
-static inline void irq_restore(uint64_t flags)
+task_t *sched_current(void)   { return cpu_local()->current_task; }
+
+/* 把“当前任务”同步到本 CPU 的 percpu + syscall 快速路径数组（P0-R1 多核安全） */
+static inline void set_cpu_current(task_t *t)
 {
-    if (flags & (1UL << 9)) {
-        __asm__ volatile("sti" ::: "memory");
+    uint32_t c = cpu_index();
+    g_percpu[c].current_task = t;
+    g_syscall_kstack[c] = t->kstack_top;
+    g_scratch[c]        = &t->scr_rip;   /* syscall 返回帧暂存指向当前任务 */
+}
+
+/* 将任务追加到指定 CPU 的运行队列尾部（调用方须持 g_sched_lock） */
+static void rq_push_cpu(task_t *t, uint32_t cpu)
+{
+    t->next = NULL;
+    if (g_percpu[cpu].rq_tail) {
+        g_percpu[cpu].rq_tail->next = t;
+    } else {
+        g_percpu[cpu].rq_head = t;
+    }
+    g_percpu[cpu].rq_tail = t;
+    g_percpu[cpu].rq_count++;
+}
+
+/* 从指定 CPU 运行队列摘除任意任务（调用方须持 g_sched_lock） */
+static void rq_unlink_cpu(task_t *t, uint32_t cpu)
+{
+    task_t *p = g_percpu[cpu].rq_head;
+    if (p == t) {
+        g_percpu[cpu].rq_head = t->next;
+        if (!g_percpu[cpu].rq_head) {
+            g_percpu[cpu].rq_tail = NULL;
+        }
+        t->next = NULL;
+        g_percpu[cpu].rq_count--;
+        return;
+    }
+    while (p && p->next != t) {
+        p = p->next;
+    }
+    if (p) {
+        p->next = t->next;
+        if (g_percpu[cpu].rq_tail == t) {
+            g_percpu[cpu].rq_tail = p;
+        }
+        t->next = NULL;
+        g_percpu[cpu].rq_count--;
     }
 }
 
-uint64_t sched_next_pid(void) { return g_next_pid++; }
-task_t *sched_current(void)   { return g_current; }
+/* 在本 CPU 运行队列中选下一个可运行任务（排除当前任务自身）。
+ * 调用方须持 g_sched_lock，且处于本 CPU 上下文。 */
+static void reap_dead(void);
+static task_t *pick_next(void)
+{
+    task_t *cur = g_percpu[cpu_index()].current_task;
+    task_t *t = g_percpu[cpu_index()].rq_head;
+    for (uint32_t i = 0; i < g_percpu[cpu_index()].rq_count; i++) {
+        if (t && t != cur && t->alive &&
+            (t->state == READY || t->state == RUNNING)) {
+            return t;
+        }
+        if (!t) {
+            break;
+        }
+        t = t->next;
+    }
+    return cur;   /* 回退：无其它可运行任务（仅 idle 自身） */
+}
 
 void sched_init(void)
 {
-    /* 将当前引导执行流封装为 task0（idle/boot 线程） */
+    kprintf("[dbg] sched_init entry\n");
+    spinlock_init(&g_sched_lock, "sched");
+    /* 将当前引导执行流封装为 task0（BSP idle/boot 线程） */
     task_t *t0 = (task_t *)kzalloc(sizeof(task_t));
     t0->id = sched_next_pid();
     t0->state = RUNNING;
@@ -87,19 +152,73 @@ void sched_init(void)
     t0->ticks_remaining = TIME_SLICE_TICKS;
     t0->is_user = false;
     t0->alive = true;
-    strncpy(t0->name, "idle", sizeof(t0->name) - 1);
-    t0->next = t0;                 /* 循环链表自环 */
-    g_current = t0;
-    g_scratch = &t0->scr_rip;      /* 初始指向 idle 的返回暂存 */
+    t0->is_idle = true;
+    t0->cpu = 0;
+    strncpy(t0->name, "idle0", sizeof(t0->name) - 1);
+    /* idle 任务栈：复用 BSP 引导内核栈（higher_half_entry 用的 kernel_stack_top），
+     * 故 kstack_base=0 标记“无独立栈”，schedule 跳过其哨兵校验。 */
+    t0->kstack_base = 0;
+    t0->kstack_top  = (uint64_t)&kernel_stack_top;   /* boot.S 符号 */
+
+    /* idle0 入 CPU0 运行队列，置为本核当前任务 */
+    rq_push_cpu(t0, 0);
+    g_percpu[0].current_task = t0;
+    g_percpu[0].idle_task    = t0;
+    set_cpu_current(t0);
     g_task_count = 1;
-    kprintf("[sched] scheduler initialized, task0='idle' pid=%lu\n",
+    kprintf("[sched] scheduler initialized (SMP RR), idle0 pid=%lu\n",
             (unsigned long)t0->id);
 }
 
-task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
+/* 创建某 CPU 的 idle 任务（smp_init 在 SIPI 前为各 AP 调用，P0-R1） */
+task_t *sched_create_idle(uint32_t cpu)
 {
-    /* M7 修复：任务数硬上限。无上限时 PID/物理页耗尽无保护，恶意/失控 spawn
-     * 会拖垮整系统。达到上限即拒绝创建。 */
+    /* 分配在锁外完成（kmalloc 内有自己的锁，避免嵌套锁序问题） */
+    task_t *t = (task_t *)kzalloc(sizeof(task_t));
+    if (!t) {
+        return NULL;
+    }
+    void *stack = kmalloc(KERNEL_STACK_BYTES);
+    if (!stack) {
+        kfree(t);
+        return NULL;
+    }
+    t->id = sched_next_pid();
+    t->state = READY;
+    t->cr3 = vmm_kernel_pml4();
+    t->priority = 0;
+    t->ticks_remaining = TIME_SLICE_TICKS;
+    t->is_user = false;
+    t->alive = true;
+    t->is_idle = true;
+    t->cpu = cpu;
+    t->kstack_base = (uint64_t)stack;
+    t->kstack_top  = (uint64_t)stack + KERNEL_STACK_BYTES;
+    *(uint64_t *)stack = KSTACK_CANARY;
+    strncpy(t->name, "idle", sizeof(t->name) - 1);
+    t->name[4] = '0' + (char)(cpu % 10);
+
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    rq_push_cpu(t, cpu);
+    g_percpu[cpu].current_task = t;   /* AP 上电后读 percpu 即得其 idle */
+    g_percpu[cpu].idle_task    = t;
+    g_syscall_kstack[cpu] = t->kstack_top;
+    g_scratch[cpu]        = &t->scr_rip;
+    g_task_count++;
+    spin_unlock_irqrestore(&g_sched_lock, f);
+    kprintf("[sched] created idle%u pid=%lu for cpu%u\n",
+            (unsigned)cpu, (unsigned long)t->id, (unsigned)cpu);
+    return t;
+}
+
+/* 分配并初始化一个内核任务结构（不入队、不加锁）。
+ * 拆出本函数是为了让 task_create_user_args 在“装配完全部用户态字段”之后
+ * 再原子入队 —— 否则半成品任务可能被其它核先调走（P0-R1 多核正确性），
+ * 同时避免“持 g_sched_lock 再调用会取同一把锁的函数”造成自死锁。 */
+static task_t *task_alloc_kernel(void (*entry)(void *), void *arg,
+                                 const char *name)
+{
+    /* M7 修复：任务数硬上限 */
     if (g_task_count >= MAX_TASKS) {
         return NULL;
     }
@@ -121,40 +240,55 @@ task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
     t->alive = true;
     t->kstack_base = (uint64_t)stack;
     t->kstack_top  = (uint64_t)stack + KERNEL_STACK_BYTES;
-    *(uint64_t *)stack = KSTACK_CANARY;   /* M7：内核栈底守卫哨兵 */
+    *(uint64_t *)stack = KSTACK_CANARY;
     strncpy(t->name, name ? name : "kthread", sizeof(t->name) - 1);
 
     /* 构造初始内核栈帧，令首次 context_switch 落到 task_trampoline */
     uint64_t *sp = (uint64_t *)t->kstack_top;
-    *(--sp) = (uint64_t)task_trampoline;   /* ret 地址 */
-    *(--sp) = 0;                           /* rbx */
-    *(--sp) = 0;                           /* rbp */
-    *(--sp) = (uint64_t)entry;             /* r12 = entry */
-    *(--sp) = (uint64_t)arg;               /* r13 = arg */
-    *(--sp) = 0;                           /* r14 */
-    *(--sp) = 0;                           /* r15 */
+    *(--sp) = (uint64_t)task_trampoline;
+    *(--sp) = 0;
+    *(--sp) = 0;
+    *(--sp) = (uint64_t)entry;
+    *(--sp) = (uint64_t)arg;
+    *(--sp) = 0;
+    *(--sp) = 0;
     t->rsp = (uint64_t)sp;
-
-    /* 插入循环就绪链表（g_current 之后）。
-     * 用 irq_save/restore 而非无条件 sti：task_create_user 需要在关中断
-     * 下调用本函数并在补写 cr3/user_rip 等字段后才允许调度器看到新任务，
-     * 否则定时器可能在字段就绪前抢占并以垃圾 user_rip 进入 Ring3（竞态）。 */
-    uint64_t f = irq_save();
-    t->next = g_current->next;
-    g_current->next = t;
-    t->all_next = g_all_tasks;       /* 链入全局表，供 sys_wait 按 PID 查找 */
-    g_all_tasks = t;
-    g_task_count++;
-    irq_restore(f);
-
-    kprintf("[sched] created task '%s' pid=%lu stack=%p\n",
-            t->name, (unsigned long)t->id, stack);
     return t;
 }
 
-/* 轻量熵源：TSC 低位混合乘散列（C3 项：用户栈 ASLR）。
- * 注：平坦二进制按固定 VA 链接，代码基址无法随机化；栈顶可随机下移
- * 0..255 页（最多 ~1MiB），提升 ROP/栈喷射攻击成本。 */
+/* 把装配完成的任务发布到目标 CPU 运行队列（加锁 + IPI 唤醒空闲核） */
+static void task_publish(task_t *t, uint32_t cpu)
+{
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    t->cpu = cpu;
+    rq_push_cpu(t, cpu);
+    t->all_next = g_all_tasks;
+    g_all_tasks = t;
+    g_task_count++;
+    /* 若目标 CPU 不是当前 CPU 且正在 hlt 空闲，发 IPI 唤醒其调度循环 */
+    if (cpu != cpu_index() && g_percpu[cpu].in_idle) {
+        lapic_send_ipi((uint8_t)g_percpu[cpu].lapic_id, IPI_RESCHED);
+    }
+    spin_unlock_irqrestore(&g_sched_lock, f);
+}
+
+task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name)
+{
+    task_t *t = task_alloc_kernel(entry, arg, name);
+    if (!t) {
+        return NULL;
+    }
+    /* P0-R1：新任务按 RR 绑定到一个 CPU（smp 未就绪时 online_count=1 全绑 CPU0） */
+    uint32_t cpu = __atomic_fetch_add(&g_rr_counter, 1, __ATOMIC_RELAXED)
+                 % smp_online_count();
+    task_publish(t, cpu);
+    kprintf("[sched] created task '%s' pid=%lu cpu=%u stack=%p\n",
+            t->name, (unsigned long)t->id, (unsigned)cpu,
+            (void *)t->kstack_base);
+    return t;
+}
+
+/* 轻量熵源：TSC 低位混合乘散列（用户栈 ASLR） */
 static uint64_t aslr_random(void)
 {
     uint32_t lo, hi;
@@ -168,12 +302,11 @@ static uint64_t aslr_random(void)
 static void user_task_thunk(void *arg)
 {
     task_t *t = (task_t *)arg;
-    interrupts_disable();              /* iretq 前的窗口保持原子 */
+    interrupts_disable();
     tss_set_rsp0(t->kstack_top);
-    g_syscall_kstack = t->kstack_top;
-    /* RFLAGS.IF=1 由 enter_user_mode 的 iretq 帧恢复 */
+    g_syscall_kstack[cpu_index()] = t->kstack_top;
+    g_scratch[cpu_index()]        = &t->scr_rip;
     enter_user_mode(t->user_rip, t->user_stack_top);
-    /* 不可达 */
 }
 
 task_t *task_create_user_args(const void *elf, size_t size,
@@ -181,135 +314,163 @@ task_t *task_create_user_args(const void *elf, size_t size,
                                 int envc, const char *const envp[],
                                 const char *name)
 {
-    /* 1. 独立地址空间（共享内核高半区） */
     uint64_t as = vmm_create_address_space();
     if (!as) {
         return NULL;
     }
 
-    /* 2. 用 ELF 加载器装载段 + 构造初始栈（W^X，栈 ASLR，含 argc/argv/envp）。
-     * 取代旧的“平坦二进制按 1MiB 拆分”装载：现在内核直接解析 ELF64，
-     * 支持 ET_EXEC / ET_DYN(PIE+ASLR)、清零 BSS、按 W^X 设权限、建立
-     * 含 argc/argv/envp/auxv 的初始用户栈。 */
     elf_load_result_t res;
     uint64_t stack_top = USER_STACK_TOP - (aslr_random() & 0xFF) * PAGE_SIZE;
     if (!elf_load(as, elf, size, argc, argv, envc, envp, stack_top,
                   USER_STACK_PAGES, &res)) {
-        vmm_destroy_address_space(as);     /* 回滚（B2 项） */
+        vmm_destroy_address_space(as);
         return NULL;
     }
 
-    /* 3. 复用内核任务骨架，入口为 user_task_thunk。
-     * 整段关中断：task_create_kernel 将任务插入就绪链表后，若定时器在
-     * cr3/user_rip 补写完成前抢占并调度该任务，thunk 将以 arg=NULL 运行，
-     * 从物理页 0（IVT）读出垃圾 user_rip 直接三重故障。 */
-    uint64_t f = irq_save();
-    task_t *t = task_create_kernel(user_task_thunk, NULL, name);
+    /* 先在“私有”状态下装配完全部用户态字段，再发布入队 —— 保证其它核
+     * 绝不会调度到半成品任务（P0-R1 多核正确性 + 避免锁重入死锁）。 */
+    task_t *t = task_alloc_kernel(user_task_thunk, NULL, name);
     if (!t) {
-        irq_restore(f);
         vmm_destroy_address_space(as);
         return NULL;
     }
     t->is_user = true;
     t->cr3 = as;
+    /* P0-R2 KPTI：本任务内核栈页映射进影子 PML4（Ring3 被中断/系统调用时
+     * CPU 向 TSS.rsp0 压栈，栈页必须在影子中可写）。必须在发布入队前完成，
+     * 且 as 已由 task_alloc_kernel 之前建立。 */
+    vmm_kpti_map_kstack(as, t->kstack_base, t->kstack_top);
     t->user_rip = res.entry;
     t->user_stack_top = res.stack_top;
-    /* P0-5：栈自动增长区——已立即映射的 USER_STACK_PAGES 之下再登记
-     * VMA_STACK_GROW_PAGES 页按需区（不占物理页）。用户深递归/大局部数组
-     * 越过已映射栈底时 #PF -> vma_populate 补零页，而非直接被杀。 */
     {
         uint64_t mapped_lo = stack_top - (uint64_t)USER_STACK_PAGES * PAGE_SIZE;
         uint64_t grow_lo   = mapped_lo
                            - (uint64_t)VMA_STACK_GROW_PAGES * PAGE_SIZE;
         vma_insert(t, grow_lo, mapped_lo, PTE_WRITE | PTE_NX, VMA_TYPE_STACK);
     }
-    /* 修正跳板参数：r13 槽（arg）指向任务自身（见 task_create_kernel 栈帧布局） */
-    ((uint64_t *)t->rsp)[2] = (uint64_t)t;   /* [r15,r14,r13,...] 从栈顶起序 2 = r13 */
-    irq_restore(f);
+    /* 修正跳板参数：r13 槽（arg）指向任务自身 */
+    ((uint64_t *)t->rsp)[2] = (uint64_t)t;
 
-    kprintf("[sched] user task '%s' pid=%lu cr3=%p entry=%p (ELF, W^X)\n",
-            t->name, (unsigned long)t->id, (void *)as, (void *)res.entry);
+    uint32_t cpu = __atomic_fetch_add(&g_rr_counter, 1, __ATOMIC_RELAXED)
+                 % smp_online_count();
+    task_publish(t, cpu);
+
+    kprintf("[sched] user task '%s' pid=%lu cpu=%u cr3=%p entry=%p (ELF, W^X)\n",
+            t->name, (unsigned long)t->id, (unsigned)cpu, (void *)as,
+            (void *)res.entry);
     return t;
 }
 
 task_t *task_create_user(const void *elf, size_t size, const char *name)
 {
-    /* 启动期装载：无参数（argc=0） */
     return task_create_user_args(elf, size, 0, NULL, 0, NULL, name);
 }
 
-/* 按 PID 在全局任务表中查找（含尚未回收的 zombie）。单核：调用方须自保证
- * 在关中断窗口内访问以避免与 reap_dead 的摘除产生竞态。 */
+/* 按 PID 在全局任务表中查找（含尚未被回收的 zombie）。调用方无需持锁，
+ * 本函数内部加锁以与 reap/创建路径互斥。 */
 task_t *task_lookup(uint64_t pid)
 {
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
     task_t *t = g_all_tasks;
     while (t) {
         if (t->id == pid) {
+            spin_unlock_irqrestore(&g_sched_lock, f);
             return t;
         }
         t = t->all_next;
     }
+    spin_unlock_irqrestore(&g_sched_lock, f);
     return NULL;
 }
 
-/* 选择 g_current 之后的下一个存活可运行任务 */
-static task_t *pick_next(void)
+/* 执行一次调度（调用时须处于关中断状态，或本函数内部会自行关中断）。
+ * 在持有 g_sched_lock 期间完成“挑选 + 摘链 + 状态/CR3/栈切换”，随后释锁再做
+ * context_switch（绝不在持锁时切栈，避免锁被新任务栈“带走”造成其它核死等）。 */
+void schedule(void)
 {
-    task_t *t = g_current->next;
-    for (uint32_t i = 0; i < g_task_count + 1; i++) {
-        if (t->alive && (t->state == READY || t->state == RUNNING)) {
-            return t;
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    uint32_t cpu = cpu_index();
+    task_t *cur = g_percpu[cpu].current_task;
+
+    /* M7 修复：内核栈溢出守卫 */
+    if (cur && cur->kstack_base) {
+        if (*(const uint64_t *)cur->kstack_base != KSTACK_CANARY) {
+            spin_unlock_irqrestore(&g_sched_lock, f);
+            panic("kernel stack overflow detected (task '%s' pid=%lu)",
+                  cur->name, (unsigned long)cur->id);
         }
-        t = t->next;
     }
-    return g_current;   /* 回退：无其它可运行任务 */
+
+    task_t *next = pick_next();
+    if (next == cur) {
+        cur->ticks_remaining = TIME_SLICE_TICKS;
+        spin_unlock_irqrestore(&g_sched_lock, f);
+        return;
+    }
+
+    /* FPU/SSE 上下文保存与恢复（换栈前在旧栈上完成） */
+    fpu_fxsave(&cur->fpu_state);
+    if (next->fpu_valid) {
+        fpu_fxrstor(&next->fpu_state);
+    } else {
+        fpu_fninit();
+        next->fpu_valid = true;
+    }
+
+    if (cur->state == RUNNING) {
+        cur->state = READY;
+    }
+    next->state = RUNNING;
+    next->ticks_remaining = TIME_SLICE_TICKS;
+    g_percpu[cpu].current_task = next;
+    g_syscall_kstack[cpu] = next->kstack_top;
+    g_scratch[cpu]        = &next->scr_rip;
+    tss_set_rsp0(next->kstack_top);
+
+    bool cr3_switch = (next->cr3 != cur->cr3);
+    uint64_t next_cr3 = next->cr3;
+    spin_unlock_irqrestore(&g_sched_lock, f);
+
+    if (cr3_switch) {
+        vmm_switch(next_cr3);
+    }
+    context_switch(&cur->rsp, next->rsp);
+
+    /* 切换完成后，在“新任务”栈上回收此前已退出任务的残留资源 */
+    reap_dead();
 }
 
-/* 立即回收一个已退出（zombie）任务：从死亡链表与全局任务表摘除并释放其
- * task 结构与内核栈。调用方须处于关中断临界区且持有有效指针。供 sys_wait
- * 在父任务首次回收 zombie 时调用，避免二次 wait 命中残留结构而永久阻塞，
- * 也避免僵尸一直占用内存。 */
-void task_reap(task_t *t)
+/* 由每 CPU LAPIC 定时器（IRQ0）调用 */
+void sched_tick(registers_t *r)
 {
-    /* 从死亡链表摘除 */
-    if (g_dead_list == t) {
-        g_dead_list = t->dead_next;
-    } else {
-        task_t *p = g_dead_list;
-        while (p && p->dead_next != t) {
-            p = p->dead_next;
-        }
-        if (p) {
-            p->dead_next = t->dead_next;
-        }
+    (void)r;
+    task_t *cur = cpu_local()->current_task;
+    if (!cur) {
+        return;
     }
-    /* 从全局任务表摘除 */
-    if (g_all_tasks == t) {
-        g_all_tasks = t->all_next;
-    } else {
-        task_t *q = g_all_tasks;
-        while (q && q->all_next != t) {
-            q = q->all_next;
-        }
-        if (q) {
-            q->all_next = t->all_next;
-        }
+    if (cur->ticks_remaining > 0) {
+        cur->ticks_remaining--;
     }
-    kfree((void *)t->kstack_base);
-    kfree(t);
+    if (cur->ticks_remaining == 0) {
+        schedule();   /* 中断上下文，IF 已关 */
+    }
 }
 
-/* 回收所有已退出任务的 task 结构与内核栈（B1 项）。资源（地址空间、
- * OOL 页）已在 task_exit_current 中释放，这里仅释放无法在自身栈上释放的部分。
- * 必须在上下文切换离开该任务后进行（此时其内核栈已不再使用）。
- * 同时把任务从全局表 g_all_tasks 摘除，避免 sys_wait 后续查到悬空指针。 */
+void task_yield(void)
+{
+    interrupts_disable();
+    schedule();
+    interrupts_enable();
+}
+
+/* 回收所有已退出任务的 task 结构与内核栈（在 schedule() 切换后、新栈上调用） */
 static void reap_dead(void)
 {
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
     task_t *t = g_dead_list;
     g_dead_list = NULL;
     while (t) {
         task_t *nx = t->dead_next;
-        /* 从全局任务表摘除（本函数运行于关中断的 schedule() 内，单核安全） */
         if (g_all_tasks == t) {
             g_all_tasks = t->all_next;
         } else {
@@ -325,102 +486,97 @@ static void reap_dead(void)
         kfree(t);
         t = nx;
     }
+    spin_unlock_irqrestore(&g_sched_lock, f);
 }
 
-/* 执行一次调度（调用时须处于关中断状态） */
-void schedule(void)
+/* 摘链并释放一个 zombie 任务（调用方须持 g_sched_lock 且确保 t 不在运行） */
+static void task_reap_locked(task_t *t)
 {
-    /* M7 修复：内核栈溢出守卫。任务内核栈从高地址向下增长，栈底 8 字节写入
-     * 哨兵；若向下溢出破坏了相邻堆块，哨兵会被覆盖。每次调度前校验当前任务
-     * 栈底哨兵，遭破坏即 panic，把"静默内存损坏"转为可诊断的崩溃，而非任其
-     * 蔓延污染其它任务。idle 任务(t0)无独立内核栈(kstack_base==0)，跳过。 */
-    if (g_current && g_current->kstack_base) {
-        if (*(const uint64_t *)g_current->kstack_base != KSTACK_CANARY) {
-            panic("kernel stack overflow detected (task '%s' pid=%lu)",
-                  g_current->name, (unsigned long)g_current->id);
+    if (g_dead_list == t) {
+        g_dead_list = t->dead_next;
+    } else {
+        task_t *p = g_dead_list;
+        while (p && p->dead_next != t) {
+            p = p->dead_next;
+        }
+        if (p) {
+            p->dead_next = t->dead_next;
         }
     }
-    task_t *prev = g_current;
-    task_t *next = pick_next();
-    if (next == prev) {
-        prev->ticks_remaining = TIME_SLICE_TICKS;
-        return;
-    }
-
-    /* FPU/SSE 上下文保存与恢复（D2 项） */
-    fpu_fxsave(&prev->fpu_state);
-    if (next->fpu_valid) {
-        fpu_fxrstor(&next->fpu_state);
+    if (g_all_tasks == t) {
+        g_all_tasks = t->all_next;
     } else {
-        fpu_fninit();
-        next->fpu_valid = true;
+        task_t *q = g_all_tasks;
+        while (q && q->all_next != t) {
+            q = q->all_next;
+        }
+        if (q) {
+            q->all_next = t->all_next;
+        }
     }
-
-    if (prev->state == RUNNING) {
-        prev->state = READY;
-    }
-    next->state = RUNNING;
-    next->ticks_remaining = TIME_SLICE_TICKS;
-    g_current = next;
-    g_scratch = &next->scr_rip;   /* 当前任务切换：暂存指针同步 */
-
-    /* 为可能的 Ring3->Ring0 切换设置内核栈；必要时切换地址空间 */
-    tss_set_rsp0(next->kstack_top);
-    g_syscall_kstack = next->kstack_top;
-    if (next->cr3 != prev->cr3) {
-        vmm_switch(next->cr3);
-    }
-
-    context_switch(&prev->rsp, next->rsp);
-
-    /* 切换完成后，回收此前已退出任务的残留资源（B1 项） */
-    reap_dead();
+    kfree((void *)t->kstack_base);
+    kfree(t);
 }
 
-/* 由 PIT IRQ0 调用（覆盖 pit.c 的弱符号） */
-void sched_tick(registers_t *r)
+/* 立即回收一个已退出（zombie）任务。调用方须确保 t 不在运行。 */
+void task_reap(task_t *t)
 {
-    (void)r;
-    if (!g_current) {
-        return;
-    }
-    if (g_current->ticks_remaining > 0) {
-        g_current->ticks_remaining--;
-    }
-    if (g_current->ticks_remaining == 0) {
-        schedule();   /* 中断上下文，IF 已关 */
-    }
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    task_reap_locked(t);
+    spin_unlock_irqrestore(&g_sched_lock, f);
 }
 
-void task_yield(void)
+/* P0-R1：sys_wait 的 SMP 安全核心。全部父子关系检查/等待者登记/zombie 回收
+ * 都在 g_sched_lock 保护下进行（原实现只关本地中断，与其它核上子任务的
+ * task_exit_current 并发修改 waiters 链是数据竞争）。
+ * 返回 0 成功（*rc_out=子任务退出码）；-1 pid 无效或非本任务子进程。 */
+int64_t task_wait_child(uint64_t child_pid, uint64_t *rc_out)
 {
-    interrupts_disable();
+    task_t *cur = sched_current();
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+
+    /* 内联查找（不可调 task_lookup：它自行拿同一把锁） */
+    task_t *child = g_all_tasks;
+    while (child && child->id != child_pid) {
+        child = child->all_next;
+    }
+    if (!child || child->parent_id != cur->id) {
+        spin_unlock_irqrestore(&g_sched_lock, f);
+        return -1;
+    }
+    if (child->zombie) {
+        uint64_t rc = child->exit_code;
+        task_reap_locked(child);   /* 立即回收：二次 wait 将查找失败返回 -1 */
+        spin_unlock_irqrestore(&g_sched_lock, f);
+        *rc_out = rc;
+        return 0;
+    }
+
+    /* 阻塞：登记到子任务等待者链，解锁（保持关中断）后调度让出。
+     * "解锁后、调度前"子任务恰好退出置本任务 READY 不丢事件：任务仍在
+     * 运行队列，schedule() 之后必被重新调度，wait_result 已写好。 */
+    cur->state     = BLOCKED;
+    cur->wait_link = child->waiters;
+    child->waiters = cur;
+    spin_unlock(&g_sched_lock);
     schedule();
-    interrupts_enable();
-}
-
-/* 从就绪环移除一个任务 */
-static void unlink_task(task_t *t)
-{
-    task_t *p = t->next;
-    while (p->next != t) {
-        p = p->next;
+    if (f & (1UL << 9)) {
+        __asm__ volatile("sti" ::: "memory");
     }
-    p->next = t->next;
-    g_task_count--;
+    *rc_out = cur->wait_result;
+    return 0;
 }
 
 __attribute__((noreturn)) void task_exit_current(uint64_t code)
 {
     interrupts_disable();
-    task_t *t = g_current;
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    uint32_t cpu = cpu_index();
+    task_t *t = g_percpu[cpu].current_task;
     kprintf("[sched] task '%s' pid=%lu exited (code=%lu)\n",
             t->name, (unsigned long)t->id, (unsigned long)code);
 
-    /* 唤醒所有阻塞在 sys_wait 本任务的父任务（及等待者）：把退出码写入
-     * 各自的 wait_result 并置 READY。必须在 t->waiters 仍有效时（尚未释放
-     * task 结构）完成；task 结构在后续 reap_dead 才释放，故等待者读取
-     * wait_result（自身字段）绝不触发悬空访问。 */
+    /* 唤醒阻塞在本任务退出的父任务（跨核等待者发 IPI 立即唤醒） */
     {
         task_t *w = t->waiters;
         while (w) {
@@ -428,30 +584,28 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
             w->wait_result = code;
             w->wait_link   = NULL;
             w->state       = READY;
+            if (w->cpu != cpu && g_percpu[w->cpu].in_idle) {
+                lapic_send_ipi((uint8_t)g_percpu[w->cpu].lapic_id,
+                               IPI_RESCHED);
+            }
             w = wn;
         }
         t->waiters = NULL;
     }
     t->exit_code = code;
-    t->zombie    = true;     /* 等待父任务 sys_wait 回收（仍留在 g_all_tasks） */
+    t->zombie    = true;
 
-    /* 释放本任务认领的端口所有权（避免下个 app 认领同名端口被悬空 owner 拒绝） */
     port_release_owner(t);
-    /* 释放本任务持有的 IPC OOL 共享页引用与映射区间（A3 项） */
     port_reap_ool(t);
-    /* P0-5：回收 VMA 链表元数据（物理页由下面的 destroy_address_space 统一收） */
+    hda_release_owner(t);   /* P0-R1：owner 退出时停流，防悬空/音频锁死 */
     vma_destroy_all(t);
-    /* 释放地址空间：用户自有物理页 + 全部页表结构（B1 项）。
-     * 关键顺序：必须先把 CR3 切回内核 PML4，再销毁旧地址空间——
-     * 否则 destroy 会释放 CR3 正指向的 PML4 页（悬空根页表）。
-     * OOL 共享页仅解除映射（PTE_OOL），其物理页由上面的 decref 释放。 */
     if (t->is_user && t->cr3 && t->cr3 != vmm_kernel_pml4()) {
         vmm_switch(vmm_kernel_pml4());
         vmm_destroy_address_space(t->cr3);
     }
     t->cr3 = 0;
 
-    /* 入死亡链表，待下次调度由 reap_dead() 回收 task 结构与内核栈 */
+    /* 入死亡链表，待下次本核 schedule 由 reap_dead 回收 */
     t->alive = false;
     t->state = BLOCKED;
     t->dead = true;
@@ -459,15 +613,14 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     g_dead_list = t;
 
     task_t *next = pick_next();
-    unlink_task(t);
+    rq_unlink_cpu(t, cpu);
     next->state = RUNNING;
     next->ticks_remaining = TIME_SLICE_TICKS;
-    g_current = next;
-    g_scratch = &next->scr_rip;   /* 当前任务切换：暂存指针同步 */
+    g_percpu[cpu].current_task = next;
+    g_syscall_kstack[cpu] = next->kstack_top;
+    g_scratch[cpu]        = &next->scr_rip;
     tss_set_rsp0(next->kstack_top);
-    g_syscall_kstack = next->kstack_top;
 
-    /* FPU/SSE 保存退出任务、恢复下一任务（D2 项） */
     fpu_fxsave(&t->fpu_state);
     if (next->fpu_valid) {
         fpu_fxrstor(&next->fpu_state);
@@ -476,10 +629,13 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
         next->fpu_valid = true;
     }
 
-    if (next->cr3) {
-        vmm_switch(next->cr3);
-    }
+    bool cr3_switch = (next->cr3 != t->cr3);
+    uint64_t next_cr3 = next->cr3;
+    spin_unlock_irqrestore(&g_sched_lock, f);
 
+    if (cr3_switch) {
+        vmm_switch(next_cr3);
+    }
     context_switch(&t->rsp, next->rsp);   /* 一去不返 */
     for (;;) { __asm__ volatile("hlt"); }
 }

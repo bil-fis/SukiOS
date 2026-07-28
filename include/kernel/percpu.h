@@ -20,6 +20,8 @@
 
 #define MAX_CPUS 8
 
+struct task;   /* 前向声明：percpu 含调度器状态，避免与 task.h 循环包含 */
+
 typedef struct percpu {
     uint32_t cpu_index;             /* gs:0  本 CPU 逻辑索引（0=BSP） */
     uint32_t lapic_id;              /* gs:4  本 CPU 的 LAPIC ID */
@@ -27,6 +29,14 @@ typedef struct percpu {
     volatile uint32_t online;       /* gs:16 AP 启动握手标志（1=在线） */
     uint32_t _pad;
     uint64_t ticks;                 /* 本 CPU 已处理的定时器/IPI 计数 */
+
+    /* ---- P0-R1 对称多核调度：per-CPU 调度状态 ---- */
+    struct task *current_task;      /* 本 CPU 当前运行任务（替代全局 g_current） */
+    struct task *idle_task;         /* 本 CPU idle 任务 */
+    struct task *rq_head;           /* 本 CPU 运行队列头（单向链表，t->next 链接） */
+    struct task *rq_tail;           /* 本 CPU 运行队列尾 */
+    uint32_t    rq_count;           /* 本 CPU 运行队列任务数（含 idle） */
+    volatile uint32_t in_idle;      /* 本 CPU 是否处于 hlt 空闲（供 IPI 唤醒参考） */
 } percpu_t;
 
 extern percpu_t g_percpu[MAX_CPUS];

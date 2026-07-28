@@ -45,6 +45,8 @@ typedef struct task {
     uint64_t scr_rsp;               /* syscall 返回用 RSP（= 用户 RSP / execve 新栈顶） */
     bool     is_user;               /* 是否 Ring3 进程 */
     bool     alive;                 /* 是否在就绪环中 */
+    bool     is_idle;               /* 是否为某 CPU 的 idle 任务（P0-R1） */
+    uint32_t cpu;                   /* 绑定运行的 CPU（per-CPU 运行队列，P0-R1） */
     char     name[32];
 
     /* FPU/SSE 状态（D2 项：上下文切换时保存/恢复，512B 须 16 字节对齐） */
@@ -91,6 +93,11 @@ task_t *task_create_user_args(const void *blob, size_t size,
                               const char *name);
 task_t *sched_current(void);
 void   schedule(void);              /* 主动触发一次调度 */
+task_t *sched_create_idle(uint32_t cpu);  /* 为某 CPU 建 idle 任务（P0-R1） */
+
+/* sys_wait 核心：等待子任务退出（SMP 安全，g_sched_lock 保护，P0-R1）。
+ * 返回 0 成功（*rc_out=退出码）；-1 pid 无效或非当前任务子进程。 */
+int64_t task_wait_child(uint64_t child_pid, uint64_t *rc_out);
 void   task_yield(void);            /* 主动让出 CPU（sys_yield 底层） */
 __attribute__((noreturn)) void task_exit_current(uint64_t code);
 

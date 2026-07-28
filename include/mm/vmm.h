@@ -69,4 +69,31 @@ bool     vmm_fork_cow(uint64_t src_pml4, uint64_t dst_pml4);
  * 返回 false 表示该 PTE 不是 COW 页或资源不足。 */
 bool     vmm_cow_break(uint64_t pml4_phys, uint64_t virt);
 
+/* ========================================================================= */
+/*  P0-8 / P0-R2：KPTI（KAISER 式双页表，Meltdown 缓解）                       */
+/* ========================================================================= */
+/*
+ * 模型：每个用户地址空间由「物理连续、8KB 对齐的一对 PML4」构成：
+ *   偶页（pair+0）  = 内核视图：用户半区 + 完整内核高半区（task->cr3 存它）；
+ *   奇页（pair+4K） = 影子视图：用户半区（共享同一批下级页表）+ 最小内核窗口
+ *                     （内核映像 .text/.rodata/.data/.bss + IST 守卫栈 +
+ *                      本任务内核栈——CPU 从 Ring3 进入时压栈/取指所需的
+ *                      全部页；物理直映区/内核堆/他任务栈一律不映射）。
+ * CR3 切换只翻转 bit12（成对物理相邻保证）：
+ *   Ring3 运行           -> CR3 = 影子（bit12=1）
+ *   syscall/中断入内核    -> CR3 &= ~bit12（syscall_entry.S / isr.S）
+ *   iretq/sysret 回用户  -> CR3 |= bit12（g_kpti_enabled 门控）
+ * 未启用（RDCL_NO=1 硬件免疫）时地址空间退化为单页 PML4，行为与旧版一致。
+ */
+
+/* 1 = KPTI 已启用（security_init 依 Meltdown 免疫检测置位，此后不再变化；
+ * 必须在任何“会进入 Ring3 的地址空间”创建之前定值）。汇编入口按位读取。 */
+extern uint8_t g_kpti_enabled;
+
+/* 把任务内核栈 [kstack_base, kstack_top) 覆盖的页映射进该地址空间的影子
+ * PML4（Ring3 被中断时 CPU 直接向 TSS.rsp0 压栈，栈页必须在影子中可写）。
+ * KPTI 未启用时为空操作。task_create_user_args / sys_execve 调用。 */
+void vmm_kpti_map_kstack(uint64_t pml4_phys, uint64_t kstack_base,
+                         uint64_t kstack_top);
+
 #endif /* _SUKI_MM_VMM_H */

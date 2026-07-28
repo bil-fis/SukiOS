@@ -43,4 +43,9 @@ uint64_t hda_pcm_queued(void);
 /* 停止流 DMA 并复位流（排空后调用）。 */
 void hda_pcm_stop(void);
 
+/* 任务退出清理：若 t 是 PCM 流 owner，停流并释放所有权（P0-R1）。
+ * 由 task_exit_current 调用，防 owner 悬空指针 + 音频永久锁死。 */
+struct task;
+void hda_release_owner(struct task *t);
+
 #endif /* _SUKI_KERNEL_HDA_H */

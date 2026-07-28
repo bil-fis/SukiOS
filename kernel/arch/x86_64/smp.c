@@ -20,6 +20,9 @@
 #include <kernel/clock.h>
 #include <kernel/interrupts.h>
 #include <kernel/gdt.h>
+#include <kernel/security.h>
+#include <kernel/syscall.h>
+#include <kernel/task.h>
 #include <kernel/console.h>
 #include <kernel/string.h>
 #include <mm/kmalloc.h>
@@ -92,13 +95,28 @@ void ap_main(uint64_t idx)
     uint8_t apic = lapic_init();       /* 使能本 CPU 的 LAPIC（LVT 全屏蔽） */
     percpu_install((uint32_t)idx, apic);
 
+    /* P0-R1：在本 AP 上应用与 BSP 一致的安全控制位（SMEP/SMAP/UMIP/NXE）。
+     * 单核假设下 AP 漏设会让用户态可执行内核页/读内核数据，是真实缺口。 */
+    cpu_apply_security_features();
+
+    /* P0-R1：syscall MSR（LSTAR/STAR/FMASK/EFER.SCE）是每核私有的，
+     * AP 必须自行初始化 —— 否则本核用户任务一执行 syscall 即双重故障。 */
+    syscall_init_cpu();
+
     /* 握手：告知 BSP 本 AP 已完全就绪（release 语义确保上面全部可见） */
     __atomic_store_n(&g_percpu[idx].online, 1, __ATOMIC_RELEASE);
 
-    /* 进入 idle：开中断等待 IPI（LAPIC 定时器保持屏蔽，调度域仍在 BSP） */
+    /* P0-R1：每 AP 启动自己的 LAPIC 周期定时器（100Hz），本核节拍触发
+     * sched_tick -> schedule()，从而真正参与对称多核调度（不再空转）。 */
+    lapic_timer_start((uint8_t)IRQ0, 100);
+
+    /* 进入 idle 循环：开中断；无任务时 hlt 省电，被 IPI/定时器唤醒后调度。 */
     interrupts_enable();
     for (;;) {
+        g_percpu[idx].in_idle = 1;
         __asm__ volatile("hlt");
+        g_percpu[idx].in_idle = 0;
+        schedule();
     }
 }
 
@@ -143,6 +161,14 @@ uint32_t smp_init(void)
         void *stack = kmalloc(AP_STACK_BYTES);
         if (!stack) {
             kprintf("[smp] cpu%u: stack alloc failed, skipping\n", (unsigned)idx);
+            continue;
+        }
+
+        /* P0-R1：为 AP 预建 idle 任务并入其运行队列，置 percpu.current_task。
+         * AP 上电后读 percpu 即得其 idle，首次 schedule() 即可参与调度。 */
+        if (!sched_create_idle(idx)) {
+            kprintf("[smp] cpu%u: idle alloc failed, skipping\n", (unsigned)idx);
+            kfree(stack);
             continue;
         }
 

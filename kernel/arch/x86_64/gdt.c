@@ -113,18 +113,31 @@ static __attribute__((noinline)) void tss_load(uint16_t sel)
     __asm__ volatile("ltr %0" : : "r"(sel) : "memory");
 }
 
-void tss_set_rsp0(uint64_t rsp0)
+/* 前向声明：AP 的 per-CPU TSS 定义在文件下方 */
+static struct tss_entry g_tss_ap[MAX_CPUS];
+
+/* 取当前 CPU 的 TSS。BSP(cpu0) 用 g_tss；AP 用 g_tss_ap[cpu]。
+ * P0-R1 修复：原实现无条件写 g_tss（BSP 的 TSS），AP 上运行 Ring3 任务
+ * 被中断时 CPU 从“本核 TR 指向的 TSS”取 rsp0 —— 写错核会用 rsp0=0
+ * 切栈直接三重故障。 */
+static struct tss_entry *current_tss(void)
 {
-    g_tss.rsp0 = rsp0;
+    uint32_t c = cpu_index();
+    return (c == 0) ? &g_tss : &g_tss_ap[c];
 }
 
-/* P0-8：更新 BSP TSS 的 IST 槽（n=1..7）。security_init 用带守卫页的
+void tss_set_rsp0(uint64_t rsp0)
+{
+    current_tss()->rsp0 = rsp0;
+}
+
+/* P0-8：更新本核 TSS 的 IST 槽（n=1..7）。security_init 用带守卫页的
  * 新栈替换启动期静态 IST 栈；CPU 每次取 IST 都实时读 TSS 内存，无需
  * 重新 ltr（TSS 描述符地址未变），下一次异常即生效。 */
 void tss_set_ist(int n, uint64_t stack_top)
 {
     if (n >= 1 && n <= 7) {
-        g_tss.ist[n - 1] = stack_top;
+        current_tss()->ist[n - 1] = stack_top;
     }
 }
 
@@ -159,10 +172,11 @@ void gdt_init(void)
 /* ---- P0-3：AP 专属 GDT/TSS ----
  * TR（任务寄存器）指向的 TSS busy 位是每 CPU 的：多个 CPU 不能共享同一
  * TSS 描述符（第二次 ltr 会因 busy 位置位而 #GP）。故每个 AP 一套
- * GDT + TSS + IST 栈。AP 当前不跑 Ring3 任务，TSS.rsp0 暂不使用，但
- * IST1 必须有效（IDT 向量 8 双重错误配置了 IST1）。 */
+ * GDT + TSS + IST 栈。P0-R1 起 AP 对称参与 Ring3 调度：TSS.rsp0 由
+ * schedule()/user_task_thunk 经 tss_set_rsp0() 写入本核 TSS；IST1 必须
+ * 有效（IDT 向量 8 双重错误配置了 IST1）。 */
 static uint64_t g_gdt_ap[MAX_CPUS][7];
-static struct tss_entry g_tss_ap[MAX_CPUS];
+/* g_tss_ap 定义已上移（current_tss 需要），此处仅保留其余 per-CPU 资源 */
 static uint8_t g_ist_ap[MAX_CPUS][4096] __attribute__((aligned(16)));
 static uint8_t g_ist2_ap[MAX_CPUS][4096] __attribute__((aligned(16))); /* NMI */
 static struct gdt_ptr g_gdtr_ap[MAX_CPUS];

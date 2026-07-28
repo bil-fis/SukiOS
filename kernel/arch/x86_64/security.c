@@ -31,13 +31,14 @@
 #include <kernel/security.h>
 #include <kernel/gdt.h>
 #include <kernel/console.h>
+#include <kernel/kaslr.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
 
-/* ---- 布局常量 ---- */
-#define IST_GUARD_BASE   0xFFFFD00000000000UL  /* 守卫栈窗口基址 */
-#define IST_STACK_PAGES  4                     /* 每条栈 4 页 = 16KB */
-#define IST_WINDOW_PAGES (1 + IST_STACK_PAGES + 1) /* 守卫页+栈+隔离页 */
+/* boot.S 定义的全局：探测到 SMAP 后置 1，copy_*_user 据此执行 STAC/CLAC */
+extern uint8_t g_smap_enabled;
+
+/* ---- 布局常量（IST_* 系列已上移至 security.h，供 vmm.c KPTI 影子映射）---- */
 #define PAGE_SIZE_4K     4096UL
 
 #define MSR_IA32_EFER              0xC0000080U
@@ -52,8 +53,8 @@
 /*
  * cpuid_ex: 执行 CPUID 指令（带子叶 ECX）。
  * 输入：leaf -> %eax, subleaf -> %ecx。
- * 输出：*a/*b/*c/*d <- eax/ebx/ecx/edx。
- * Clobber：无额外寄存器（四个输出即全部被改写的寄存器）。
+ * 输出：a/b/c/d <- eax/ebx/ecx/edx（四个输出即全部被改写的寄存器）。
+ * Clobber：无额外寄存器。
  */
 static __attribute__((noinline)) void cpuid_ex(uint32_t leaf, uint32_t subleaf,
                                                uint32_t *a, uint32_t *b,
@@ -122,21 +123,51 @@ static uint64_t ist_guard_stack_create(int idx)
     return base + (uint64_t)(1 + IST_STACK_PAGES) * PAGE_SIZE_4K;
 }
 
+/* 在当前 CPU 上探测并应用安全控制位（SMEP/SMAP/UMIP/EFER.NXE）。
+ * 设计为幂等：BSP 在 security_init 调用，AP 在 ap_main 调用，二者走同一路径，
+ * 保证每核的用户内存保护位一致（AP 漏设 SMEP/SMAP 会让用户态真实可执行内核
+ * 页 / 访问内核数据，是真实安全缺口）。 */
+void cpu_apply_security_features(void)
+{
+    uint32_t a, b, c, d;
+    cpuid_ex(7, 0, &a, &b, &c, &d);
+
+    uint64_t cr4 = read_cr4();
+    if (c & (1U << 2))  { cr4 |= CR4_UMIP; }   /* UMIP */
+    if (b & (1U << 7))  { cr4 |= CR4_SMEP; }   /* SMEP */
+    if (b & (1U << 19)) { cr4 |= CR4_SMAP;     /* SMAP */
+                            g_smap_enabled = 1; }
+    write_cr4(cr4);
+
+    /* EFER.NXE：CPUID.80000001H:EDX[20] 探测 */
+    if (!(rdmsr64(MSR_IA32_EFER) & (1UL << 11))) {
+        cpuid_ex(0x80000000U, 0, &a, &b, &c, &d);
+        if (a >= 0x80000001U) {
+            cpuid_ex(0x80000001U, 0, &a, &b, &c, &d);
+            if (d & (1U << 20)) {
+                uint64_t efer = rdmsr64(MSR_IA32_EFER);
+                efer |= (1UL << 11);
+                /* 写 EFER 用 rdmsr64/wrmsr 封装不便，单独内联 */
+                uint32_t lo = (uint32_t)efer, hi = (uint32_t)(efer >> 32);
+                __asm__ volatile("wrmsr" : : "c"(MSR_IA32_EFER), "a"(lo), "d"(hi) : "memory");
+            }
+        }
+    }
+}
+
 void security_init(void)
 {
     uint32_t a, b, c, d;
 
-    /* ---- 1) UMIP：CPUID.(EAX=7,ECX=0):ECX[2] 表示支持 ---- */
-    bool umip_on = false;
+    /* ---- 1) 在当前 BSP 上应用安全控制位（UMIP/SMEP/SMAP/NXE） ---- */
+    cpu_apply_security_features();
+
     cpuid_ex(7, 0, &a, &b, &c, &d);
     bool has_umip = (c & (1U << 2)) != 0;
     bool has_arch_cap = (d & (1U << 29)) != 0;   /* EDX[29]: ARCH_CAPABILITIES */
-    if (has_umip) {
-        write_cr4(read_cr4() | CR4_UMIP);
-        umip_on = (read_cr4() & CR4_UMIP) != 0;  /* 写后读回确认 */
-    }
+    bool umip_on = (read_cr4() & CR4_UMIP) != 0;
 
-    /* ---- 2) NXE 校验（boot.S 应已置位；此处只验证不改写） ---- */
+    /* ---- 2) NXE 校验（boot.S/ap_boot.S 应已置位；此处只验证） ---- */
     bool nxe_on = (rdmsr64(MSR_IA32_EFER) & (1UL << 11)) != 0;
 
     /* ---- 3) SMEP/SMAP 读回复核 ---- */
@@ -150,10 +181,18 @@ void security_init(void)
     if (df_top)  { tss_set_ist(1, df_top);  }
     if (nmi_top) { tss_set_ist(2, nmi_top); }
 
-    /* ---- 5) Meltdown 免疫检测 -> KPTI 结论 ---- */
+    /* ---- 5) Meltdown 免疫检测 -> KPTI 部署（P0-R2） ----
+     * RDCL_NO=1（硬件免疫）：双页表纯性能损耗，不部署；
+     * 其余（明确易损 / 无 ARCH_CAPABILITIES 无从判断）：启用 KPTI。
+     * 置位必须在本函数内完成——kmain 顺序保证 security_init 先于
+     * sched_init/task_create_user，任何会进入 Ring3 的地址空间都将以
+     * 「内核视图+影子」成对创建（vmm_create_address_space）。 */
     bool rdcl_no = false;
     if (has_arch_cap) {
         rdcl_no = (rdmsr64(MSR_IA32_ARCH_CAPABILITIES) & 1UL) != 0;
+    }
+    if (!rdcl_no) {
+        g_kpti_enabled = 1;
     }
 
     /* ---- 汇总报告 ---- */
@@ -171,5 +210,18 @@ void security_init(void)
             rdcl_no ? "immune (RDCL_NO=1)"
                     : (has_arch_cap ? "VULNERABLE (RDCL_NO=0)"
                                     : "unknown (no ARCH_CAPABILITIES)"),
-            rdcl_no ? "not needed" : "pending (P1: dual page tables)");
+            g_kpti_enabled
+                ? "ACTIVE (KAISER dual page tables: shadow PML4 maps only "
+                  "kernel image + IST + task kstacks)"
+                : "not needed");
+
+    /* ---- 6) KASLR（P0-8 代码段随机化）状态报告 ----
+     * g_kernel_slide 由 boot.S 在引导期写入（高半区基址随机滑动量）。
+     * 0 表示退化（未随机化）；非 0 表示内核虚拟基址已偏离固定 KERNEL_BASE。 */
+    if (g_kernel_slide == 0) {
+        kprintf("[security] KASLR: DISABLED (slide=0, base fixed)\n");
+    } else {
+        kprintf("[security] KASLR: ENABLED slide=%lu MiB (base=0xFFFF800000000000+slide)\n",
+                (unsigned long)(g_kernel_slide / (1024 * 1024)));
+    }
 }

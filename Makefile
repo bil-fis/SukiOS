@@ -27,14 +27,20 @@ ISO    := $(BUILD)/SukiOS.iso
 # 说明：手册 CFLAGS 原写 -mcmodel=kernel，但该模型要求内核位于顶部 2GB
 # (0xFFFFFFFF80000000+)，与红线 KERNEL_BASE=0xFFFF800000000000 冲突，
 # 故改用 -mcmodel=large（支持任意 64 位地址）。
+# -MMD -MP：为每个 .o 生成 .d 头依赖文件并在末尾 include，保证修改 .h 后
+# 所有包含它的 .c/.S 自动重编（曾因缺依赖跟踪导致 percpu_t 布局新旧混用崩溃）。
 CFLAGS := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
           -mcmodel=large -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
           -fno-asynchronous-unwind-tables -fno-omit-frame-pointer \
-          -I include
+          -MMD -MP -I include
 
-ASFLAGS := -ffreestanding -mcmodel=large -fno-pic -fno-pie -I include
+ASFLAGS := -ffreestanding -mcmodel=large -fno-pic -fno-pie -MMD -MP -I include
 
+# 注意（P0-8 KASLR）：--emit-relocs 只能用于【预链接】阶段（供 gen_relk.py
+# 抽取 R_X86_64_64）。最终 kernel.elf 绝不能保留 .rela.* 节——GRUB multiboot2
+# 装载器遇到带重定位节的 ELF 会直接拒绝：
+#   "error: ELF files with relocs are not supported yet."
 LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 \
            -Wl,--build-id=none -T boot/linker.ld
 
@@ -47,7 +53,7 @@ USER_PROGS   := fs_server input_server shell
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
-                -fno-asynchronous-unwind-tables -I user -I include
+                -fno-asynchronous-unwind-tables -MMD -MP -I user -I include
 USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o
 USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.blob.o,$(USER_PROGS))
@@ -63,7 +69,7 @@ APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -mno-red-zone -msse -msse2 \
                 -ffunction-sections -fdata-sections \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
-                -fno-asynchronous-unwind-tables -I user -I include \
+                -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
                 -I user/lib/shims -I minimp3
 APP_ELFS     := $(patsubst %,$(BUILD)/apps/%.elf,$(APP_PROGS))
 
@@ -185,10 +191,29 @@ $(BUILD)/%.c.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# ---- 链接内核 ELF ----
-$(KERNEL): $(OBJS) boot/linker.ld
+# ---- 链接内核 ELF（P0-8 KASLR：两阶段，先产重定位表再重链） ----
+# 阶段 A：预链接（带 --emit-relocs 保留重定位信息）到 kernel.pre.elf
+# 此时 relk.o 尚未生成，g_relk_offsets/g_relk_count 尚未定义，故对预链接
+# 允许未解析符号（仅用于抽取重定位表；最终链接仍会严格检查未定义符号）。
+PRE := $(BUILD)/kernel.pre.elf
+$(PRE): $(OBJS) boot/linker.ld
 	@mkdir -p $(dir $@)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lgcc
+	$(CC) $(LDFLAGS) -Wl,--emit-relocs -Wl,--unresolved-symbols=ignore-all -o $@ $(OBJS) -lgcc
+	@echo "==> Pre-linked $(PRE)"
+
+# 阶段 B：由预链接 ELF 抽取 R_X86_64_64 重定位偏移，生成 build/relk.c
+build/relk.c: $(PRE)
+	python3 tools/gen_relk.py $< $@
+
+# 阶段 C：编译重定位表为 relk.o
+RELK := $(BUILD)/relk.o
+$(RELK): build/relk.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# 阶段 D：最终链接（含 relk.o；.text/.data 布局与预链接一致，故偏移有效）
+$(KERNEL): $(OBJS) $(RELK) boot/linker.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(RELK) -lgcc
 	@echo "==> Linked $(KERNEL)"
 	@grub-file --is-x86-multiboot2 $(KERNEL) \
 		&& echo "==> valid Multiboot2 kernel" || echo "!! Multiboot2 header INVALID"
@@ -270,3 +295,6 @@ debug: $(ISO) $(DISK)
 
 clean:
 	rm -rf $(BUILD)
+
+# ---- 头文件依赖自动包含（由 -MMD 生成的 .d 文件） ----
+-include $(shell find $(BUILD) -name '*.d' 2>/dev/null)

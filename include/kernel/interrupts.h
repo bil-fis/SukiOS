@@ -13,6 +13,12 @@
  * 完全一致（内存低地址在前 = 最后压入者在前）。
  */
 typedef struct registers {
+    uint64_t saved_cr3;                    /* P0-R2 KPTI：中断入口时的 CR3 原值
+                                            * （bit12=1 表示来自影子页表/Ring3）。
+                                            * isr.S 在压完 GPR 后压入；出口原样
+                                            * 写回——精确还原入口视图，天然涵盖
+                                            * NMI 命中「CR3 已切影子但尚未 iretq」
+                                            * 微窗口的场景（还原为影子继续退出）。 */
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t int_no, err_code;             /* 由存根压入 */

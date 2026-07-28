@@ -18,11 +18,19 @@
 #include <kernel/console.h>
 #include <kernel/string.h>
 #include <kernel/interrupts.h>
+#include <kernel/spinlock.h>
+#include <kernel/percpu.h>
+#include <kernel/smp.h>
+#include <kernel/apic.h>
 #include <mm/kmalloc.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
 
 static kernel_port_t g_ports[PORT_MAX];
+
+/* P0-R1：端口表自旋锁，取代单核 cli/sti 临界区（cli/sti 在 SMP 下不隔离
+ * 其它核）。原 irq_save/irq_restore 包裹接口保留，内部改为 spin_lock_irqsave。 */
+static spinlock_t g_port_lock = SPINLOCK_INIT("port");
 
 /* OOL 接收窗口：映射进接收方用户空间的基址（优先复用空闲区间） */
 #define OOL_RECV_BASE  0x0000600000000000UL
@@ -37,15 +45,26 @@ static uint64_t g_ool_bump = 0;
 typedef struct ool_free { uint64_t base; uint64_t size; struct ool_free *next; } ool_free_t;
 static ool_free_t *g_ool_free = NULL;
 
-/* ---- 中断开关辅助（单核临界区） ---- */
+/* ---- 端口表临界区：自旋锁 irqsave 包装（P0-R1） ---- */
 static inline uint64_t irq_save(void)
 {
-    uint64_t f;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) :: "memory");
-    return f;
+    return spin_lock_irqsave(&g_port_lock);
 }
 static inline void irq_restore(uint64_t f)
 {
+    spin_unlock_irqrestore(&g_port_lock, f);
+}
+
+/* 阻塞让出（P0-R1 关键正确性）：登记等待者之后必须【先释放端口自旋锁】
+ * 再 schedule() —— 单核 cli/sti 时代持"锁"（即关中断）切换是安全的，但
+ * 自旋锁时代持锁切走会让其它核/任务的所有 IPC 在关中断下永久自旋（死锁）。
+ * 顺序：解锁（保持关中断，杜绝本核中断重入端口路径）-> schedule ->
+ * 被唤醒后按进入时的 RFLAGS.IF 恢复中断。潜在的"解锁后、调度前被唤醒"
+ * 不丢事件：唤醒仅置 state=READY，任务仍在运行队列，稍后必被重新调度。 */
+static void port_block_and_yield(uint64_t f)
+{
+    spin_unlock(&g_port_lock);
+    schedule();
     if (f & (1UL << 9)) {
         __asm__ volatile("sti" ::: "memory");
     }
@@ -197,6 +216,11 @@ static void enqueue(kernel_port_t *p, kernel_msg_t *m)
         }
         w->wait_next = NULL;
         w->state = READY;
+        /* P0-R1：等待者绑定在其它核且该核正 hlt 空闲时，发 IPI 立即唤醒，
+         * 否则最坏要等对核下一个 10ms 定时节拍才被调度（IPC 延迟激增）。 */
+        if (w->cpu != cpu_index() && g_percpu[w->cpu].in_idle) {
+            lapic_send_ipi((uint8_t)g_percpu[w->cpu].lapic_id, IPI_RESCHED);
+        }
     }
 }
 
@@ -293,10 +317,9 @@ uint64_t ipc_recv_kernel(uint32_t port_name, void *buf, uint32_t buf_size,
             irq_restore(f);
             return MACH_RCV_TIMED_OUT;
         }
-        /* 阻塞：登记到等待队列并让出 CPU（关中断下切换是安全的） */
+        /* 阻塞：登记等待 -> 解锁（保持关中断）-> 调度让出（见 helper 注释） */
         port_wait_enqueue(p);
-        schedule();
-        irq_restore(f);
+        port_block_and_yield(f);
         /* 被唤醒后重试出队 */
     }
 }
@@ -422,8 +445,7 @@ uint64_t ipc_recv_ool_kernel(uint32_t port_name, void *inline_buf,
             return MACH_RCV_TIMED_OUT;
         }
         port_wait_enqueue(p);
-        schedule();
-        irq_restore(f);
+        port_block_and_yield(f);
     }
 }
 
@@ -514,8 +536,7 @@ uint64_t sys_mach_msg(uint64_t msg_uptr, uint64_t option,
                 break;
             }
             port_wait_enqueue(p);
-            schedule();
-            irq_restore(f);
+            port_block_and_yield(f);
         }
         /* M6 修复：接收侧防御性校验。
          * - recv_limit 至少须容纳消息头，否则无法安全拷出 → 拒绝。

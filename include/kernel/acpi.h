@@ -55,6 +55,17 @@ typedef struct acpi_info {
 
     /* 本地 APIC 寄存器基址（默认 0xFEE00000；可由 MSR 0x1B 覆盖） */
     uint64_t lapic_phys;
+
+    /* FADT 电源管理寄存器（P0-R8：S5 软关机所需；0 表示未解析到）。
+     * 偏移严格按 ACPI 规范：PM1a_CNT_BLK @0x3B、PM1b_CNT_BLK @0x3F（32 位
+     * I/O 端口，ACPI 1.0/2.0+ 通用；2.0+ 若 32 位为 0 则回落 X_PM1a/X_PM1b
+     * GAS @0x90/0x98）。旧实现误用 0x48/0x4C，读到 PM_TMR_BLK/GPE1_BLK 区域，
+     * 导致 QEMU 把 0x608 当 PM1b 控制块、向错误端口写 S5 而关机失败。 */
+    uint32_t pm1a_cnt_blk;     /* PM1a Control Block I/O 端口 */
+    uint32_t pm1b_cnt_blk;     /* PM1b Control Block I/O 端口（多数平台为 0） */
+    uint8_t  slp_typ_a;        /* S5 在 PM1a 的 SLP_TYP 值（来自 DSDT _S5 低 3 位） */
+    uint8_t  slp_typ_b;        /* S5 在 PM1b 的 SLP_TYP 值 */
+    uint64_t dsdt_phys;        /* DSDT 物理地址（FADT @0x28；SLP_TYP 须由此解析） */
 } acpi_info_t;
 
 /* 调用 acpi_init() 后读取全局结果（只读共享） */
@@ -70,5 +81,9 @@ bool acpi_init(void);
 
 /* 在已解析的 ACPI 表中查找指定签名（如 "HPET"）的表物理地址；未找到返回 0。 */
 uint64_t acpi_find_table(const char sig[8]);
+
+/* P0-R8：ACPI S5 软关机。向 PM1a/PM1b Control Block 写入 SLP_TYP(S5) | SLP_EN
+ * 触发平台断电；无 FADT 电源信息则退化为无限停机。 */
+void acpi_poweroff(void);
 
 #endif /* _SUKI_KERNEL_ACPI_H */

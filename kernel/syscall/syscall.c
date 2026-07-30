@@ -189,11 +189,15 @@ static uint64_t sys_input_read(void)
     return (sc < 0) ? (uint64_t)-1 : (uint64_t)sc;
 }
 
-/* 6: sys_reboot —— 通过 8042 键盘控制器脉冲 CPU RESET 线 */
-static uint64_t sys_reboot(void)
+/* 6: sys_reboot —— mode=0: 经 8042 键盘控制器脉冲 CPU RESET 线重启；
+ *    mode!=0: 经 ACPI S5 软关机（见 acpi_poweroff）。二者均不返回。 */
+static uint64_t sys_reboot(uint64_t mode)
 {
-    kprintf("[syscall] reboot requested by pid=%lu\n",
-            (unsigned long)sched_current()->id);
+    kprintf("[syscall] reboot requested by pid=%lu (mode=%lu)\n",
+            (unsigned long)sched_current()->id, (unsigned long)mode);
+    if (mode != 0) {
+        acpi_poweroff();   /* 不返回 */
+    }
     /* 等待 8042 输入缓冲空，然后发送 0xFE (pulse reset) */
     for (int i = 0; i < 100000; i++) {
         if (!(inb(0x64) & 0x02)) {
@@ -645,7 +649,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_YIELD:       return sys_yield();
     case SYS_DEBUG_WRITE: return sys_debug_write(a1, a2);
     case SYS_INPUT_READ:  return sys_input_read();
-    case SYS_REBOOT:      return sys_reboot();
+    case SYS_REBOOT:      return sys_reboot(a1);
     case SYS_PORT_CLAIM:  return sys_port_claim(a1);
     case SYS_EXECVE:      return sys_execve(a1, a2, a3);
     case SYS_WAIT:        return sys_wait(a1);

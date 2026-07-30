@@ -116,7 +116,8 @@ static void run_command(char *line)
                 "  help          - show this help\n"
                 "  ls            - list FAT32 root directory (via FS_SERVER)\n"
                 "  cat <FILE>    - print file content (8.3 name, e.g. README.TXT)\n"
-                "  reboot        - reboot the machine\n");
+                "  reboot        - reboot the machine\n"
+                "  poweroff      - ACPI S5 soft power off\n");
     } else if (u_strcmp(line, "ls") == 0) {
         fs_request(FS_MSG_LIST, 0);
         fs_wait_and_print(FS_MSG_LIST, false);
@@ -131,6 +132,9 @@ static void run_command(char *line)
     } else if (u_strcmp(line, "reboot") == 0) {
         u_print("rebooting...\n");
         suki_syscall5(SYS_REBOOT, 0, 0, 0, 0, 0);
+    } else if (u_strcmp(line, "poweroff") == 0 || u_strcmp(line, "shutdown") == 0) {
+        u_print("powering off (ACPI S5)...\n");
+        suki_syscall5(SYS_REBOOT, 1, 0, 0, 0, 0);   /* mode=1 -> acpi_poweroff */
     } else if (u_strcmp(line, "exec") == 0) {
         if (!*arg) {
             u_print("usage: exec <FILE> [args...]\n");

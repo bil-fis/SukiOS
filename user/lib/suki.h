@@ -55,7 +55,13 @@ typedef struct mach_msg_header {
     uint32_t msgh_reserved;
 } mach_msg_header_t;
 
-/* ---- syscall 原语 ---- */
+/* ---- syscall 原语 ----
+ * 注意 clobber 列表须覆盖编译器可能借用的所有调用者保存寄存器：syscall 指令
+ * 本身改 rcx/r11/rax/flags；若省略 r9/rbx，编译器可能把循环不变量（如恒定的
+ * 调用号 n）缓存在 r9 中，而相邻的另一次 syscall 调用（如 sys_port_claim）经由
+ * 寄存器分配踩坏 r9，导致后续迭代复用被污染的调用号，表现为海量非法 syscall
+ * （曾致使 INPUT_SERVER 每 tick 发 KERNEL_BASE 量级调用号）。故将 r9/rbx 一并列
+ * 入 clobber，强制编译器每次调用都正确重载荷号到 rax。 */
 static inline uint64_t suki_syscall5(uint64_t n, uint64_t a1, uint64_t a2,
                                      uint64_t a3, uint64_t a4, uint64_t a5)
 {
@@ -64,9 +70,22 @@ static inline uint64_t suki_syscall5(uint64_t n, uint64_t a1, uint64_t a2,
     register uint64_t r8  __asm__("r8")  = a5;
     __asm__ volatile("syscall"
                      : "=a"(ret)
-                     : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
-                     : "rcx", "r11", "memory");
+                     : "a"(n), "D"(a1), "S"(a2), "d"(a3),
+                       "r"(r10), "r"(r8)
+                     : "rcx", "r11", "r9", "rbx", "memory");
     return ret;
+}
+
+/* P0-R8：ACPI S5 软关机（SYS_REBOOT mode=1）。 */
+static inline void suki_poweroff(void)
+{
+    suki_syscall5(SYS_REBOOT, 1, 0, 0, 0, 0);
+}
+
+/* 重启（SYS_REBOOT mode=0）。 */
+static inline void suki_reboot(void)
+{
+    suki_syscall5(SYS_REBOOT, 0, 0, 0, 0, 0);
 }
 
 static inline void sys_debug_write(const char *s, uint64_t len)

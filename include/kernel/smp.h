@@ -24,6 +24,9 @@
 #define IPI_RESCHED    0xF0
 #define IPI_TLB_FLUSH  0xF1
 #define IPI_HALT       0xF2
+/* P0-R3：gdbstub 会话冻结——收到后其它 CPU 在中断上下文自旋，直到
+ * gdbstub 释放（continue/step/detach），保证调试快照期间内存/寄存器不漂移 */
+#define IPI_GDB_FREEZE 0xF3
 
 /* 依据 ACPI MADT 枚举启动全部 AP。须在 acpi/lapic/clock（TSC 校准，供
  * 延时用）就绪后调用。返回在线 CPU 总数（含 BSP）。 */

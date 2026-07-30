@@ -24,6 +24,7 @@
 #include <kernel/smp.h>
 #include <kernel/percpu.h>
 #include <kernel/diagnostics.h>
+#include <kernel/gdbstub.h>   /* P0-R3：常备串口 GDB stub（COM2） */
 #include <kernel/security.h>  /* P0-8：安全地基（UMIP/IST 守卫栈/Meltdown 检测） */
 #include <kernel/keyboard.h>
 #include <kernel/string.h>
@@ -178,6 +179,12 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     /* ---- P0-8：安全地基总装（vmm/kheap 就绪后、SMP 启动前）----
      * UMIP 使能 + NXE/SMEP/SMAP 复核 + BSP 守卫页 IST 栈 + Meltdown 检测 */
     security_init();
+
+    /* ---- P0-R3：可诊断性设施 ----
+     * gdbstub：COM2 常备 GDB 远程调试（断点/单步/读写内存寄存器/monitor klog）；
+     * diag_selftest：故意触发一次 WARN_ON 验证「打印+回溯+继续」全链路。 */
+    gdbstub_init();
+    diag_selftest();
 
     /* ---- P0-1/P0-2/P0-4：ACPI 拓扑发现 + LAPIC/IOAPIC 取代 8259 PIC+PIT ---- */
     acpi_set_rsdp_hint(g_boot.rsdp_copy_phys);     /* P0-6：UEFI 下唯一 RSDP 来源 */

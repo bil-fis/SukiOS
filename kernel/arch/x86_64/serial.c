@@ -8,6 +8,7 @@
  */
 #include <kernel/serial.h>
 #include <kernel/io.h>
+#include <kernel/klog.h>     /* P0-R3a：所有串口输出镜像进内存环缓冲 */
 
 #define COM1_BASE   0x3F8
 
@@ -39,6 +40,10 @@ static int serial_tx_ready(void)
 
 void serial_write(char c)
 {
+    /* P0-R3a：先镜像进 klog 环缓冲（含 serial_init 之前的调用也能留痕；
+     * klog_dump 重放期间该函数内部抑制递归记录）。CR 转换不入环——环内
+     * 保存规范化 '\n' 文本。 */
+    klog_putc(c);
     if (c == '\n') {
         while (!serial_tx_ready()) { }
         outb(COM1_BASE + UART_DATA, '\r');   /* CRLF 换行 */

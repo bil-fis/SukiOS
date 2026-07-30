@@ -27,15 +27,19 @@
 #include <kernel/apic.h>
 #include <kernel/percpu.h>
 #include <mm/kmalloc.h>
+#include <mm/kstack.h>       /* P0-R5：带未映射守卫页的内核栈分配器 */
 #include <mm/vmm.h>
 #include <mm/pmm.h>
+#include <kernel/gdbstub.h>  /* P0-R3：sched_tick 内轮询 GDB 远程 break-in */
 #include <mm/vma.h>          /* P0-5：栈自动增长区登记 / 退出清理 */
 #include <kernel/elf.h>
 #include <kernel/hda.h>      /* hda_release_owner：任务退出释放音频流 */
 #include <ipc/port.h>
 
-/* 每任务内核栈大小（字节）。Ring0 内核栈与用户态栈(USER_STACK_PAGES)独立。 */
-#define KERNEL_STACK_BYTES  16384
+/* 每任务内核栈大小（字节）。Ring0 内核栈与用户态栈(USER_STACK_PAGES)独立。
+ * P0-R5：栈体改由 kstack_alloc 提供（独立 VA 槽位 + 栈底下方未映射守卫页，
+ * 溢出立即 #PF 定性），大小由 mm/kstack.h 统一定义（16KB 不变）。 */
+#define KERNEL_STACK_BYTES  KSTACK_BYTES
 #define MAX_TASKS       256
 /* M7 修复：内核栈底守卫哨兵。任务内核栈从高地址向下增长，栈底写入哨兵；
  * 若向下溢出破坏相邻堆块，哨兵会被覆盖。每次调度前校验当前任务栈底哨兵。 */
@@ -141,7 +145,6 @@ static task_t *pick_next(void)
 
 void sched_init(void)
 {
-    kprintf("[dbg] sched_init entry\n");
     spinlock_init(&g_sched_lock, "sched");
     /* 将当前引导执行流封装为 task0（BSP idle/boot 线程） */
     task_t *t0 = (task_t *)kzalloc(sizeof(task_t));
@@ -178,7 +181,7 @@ task_t *sched_create_idle(uint32_t cpu)
     if (!t) {
         return NULL;
     }
-    void *stack = kmalloc(KERNEL_STACK_BYTES);
+    uint64_t stack = kstack_alloc();   /* P0-R5：守卫页栈 */
     if (!stack) {
         kfree(t);
         return NULL;
@@ -192,8 +195,8 @@ task_t *sched_create_idle(uint32_t cpu)
     t->alive = true;
     t->is_idle = true;
     t->cpu = cpu;
-    t->kstack_base = (uint64_t)stack;
-    t->kstack_top  = (uint64_t)stack + KERNEL_STACK_BYTES;
+    t->kstack_base = stack;
+    t->kstack_top  = stack + KERNEL_STACK_BYTES;
     *(uint64_t *)stack = KSTACK_CANARY;
     strncpy(t->name, "idle", sizeof(t->name) - 1);
     t->name[4] = '0' + (char)(cpu % 10);
@@ -226,7 +229,7 @@ static task_t *task_alloc_kernel(void (*entry)(void *), void *arg,
     if (!t) {
         return NULL;
     }
-    void *stack = kmalloc(KERNEL_STACK_BYTES);
+    uint64_t stack = kstack_alloc();   /* P0-R5：守卫页栈 */
     if (!stack) {
         kfree(t);
         return NULL;
@@ -238,8 +241,8 @@ static task_t *task_alloc_kernel(void (*entry)(void *), void *arg,
     t->ticks_remaining = TIME_SLICE_TICKS;
     t->is_user = false;
     t->alive = true;
-    t->kstack_base = (uint64_t)stack;
-    t->kstack_top  = (uint64_t)stack + KERNEL_STACK_BYTES;
+    t->kstack_base = stack;
+    t->kstack_top  = stack + KERNEL_STACK_BYTES;
     *(uint64_t *)stack = KSTACK_CANARY;
     strncpy(t->name, name ? name : "kthread", sizeof(t->name) - 1);
 
@@ -444,6 +447,9 @@ void schedule(void)
 void sched_tick(registers_t *r)
 {
     (void)r;
+    /* P0-R3：BSP 每 tick（10ms）探测 COM2 是否有 GDB 数据到达；有则触发
+     * int3 陷入 gdbstub 会话（函数内部自限 cpu0 + 未附着时才触发）。 */
+    gdbstub_poll();
     task_t *cur = cpu_local()->current_task;
     if (!cur) {
         return;
@@ -482,7 +488,9 @@ static void reap_dead(void)
                 p->all_next = t->all_next;
             }
         }
-        kfree((void *)t->kstack_base);
+        if (t->kstack_base) {
+            kstack_free(t->kstack_base);   /* P0-R5：归还守卫页栈槽位 */
+        }
         kfree(t);
         t = nx;
     }
@@ -514,7 +522,9 @@ static void task_reap_locked(task_t *t)
             q->all_next = t->all_next;
         }
     }
-    kfree((void *)t->kstack_base);
+    if (t->kstack_base) {
+        kstack_free(t->kstack_base);       /* P0-R5：归还守卫页栈槽位 */
+    }
     kfree(t);
 }
 

@@ -12,6 +12,7 @@
 #include <kernel/diagnostics.h>
 #include <kernel/task.h>
 #include <mm/vma.h>          /* P0-5：#PF 按需分页救援 vma_populate */
+#include <mm/kstack.h>       /* P0-R5：守卫页命中定性（内核栈溢出诊断） */
 
 /* 64 位 IDT 门描述符（16 字节） */
 struct idt_entry {
@@ -46,8 +47,9 @@ extern void isr32(void); extern void isr33(void); extern void isr34(void); exter
 extern void isr36(void); extern void isr37(void); extern void isr38(void); extern void isr39(void);
 extern void isr40(void); extern void isr41(void); extern void isr42(void); extern void isr43(void);
 extern void isr44(void); extern void isr45(void); extern void isr46(void); extern void isr47(void);
-/* IPI 向量存根（P0-3 SMP，见 isr.S） */
+/* IPI 向量存根（P0-3 SMP + P0-R3 GDB 冻结，见 isr.S） */
 extern void isr240(void); extern void isr241(void); extern void isr242(void);
+extern void isr243(void);
 
 static void (*const g_stubs[48])(void) = {
     isr0,isr1,isr2,isr3,isr4,isr5,isr6,isr7,isr8,isr9,isr10,isr11,
@@ -114,6 +116,14 @@ static void page_fault_handler(registers_t *r)
     kprintf("\n[KPF] KERNEL page fault! cr2=%p write=%d rip=%p cs=0x%lx rflags=0x%lx\n",
             (void *)cr2, write, (void *)r->rip,
             (unsigned long)r->cs, (unsigned long)r->rflags);
+    /* P0-R5：CR2 落在某条在用内核栈的守卫页 => 定性为内核栈溢出（大局部
+     * 数组/深递归写穿栈底），直接给出结论性诊断而非神秘 #PF。 */
+    if (kstack_guard_hit(cr2)) {
+        kprintf("[KPF] CR2 hits a kernel-stack GUARD PAGE => "
+                "KERNEL STACK OVERFLOW (task '%s')\n",
+                sched_current() ? sched_current()->name : "?");
+        kernel_oops("Kernel stack overflow (guard page hit)", r);
+    }
     kernel_oops("Kernel page fault (copy_from_user should have pre-validated)",
                 r);
 }
@@ -132,10 +142,12 @@ void idt_init(void)
         idt_set_gate(i, (uint64_t)g_stubs[i], ist, 0x8E);
     }
 
-    /* IPI 向量（P0-3）：0xF0 重调度 / 0xF1 TLB 刷新 / 0xF2 停机 */
+    /* IPI 向量（P0-3）：0xF0 重调度 / 0xF1 TLB 刷新 / 0xF2 停机
+     * P0-R3：0xF3 GDB 冻结（gdbstub 会话期间其它 CPU 自旋等待） */
     idt_set_gate(240, (uint64_t)isr240, 0, 0x8E);
     idt_set_gate(241, (uint64_t)isr241, 0, 0x8E);
     idt_set_gate(242, (uint64_t)isr242, 0, 0x8E);
+    idt_set_gate(243, (uint64_t)isr243, 0, 0x8E);
 
     register_interrupt_handler(14, page_fault_handler);   /* #PF 隔离处理器 */
 
@@ -171,10 +183,19 @@ void isr_dispatch(registers_t *r)
                 (void *)r->rip, (unsigned long)r->cs, (unsigned long)r->rflags);
         kprintf("  RSP=%p RAX=%p RBX=%p\n",
                 (void *)r->rsp, (void *)r->rax, (void *)r->rbx);
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
         if (vec == 14) {
-            uint64_t cr2;
-            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
             kprintf("  CR2 (fault addr) = %p\n", (void *)cr2);
+        }
+        /* P0-R5：#DF（vec 8，走 IST1）最常见成因就是 push/call 推进守卫页
+         * ——#PF 帧无处可压升级 #DF，CR2 仍保留首次故障地址。命中守卫区间
+         * 即可给出「内核栈溢出」结论，而非无线索的 Double Fault。 */
+        if ((vec == 8 || vec == 14) && kstack_guard_hit(cr2)) {
+            kprintf("  CR2=%p hits a kernel-stack GUARD PAGE => "
+                    "KERNEL STACK OVERFLOW\n", (void *)cr2);
+            kernel_oops("Kernel stack overflow (guard page hit, via #DF/#PF)",
+                        r);
         }
         kernel_oops("Unhandled CPU exception", r);
     }

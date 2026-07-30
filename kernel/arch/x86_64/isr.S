@@ -62,10 +62,12 @@ ISR_NOERR 29
 ISR_ERR   30
 ISR_NOERR 31
 
-/* IPI 向量（P0-3 SMP）：0xF0 重调度 / 0xF1 TLB 刷新 / 0xF2 panic 停机 */
+/* IPI 向量（P0-3 SMP）：0xF0 重调度 / 0xF1 TLB 刷新 / 0xF2 panic 停机
+ * 0xF3 GDB 冻结（P0-R3：gdbstub 会话期间其它 CPU 自旋等待释放） */
 ISR_NOERR 240
 ISR_NOERR 241
 ISR_NOERR 242
+ISR_NOERR 243
 
 /* 硬件 IRQ 32..47（PIC 重映射后） */
 ISR_NOERR 32

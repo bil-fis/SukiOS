@@ -26,10 +26,11 @@
 #include <kernel/console.h>
 #include <kernel/string.h>
 #include <mm/kmalloc.h>
+#include <mm/kstack.h>     /* P0-R5：AP 引导/空闲栈同样使用守卫页栈 */
 #include <mm/vmm.h>
 
 #define AP_TRAMP_PHYS   0x8000UL
-#define AP_STACK_BYTES  16384
+#define AP_STACK_BYTES  KSTACK_BYTES   /* 16KB，栈底下方带未映射守卫页 */
 
 /* ap_boot.S 导出的跳板边界与邮箱标号（内核 VMA 内的地址，用于算偏移） */
 extern char ap_tramp_start[], ap_tramp_end[];
@@ -158,7 +159,9 @@ uint32_t smp_init(void)
             continue;
         }
 
-        void *stack = kmalloc(AP_STACK_BYTES);
+        /* P0-R5：AP 引导栈改用守卫页栈——该栈是 AP idle 循环的实际执行栈
+         * （schedule 首次从 idle 切出时 RSP 保存于 idle 任务），溢出可诊断。 */
+        uint64_t stack = kstack_alloc();
         if (!stack) {
             kprintf("[smp] cpu%u: stack alloc failed, skipping\n", (unsigned)idx);
             continue;
@@ -168,17 +171,17 @@ uint32_t smp_init(void)
          * AP 上电后读 percpu 即得其 idle，首次 schedule() 即可参与调度。 */
         if (!sched_create_idle(idx)) {
             kprintf("[smp] cpu%u: idle alloc failed, skipping\n", (unsigned)idx);
-            kfree(stack);
+            kstack_free(stack);
             continue;
         }
 
         /* 2) 填邮箱（volatile 写 + 后续 IPI 前的 sfence 语义由 wrmsr/MMIO 保证） */
         *mb_cr3   = vmm_kernel_pml4();
-        *mb_stack = (uint64_t)stack + AP_STACK_BYTES;
+        *mb_stack = stack + AP_STACK_BYTES;
         *mb_entry = (uint64_t)ap_main;
         *mb_idx   = idx;
         g_percpu[idx].online = 0;
-        g_percpu[idx].kstack_top = (uint64_t)stack + AP_STACK_BYTES;
+        g_percpu[idx].kstack_top = stack + AP_STACK_BYTES;
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
         /* 3) INIT-SIPI-SIPI */
@@ -205,7 +208,7 @@ uint32_t smp_init(void)
         } else {
             kprintf("[smp] cpu%u (lapic_id=%u) FAILED to start\n",
                     (unsigned)idx, (unsigned)target);
-            kfree(stack);
+            kstack_free(stack);
         }
     }
 

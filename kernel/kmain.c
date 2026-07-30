@@ -38,6 +38,7 @@
 #include <ipc/port.h>
 #include <kernel/ata.h>
 #include <kernel/ahci.h>      /* P0-7：AHCI DMA 优先探测 */
+#include <kernel/pci.h>       /* P0-1/P0-2：ECAM、_PRT 路由、MSI 编程 */
 #include <kernel/hda.h>
 
 /* L3：由 boot.S 在探测到 CPU 支持 SMAP 后置 1（见 syscall.c 的 copy_*_user
@@ -188,7 +189,8 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
 
     /* ---- P0-1/P0-2/P0-4：ACPI 拓扑发现 + LAPIC/IOAPIC 取代 8259 PIC+PIT ---- */
     acpi_set_rsdp_hint(g_boot.rsdp_copy_phys);     /* P0-6：UEFI 下唯一 RSDP 来源 */
-    acpi_init();                                   /* 解析 RSDP/XSDT/MADT/HPET */
+    acpi_init();                                   /* 解析 RSDP/XSDT/MADT/HPET/MCFG/_PRT */
+    pci_cfg_init();                                /* P0-1：MCFG 存在则切 ECAM，否则 PIO 回退 */
     uint8_t bsp_lapic = lapic_init();              /* 启用本地 APIC */
     ioapic_init();                                 /* 初始化 I/O APIC（屏蔽全部） */
     ioapic_set_dest(bsp_lapic);                    /* 中断投递到 BSP */

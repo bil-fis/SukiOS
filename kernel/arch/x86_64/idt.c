@@ -51,6 +51,27 @@ extern void isr44(void); extern void isr45(void); extern void isr46(void); exter
 extern void isr240(void); extern void isr241(void); extern void isr242(void);
 extern void isr243(void);
 
+/* MSI/MSI-X 向量池存根（P0-2/R6）：48..127，X 宏一次生成声明与数组 */
+#define MSI_ISR_LIST \
+    X(48)  X(49)  X(50)  X(51)  X(52)  X(53)  X(54)  X(55) \
+    X(56)  X(57)  X(58)  X(59)  X(60)  X(61)  X(62)  X(63) \
+    X(64)  X(65)  X(66)  X(67)  X(68)  X(69)  X(70)  X(71) \
+    X(72)  X(73)  X(74)  X(75)  X(76)  X(77)  X(78)  X(79) \
+    X(80)  X(81)  X(82)  X(83)  X(84)  X(85)  X(86)  X(87) \
+    X(88)  X(89)  X(90)  X(91)  X(92)  X(93)  X(94)  X(95) \
+    X(96)  X(97)  X(98)  X(99)  X(100) X(101) X(102) X(103) \
+    X(104) X(105) X(106) X(107) X(108) X(109) X(110) X(111) \
+    X(112) X(113) X(114) X(115) X(116) X(117) X(118) X(119) \
+    X(120) X(121) X(122) X(123) X(124) X(125) X(126) X(127)
+#define X(n) extern void isr##n(void);
+MSI_ISR_LIST
+#undef X
+static void (*const g_msi_stubs[])(void) = {
+#define X(n) isr##n,
+MSI_ISR_LIST
+#undef X
+};
+
 static void (*const g_stubs[48])(void) = {
     isr0,isr1,isr2,isr3,isr4,isr5,isr6,isr7,isr8,isr9,isr10,isr11,
     isr12,isr13,isr14,isr15,isr16,isr17,isr18,isr19,isr20,isr21,isr22,isr23,
@@ -149,13 +170,18 @@ void idt_init(void)
     idt_set_gate(242, (uint64_t)isr242, 0, 0x8E);
     idt_set_gate(243, (uint64_t)isr243, 0, 0x8E);
 
+    /* MSI/MSI-X 向量池（P0-2/R6）：48..127，消息信号中断专用存根 */
+    for (int i = 48; i <= 127; i++) {
+        idt_set_gate(i, (uint64_t)g_msi_stubs[i - 48], 0, 0x8E);
+    }
+
     register_interrupt_handler(14, page_fault_handler);   /* #PF 隔离处理器 */
 
     g_idtr.limit = sizeof(g_idt) - 1;
     g_idtr.base  = (uint64_t)&g_idt;
     idt_load(&g_idtr);
 
-    kprintf("[idt] IDT loaded (48+IPI vectors installed, #PF handler registered)\n");
+    kprintf("[idt] IDT loaded (48+80(MSI)+IPI vectors installed, #PF handler)\n");
 }
 
 /* P0-3：AP 加载与 BSP 相同的 IDT（handler 表共享，per-CPU 行为由向量决定） */

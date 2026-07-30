@@ -21,6 +21,7 @@
  */
 #include <kernel/ahci.h>
 #include <kernel/pci.h>
+#include <kernel/apic.h>        /* P0-2/R6：lapic_id() 用于 MSI 目标 APIC */
 #include <kernel/console.h>
 #include <kernel/string.h>
 #include <kernel/interrupts.h>
@@ -46,8 +47,11 @@
 #define PX_TFD         0x20
 #define PX_SIG         0x24
 #define PX_SSTS        0x28
+#define PX_SCTL        0x2C             /* 端口控制与状态（COMRESET 用） */
 #define PX_SERR        0x30
 #define PX_CI          0x38
+
+#define PXSCTL_DET_MASK  0xFu           /* 设备检测初始化状态位（SCTL[3:0]） */
 
 #define PXCMD_ST       (1u << 0)       /* Start（命令处理开） */
 #define PXCMD_FRE      (1u << 4)       /* FIS Receive Enable */
@@ -151,6 +155,50 @@ static void port_start(void)
     px_wr(PX_CMD, px_rd(PX_CMD) | PXCMD_ST);
 }
 
+/* P0-7/R4：端口级错误恢复。命令因 TFES/超时失败后，对端口做 COMRESET 并重启
+ * 引擎，使其回到可重发命令的干净状态。不破坏已建立的 IDENTIFY 信息，恢复后
+ * 调用方可直接重发同一条命令。返回 true=端口已就绪。 */
+static bool ahci_port_reset(void)
+{
+    kprintf("[ahci] recovering port %u (COMRESET)\n", g_port);
+    /* 1) 清所有错误/完成状态位（W1C 幂等） */
+    px_wr(PX_IS, 0xFFFFFFFFu);
+    hba_wr(HBA_IS, 1u << g_port);
+    px_wr(PX_SERR, 0xFFFFFFFFu);
+
+    /* 2) 停引擎，准备复位 */
+    port_stop();
+
+    /* 3) COMRESET：DET=1 保持约 1ms 后 DET=0（AHCI 1.3.1 §10.4.2） */
+    px_wr(PX_SCTL, (px_rd(PX_SCTL) & ~PXSCTL_DET_MASK) | 0x1u);
+    for (volatile uint64_t i = 0; i < 2000000ULL; i++) {
+        __asm__ volatile("pause");
+    }
+    px_wr(PX_SCTL, (px_rd(PX_SCTL) & ~PXSCTL_DET_MASK) | 0x0u);
+
+    /* 4) 等待设备重新就绪（SSTS.DET==3），上限约 480ms（暂停计数） */
+    bool ready = false;
+    for (volatile uint64_t i = 0; i < 120000000ULL; i++) {
+        if ((px_rd(PX_SSTS) & 0x0F) == 3) {
+            ready = true;
+            break;
+        }
+        __asm__ volatile("pause");
+    }
+    if (!ready) {
+        kprintf("[ahci] reset: device not ready (SSTS=0x%x)\n",
+                (unsigned)(px_rd(PX_SSTS) & 0x0F));
+        return false;
+    }
+
+    /* 5) 清错误位并重启引擎 */
+    px_wr(PX_SERR, 0xFFFFFFFFu);
+    px_wr(PX_IS, 0xFFFFFFFFu);
+    hba_wr(HBA_IS, 1u << g_port);
+    port_start();
+    return true;
+}
+
 /* ---- 构造并执行一条命令（slot 0，单 PRDT，数据经弹跳页） ----
  * cmd    : ATA 命令码（0x25 DMA READ EXT / 0x35 DMA WRITE EXT / 0xEC IDENTIFY）
  * lba    : 起始扇区；count：扇区数（IDENTIFY 时忽略 LBA/count 填 0）
@@ -198,45 +246,70 @@ static bool ahci_exec(uint8_t cmd, uint64_t lba, uint16_t count,
         prdt[3] = (bytes - 1) | (1u << 31);
     }
 
-    /* 等待端口空闲（BSY|DRQ 清零）后发命令 */
-    for (uint64_t i = 0; i < 5000000; i++) {
-        if (!(px_rd(PX_TFD) & (TFD_BSY | TFD_DRQ))) {
-            break;
-        }
-        __asm__ volatile("pause");
-    }
-    g_cmd_done = false;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    px_wr(PX_CI, 1u);                  /* 发槽 0 */
+    /* 带错误恢复的执行循环（P0-7/R4）：最多重试 MAX_RETRY 次；
+     * 任一尝试遇 TFES/超时先 COMRESET 复位端口再重发，仍失败才返回 false。
+     * 正常路径（首试成功）行为与旧实现完全一致，零额外开销。 */
+    const int MAX_RETRY = 3;
+    for (int attempt = 0; attempt <= MAX_RETRY; attempt++) {
+        /* 清陈旧错误/完成状态（W1C 幂等），避免上次残留 TFES 立即误判 */
+        px_wr(PX_IS, 0xFFFFFFFFu);
+        hba_wr(HBA_IS, 1u << g_port);
 
-    /* 等待完成：优先中断标志；轮询 PxCI 兜底（约 2 秒 TSC 超时） */
-    uint64_t deadline = rdtsc() + 4000000000ULL;
-    for (;;) {
-        if (g_cmd_done || !(px_rd(PX_CI) & 1u)) {
-            break;
+        /* 等待端口空闲（BSY|DRQ 清零）后发命令 */
+        for (uint64_t i = 0; i < 5000000; i++) {
+            if (!(px_rd(PX_TFD) & (TFD_BSY | TFD_DRQ))) {
+                break;
+            }
+            __asm__ volatile("pause");
         }
-        if (px_rd(PX_IS) & PXIS_TFES) {
-            break;
+        g_cmd_done = false;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        px_wr(PX_CI, 1u);                  /* 发槽 0 */
+
+        /* 等待完成：优先中断标志；轮询 PxCI 兜底（约 2 秒 TSC 超时） */
+        uint64_t deadline = rdtsc() + 4000000000ULL;
+        bool timed_out = false;
+        for (;;) {
+            if (g_cmd_done || !(px_rd(PX_CI) & 1u)) {
+                break;
+            }
+            if (px_rd(PX_IS) & PXIS_TFES) {
+                break;
+            }
+            if (rdtsc() > deadline) {
+                timed_out = true;
+                kprintf("[ahci] command 0x%x timeout (attempt %d, CI=0x%x TFD=0x%x)\n",
+                        cmd, attempt, px_rd(PX_CI), px_rd(PX_TFD));
+                break;
+            }
+            __asm__ volatile("pause");
         }
-        if (rdtsc() > deadline) {
-            kprintf("[ahci] command 0x%x timeout (CI=0x%x TFD=0x%x)\n",
-                    cmd, px_rd(PX_CI), px_rd(PX_TFD));
+        /* 兜底路径可能未经 IRQ 清状态：此处再 W1C 一次（幂等） */
+        uint32_t pis = px_rd(PX_IS);
+        if (pis) {
+            px_wr(PX_IS, pis);
+            hba_wr(HBA_IS, 1u << g_port);
+        }
+        bool err = (pis & PXIS_TFES) || (px_rd(PX_TFD) & TFD_ERR) || timed_out;
+        if (!err) {
+            return true;
+        }
+
+        /* 末次尝试仍失败，放弃 */
+        if (attempt == MAX_RETRY) {
+            kprintf("[ahci] command 0x%x failed after %u retries (PxIS=0x%x TFD=0x%x)\n",
+                    cmd, (unsigned)MAX_RETRY, pis, px_rd(PX_TFD));
             return false;
         }
-        __asm__ volatile("pause");
+        /* 端口复位后重试（恢复干净状态） */
+        kprintf("[ahci] command 0x%x attempt %d error (PxIS=0x%x TFD=0x%x), "
+                "port reset + retry\n", cmd, attempt, pis, px_rd(PX_TFD));
+        if (!ahci_port_reset()) {
+            kprintf("[ahci] command 0x%x: port reset failed, giving up\n", cmd);
+            return false;
+        }
     }
-    /* 兜底路径可能未经 IRQ 清状态：此处再 W1C 一次（幂等） */
-    uint32_t pis = px_rd(PX_IS);
-    if (pis) {
-        px_wr(PX_IS, pis);
-        hba_wr(HBA_IS, 1u << g_port);
-    }
-    if ((pis & PXIS_TFES) || (px_rd(PX_TFD) & TFD_ERR)) {
-        kprintf("[ahci] command 0x%x error (PxIS=0x%x TFD=0x%x)\n",
-                cmd, pis, px_rd(PX_TFD));
-        return false;
-    }
-    return true;
+    return false;
 }
 
 bool ahci_init(void)
@@ -300,18 +373,35 @@ bool ahci_init(void)
     px_wr(PX_IS,   0xFFFFFFFFu);
     port_start();
 
-    /* 中断路由：SeaBIOS 已把 GSI 写入 PCI INT_LINE；i440FX/PIIX3 下 PCI
-     * INTx 为电平低有效。向量取 32+GSI（IDT 前 48 stub 已就位）。 */
-    uint8_t gsi = pci_cfg_read8(d.bus, d.dev, d.func, PCI_CFG_INT_LINE);
-    if (gsi > 0 && gsi < 16) {
-        register_interrupt_handler(32 + gsi, ahci_irq_handler);
-        ioapic_route(gsi, 32 + gsi, true /*level*/, true /*active_low*/, 0);
+    /* 中断路由（P0-2/R6：MSI 优先，IOAPIC 回退）：
+     *   1) 依 _PRT/INT_LINE 求 GSI（PCI INTx 引脚在配置空间 0x3D）；
+     *   2) 优先把中断改为 MSI 投递（向量落在 MSI 池 48..127），失败则回落
+     *      传统 IOAPIC 电平低有效路由。MSI 成功即禁用设备 INTx，避免双投递。 */
+    uint8_t pin = pci_cfg_read8(d.bus, d.dev, d.func, PCI_CFG_INT_PIN);
+    int gsi = pci_route_interrupt(&d, pin);
+    uint8_t gsi_u = (gsi >= 0 && gsi < 16) ? (uint8_t)gsi : 22;
+    const uint8_t AHCI_MSI_VECTOR = 64;        /* 落在 MSI 向量池内 */
+    bool routed = false;
+
+    if (pci_enable_msi(&d, AHCI_MSI_VECTOR, lapic_id())) {
+        register_interrupt_handler(AHCI_MSI_VECTOR, ahci_irq_handler);
+        px_wr(PX_IE, PXIS_DHRS | PXIS_PSS | PXIS_DPS | PXIS_TFES);
+        hba_wr(HBA_GHC, hba_rd(HBA_GHC) | GHC_IE);
+        kprintf("[ahci] IRQ routed via MSI -> vector %u (lapic %u)\n",
+                (unsigned)AHCI_MSI_VECTOR, (unsigned)lapic_id());
+        routed = true;
+    } else if (gsi_u < 16) {
+        register_interrupt_handler((uint8_t)(32 + gsi_u), ahci_irq_handler);
+        ioapic_route(gsi_u, 32 + gsi_u, true /*level*/, true /*active_low*/,
+                     lapic_id());
         px_wr(PX_IE, PXIS_DHRS | PXIS_PSS | PXIS_DPS | PXIS_TFES);
         hba_wr(HBA_GHC, hba_rd(HBA_GHC) | GHC_IE);
         kprintf("[ahci] IRQ routed: GSI %u -> vector %u (level, active-low)\n",
-                gsi, 32 + gsi);
-    } else {
-        kprintf("[ahci] no valid INT_LINE, polling mode only\n");
+                gsi_u, 32 + gsi_u);
+        routed = true;
+    }
+    if (!routed) {
+        kprintf("[ahci] no valid IRQ, polling mode only\n");
     }
 
     /* IDENTIFY DEVICE：取容量（LBA48 word100-103 优先，回退 word60-61） */

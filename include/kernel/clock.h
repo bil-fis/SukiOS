@@ -17,6 +17,12 @@
 #define _SUKI_KERNEL_CLOCK_H
 
 #include <kernel/types.h>
+#include <kernel/interrupts.h>   /* registers_t：sched_tick 节拍钩子入参 */
+
+/* 系统节拍钩子：每 CPU LAPIC 定时器(100Hz)或 PIT 触发后调用（弱符号，
+ * 由调度器 sched.c 提供强实现覆盖 pit.c 的空弱实现）。声明于此供 clock.c
+ * 等调用方获得正确原型，避免隐式声明（UB/错误调用约定）。 */
+void sched_tick(registers_t *r);
 
 /* 初始化时钟子系统：
  *   1) 用 PIT 一次性模式校准 TSC 频率（关中断，安全）；

@@ -25,6 +25,7 @@
 #define ACPI_SIG_MADT  "APIC"
 #define ACPI_SIG_FADT  "FACP"
 #define ACPI_SIG_HPET  "HPET"
+#define ACPI_SIG_MCFG   "MCFG"   /* PCIe ECAM 配置空间基址（P0-1 补充解析） */
 
 /* MADT 子结构类型 */
 #define ACPI_MADT_LAPIC      0   /* 处理器本地 APIC */
@@ -33,6 +34,24 @@
 #define ACPI_MADT_LAPIC_NMI  4   /* 本地 APIC NMI */
 
 #define ACPI_MADT_LAPIC_ENABLED 0x1
+
+/* MCFG：每个 PCIe ECAM 配置窗口（表头后跟一组该结构） */
+#define ACPI_MCFG_MAX_WINDOWS 8
+typedef struct acpi_mcfg_window {
+    uint64_t base;          /* ECAM 窗口物理基址（段组 0 通常为 0xE0000000） */
+    uint16_t seg_group;     /* PCI 段组号 */
+    uint8_t  bus_start;     /* 该窗口覆盖的起始总线号 */
+    uint8_t  bus_end;       /* 该窗口覆盖的结束总线号 */
+} acpi_mcfg_window_t;
+
+/* _PRT：PCI 根桥中断路由表条目（P0-1/R8：把 INTx# 映射到 GSI） */
+#define ACPI_PRT_MAX 64
+typedef struct acpi_prt_entry {
+    uint32_t addr;          /* 设备地址：高 16 位=dev，低 16 位=func，0xFFFF 通配 */
+    uint8_t  pin;           /* INTx# 引脚（0=A, 1=B, 2=C, 3=D） */
+    uint8_t  link[4];       /* 源链接设备 NameSeg；全 0 表示直连 GSI（Source==0） */
+    uint32_t gsi_index;     /* 直连时为 GSI 值；link 模式下为 link 的 _CRS 索引 */
+} acpi_prt_entry_t;
 
 /* 解析结果（供 apic/hpet 驱动消费） */
 typedef struct acpi_info {
@@ -66,6 +85,17 @@ typedef struct acpi_info {
     uint8_t  slp_typ_a;        /* S5 在 PM1a 的 SLP_TYP 值（来自 DSDT _S5 低 3 位） */
     uint8_t  slp_typ_b;        /* S5 在 PM1b 的 SLP_TYP 值 */
     uint64_t dsdt_phys;        /* DSDT 物理地址（FADT @0x28；SLP_TYP 须由此解析） */
+
+    /* MCFG：PCIe ECAM 配置空间窗口（P0-1 补充）。mcfg_count==0 表示该平台
+     * 未提供 MCFG（多为传统 PCI 的 i440FX），此时 PCI 配置走 PIO 0xCF8。 */
+    uint64_t mcfg_phys;
+    uint32_t mcfg_count;
+    acpi_mcfg_window_t mcfg_windows[ACPI_MCFG_MAX_WINDOWS];
+
+    /* _PRT：PCI 根桥 INTx# -> GSI 路由表（P0-1/R8）。prt_count==0 表示未解析
+     * 到 _PRT，PCI 中断路由回退到固件预编程的 INT_LINE。 */
+    uint32_t prt_count;
+    acpi_prt_entry_t prt[ACPI_PRT_MAX];
 } acpi_info_t;
 
 /* 调用 acpi_init() 后读取全局结果（只读共享） */
@@ -80,10 +110,21 @@ void acpi_set_rsdp_hint(uint64_t rsdp_phys);
 bool acpi_init(void);
 
 /* 在已解析的 ACPI 表中查找指定签名（如 "HPET"）的表物理地址；未找到返回 0。 */
-uint64_t acpi_find_table(const char sig[8]);
+uint64_t acpi_find_table(const char *sig);
 
 /* P0-R8：ACPI S5 软关机。向 PM1a/PM1b Control Block 写入 SLP_TYP(S5) | SLP_EN
  * 触发平台断电；无 FADT 电源信息则退化为无限停机。 */
 void acpi_poweroff(void);
+
+/* P0-1：查询段组/总线对应的 ECAM 窗口。命中时 *base_out 填窗口物理基址、
+ * *bus_start_out / *bus_end_out 填该窗口覆盖的总线范围，返回 true；未命中返回
+ * false（调用方应回落 PIO 0xCF8 配置访问）。输出指针可为 NULL。 */
+bool acpi_get_mcfg_window(uint16_t seg_group, uint8_t bus,
+                          uint64_t *base_out, uint8_t *bus_start_out,
+                          uint8_t *bus_end_out);
+
+/* P0-1/R8：依 _PRT 把 PCI 设备 (bus,dev,pin) 的 INTx# 解析为 GSI。
+ * 返回 GSI（>=0）；解析失败返回 -1（调用方应回落 INT_LINE）。 */
+int acpi_pci_route(uint8_t bus, uint8_t dev, uint8_t pin);
 
 #endif /* _SUKI_KERNEL_ACPI_H */

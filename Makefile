@@ -163,6 +163,10 @@ $(BUILD)/user/%.blob.o: $(BUILD)/user/%.elf
 		--redefine-sym _binary_build_user_$*_elf_end=user_$*_end \
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
 		$< $@
+	# objcopy -I binary 会丢掉 .note.GNU-stack，导致最终内核 ELF 的
+	# GNU_STACK 缺省为「可执行栈」(安全弱点)。补一个空(=non-exec)的
+	# .note.GNU-stack 段，确保内核栈不可执行。
+	objcopy --add-section .note.GNU-stack=/dev/null $@ $@.nostack && mv $@.nostack $@
 
 # ---- 独立程序编译规则（user/apps/*.c，启用 SSE，链接为独立 ELF） ----
 $(BUILD)/apps/%.o: user/apps/%.c

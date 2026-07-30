@@ -87,6 +87,20 @@ ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
 
+/* MSI/MSI-X 向量池（P0-2/R6）：48..127 为消息信号中断复用 isr\num 存根。
+ * 设备经 MSI 把中断投递到这些向量，由驱动通过 register_interrupt_handler 注册。
+ * 用 .altmacro + .rept 批量生成，避免手工罗列 80 条。 */
+.altmacro
+.macro GEN_MSI_STUBS first, last
+.set _m, \first
+.rept (\last - \first + 1)
+ISR_NOERR %_m
+.set _m, _m + 1
+.endr
+.endm
+GEN_MSI_STUBS 48, 127
+.noaltmacro
+
 /* 公共存根：保存寄存器 -> KPTI 切内核页表 -> 调用 C -> KPTI 还原 -> iretq
  *
  * P0-R2 KPTI 设计（KAISER 式）：

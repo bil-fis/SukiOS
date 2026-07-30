@@ -113,6 +113,7 @@ static const struct acpi_rsdp *acpi_scan_rsdp(uint64_t start, uint64_t end)
 /* 处理单张 ACPI 表：记录关键表（MADT/FADT/HPET）并打印签名。
  * 返回 false 表示该表头校验失败（调用方应跳过）。 */
 static void acpi_parse_fadt(uint64_t fadt_phys);   /* 前向声明（定义见下文） */
+static void acpi_parse_mcfg(void);                  /* 前向声明（P0-1 MCFG） */
 static bool acpi_process_table(uint64_t tbl_phys, uint32_t idx)
 {
     if (!tbl_phys) {
@@ -137,6 +138,9 @@ static bool acpi_process_table(uint64_t tbl_phys, uint32_t idx)
         acpi_parse_fadt(tbl_phys);   /* P0-R8：解析 PM 寄存器用于 S5 关机 */
     } else if (sig_eq(h->signature, ACPI_SIG_HPET)) {
         g_acpi.hpet_phys = tbl_phys;
+    } else if (sig_eq(h->signature, ACPI_SIG_MCFG)) {
+        g_acpi.mcfg_phys = tbl_phys;
+        acpi_parse_mcfg();   /* P0-1：记录 PCIe ECAM 窗口供 PCI 配置访问 */
     }
 
     if (idx < 24) {
@@ -335,6 +339,308 @@ static void acpi_parse_fadt(uint64_t fadt_phys)
             (unsigned)g_acpi.slp_typ_a, (unsigned)g_acpi.slp_typ_b);
 }
 
+/* P0-1：解析 MCFG，记录所有 PCIe ECAM 配置空间窗口。
+ * MCFG 表头（36 字节）后跟每组 16 字节窗口：
+ *   base[8] | seg_group[2] | bus_start[1] | bus_end[1] | reserved[4]。
+ * 传统 PCI（i440FX）不提供 MCFG，此时 mcfg_count==0，PCI 走 PIO 0xCF8。 */
+static void acpi_parse_mcfg(void)
+{
+    if (!g_acpi.mcfg_phys) {
+        return;
+    }
+    const uint8_t *m = (const uint8_t *)PHYS_TO_VIRT(g_acpi.mcfg_phys);
+    uint32_t len = *(const uint32_t *)(m + 0x04);
+    /* MCFG：36 字节 SDT 头 + 8 字节保留字段后，才是分配结构（每项 16 字节）。
+     * 条目起始偏移为 44，而非 36（ACPI 6.x 规范 §PCI Express Memory
+     * Mapped Configuration Space Base Address Allocation Structure）。 */
+    if (len < 44 + 16 || !acpi_checksum_ok((const struct acpi_sdt_hdr *)m, len)) {
+        kprintf("[acpi] MCFG: BAD length/checksum, skipped\n");
+        return;
+    }
+    uint32_t n = (len - 44) / 16;
+    if (n > ACPI_MCFG_MAX_WINDOWS) {
+        n = ACPI_MCFG_MAX_WINDOWS;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *e = m + 44 + i * 16;
+        uint64_t base = 0;
+        uint16_t seg = 0;
+        memcpy(&base, e, 8);              /* 用 memcpy 避免未对齐 64 位读取 */
+        memcpy(&seg, e + 8, 2);
+        g_acpi.mcfg_windows[i].base      = base;
+        g_acpi.mcfg_windows[i].seg_group = seg;
+        g_acpi.mcfg_windows[i].bus_start = e[10];
+        g_acpi.mcfg_windows[i].bus_end   = e[11];
+    }
+    g_acpi.mcfg_count = n;
+    kprintf("[acpi] MCFG: %u ECAM window(s):\n", (unsigned)n);
+    for (uint32_t i = 0; i < n; i++) {
+        kprintf("    seg=%u bus=%u..%u base=%p\n",
+                (unsigned)g_acpi.mcfg_windows[i].seg_group,
+                (unsigned)g_acpi.mcfg_windows[i].bus_start,
+                (unsigned)g_acpi.mcfg_windows[i].bus_end,
+                (void *)(uintptr_t)g_acpi.mcfg_windows[i].base);
+    }
+}
+
+/* 查询段组/总线对应的 ECAM 窗口（见 acpi.h 说明）。 */
+bool acpi_get_mcfg_window(uint16_t seg_group, uint8_t bus,
+                          uint64_t *base_out, uint8_t *bus_start_out,
+                          uint8_t *bus_end_out)
+{
+    for (uint32_t i = 0; i < g_acpi.mcfg_count; i++) {
+        if (g_acpi.mcfg_windows[i].seg_group == seg_group &&
+            bus >= g_acpi.mcfg_windows[i].bus_start &&
+            bus <= g_acpi.mcfg_windows[i].bus_end) {
+            if (base_out)    *base_out    = g_acpi.mcfg_windows[i].base;
+            if (bus_start_out) *bus_start_out = g_acpi.mcfg_windows[i].bus_start;
+            if (bus_end_out) *bus_end_out  = g_acpi.mcfg_windows[i].bus_end;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── _PRT 解析辅助：ACPI PkgLength 解码（ACPI 6.x 表 17-3）──────────────
+ * 返回包内容长度，并通过 *cstart 给出内容起始偏移（pkg = PackageOp 位置）。 */
+static uint32_t acpi_pkg_bounds(const uint8_t *aml, uint32_t pkg,
+                                 uint32_t *cstart)
+{
+    uint8_t lead = aml[pkg + 1];
+    if (!(lead & 0x80)) {
+        *cstart = pkg + 2;
+        return lead;
+    }
+    uint8_t nn = (lead >> 6) & 0x03;     /* 后续字节数（0..3） */
+    uint32_t L = (uint32_t)(lead & 0x0F);
+    for (uint8_t j = 0; j < nn; j++) {
+        L |= ((uint32_t)aml[pkg + 2 + j] << ((j + 1) * 8));
+    }
+    *cstart = pkg + 2 + nn;
+    return L;
+}
+
+/* 读一个 AML 整型常量并返回其值，并把 *pos 推进到表达式之后。
+ * 支持 Byte/Word/DWord/QWord 前缀、Zero/One/Ones；未知形态跳过 1 字节回落 0。 */
+static uint64_t acpi_aml_const(const uint8_t *aml, uint32_t end, uint32_t *pos)
+{
+    if (*pos >= end) {
+        return 0;
+    }
+    uint8_t op = aml[*pos];
+    switch (op) {
+    case 0x00: *pos += 1; return 0;                       /* Zero */
+    case 0x01: *pos += 1; return 1;                       /* One */
+    case 0xFF: *pos += 1; return 0xFFFFFFFFULL;           /* Ones */
+    case 0x0A:                                            /* ByteConst */
+        if (*pos + 2 > end) { *pos = end; return 0; }
+        { uint64_t v = aml[*pos + 1]; *pos += 2; return v; }
+    case 0x0B:                                            /* WordConst */
+        if (*pos + 3 > end) { *pos = end; return 0; }
+        { uint64_t v = (uint64_t)aml[*pos + 1] | ((uint64_t)aml[*pos + 2] << 8);
+          *pos += 3; return v; }
+    case 0x0C:                                            /* DWordConst */
+        if (*pos + 5 > end) { *pos = end; return 0; }
+        { uint64_t v = (uint64_t)aml[*pos + 1] | ((uint64_t)aml[*pos + 2] << 8) |
+                       ((uint64_t)aml[*pos + 3] << 16) | ((uint64_t)aml[*pos + 4] << 24);
+          *pos += 5; return v; }
+    case 0x0E:                                            /* QWordConst */
+        if (*pos + 9 > end) { *pos = end; return 0; }
+        { uint64_t v = 0; for (uint8_t b = 0; b < 8; b++) {
+              v |= (uint64_t)aml[*pos + 1 + b] << (8 * b); }
+          *pos += 9; return v; }
+    default:
+        *pos += 1; return 0;
+    }
+}
+
+/* 在 DSDT 中定位链接设备 NameSeg 的 _CRS，若是常量 ResourceTemplate 则
+ * 解析其中的 Extended Interrupt(0x89) 或 IRQ(0x22) 描述符取 GSI。
+ * 计算型 _CRS（需方法求值）无法解析，返回 -1 由调用方回落 INT_LINE。 */
+static int acpi_parse_resource_gsi(const uint8_t *aml, uint32_t len, uint32_t *pos)
+{
+    uint32_t p = *pos;
+    while (p < len) {
+        uint8_t t = aml[p];
+        if (t == 0x89) {                       /* Extended Interrupt 描述符 */
+            if (p + 2 >= len) break;
+            uint8_t cnt = aml[p + 3];          /* 中断表长度 */
+            if (p + 4 + 4 > len) break;
+            uint32_t gsi = (uint32_t)aml[p + 4] | ((uint32_t)aml[p + 5] << 8) |
+                           ((uint32_t)aml[p + 6] << 16) | ((uint32_t)aml[p + 7] << 24);
+            (void)cnt;
+            *pos = p + 4 + 4;
+            return (int)gsi;
+        } else if (t == 0x22) {                /* 小 IRQ 描述符：位图 */
+            if (p + 4 > len) break;
+            uint16_t mask = (uint16_t)aml[p + 2] | ((uint16_t)aml[p + 3] << 8);
+            for (uint8_t b = 0; b < 16; b++) {
+                if (mask & (1u << b)) { *pos = p + 4; return (int)b; }
+            }
+            break;
+        } else if (t == 0x23) {                /* 大 IRQ 描述符：变长位图 */
+            if (p + 1 >= len) break;
+            uint8_t blen = aml[p + 1];
+            uint32_t bit = 0;
+            for (uint8_t bb = 0; bb < blen && p + 2 + bb < len; bb++) {
+                uint8_t byte = aml[p + 2 + bb];
+                for (uint8_t bitin = 0; bitin < 8; bitin++) {
+                    if (byte & (1u << bitin)) { *pos = p + 2 + bb; return (int)bit; }
+                    bit++;
+                }
+            }
+            break;
+        }
+        p++;
+    }
+    return -1;
+}
+
+static int acpi_resolve_link_gsi(const uint8_t link[4])
+{
+    if (!g_acpi.dsdt_phys) {
+        return -1;
+    }
+    const struct acpi_sdt_hdr *h =
+        (const struct acpi_sdt_hdr *)PHYS_TO_VIRT(g_acpi.dsdt_phys);
+    if (!acpi_checksum_ok(h, h->length)) {
+        return -1;
+    }
+    const uint8_t *aml = (const uint8_t *)h + sizeof(*h);
+    uint32_t len = h->length - sizeof(*h);
+    for (uint32_t i = 0; i + 4 + 4 < len; i++) {
+        if (memcmp(&aml[i], link, 4) != 0) {
+            continue;
+        }
+        /* 在 NameSeg 之后有限范围内找 "_CRS" */
+        for (uint32_t j = i + 4; j + 4 < len && j < i + 0x60; j++) {
+            if (aml[j] == 0x5F && aml[j + 1] == 'C' &&
+                aml[j + 2] == 'R' && aml[j + 3] == 'S') {
+                uint32_t d = j + 4;
+                if (d >= len) break;
+                if (aml[d] == 0x08) {          /* Name(_CRS, <data>) */
+                    uint32_t k = d + 1;
+                    int g = acpi_parse_resource_gsi(aml, len, &k);
+                    if (g >= 0) return g;
+                } else if (aml[d] == 0x14) {   /* Method(_CRS,...) 计算型：不求值 */
+                    return -1;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+/* P0-1/R8：解析 DSDT 中的 _PRT（PCI 根桥 INTx# -> GSI 路由表）。
+ * 典型形态：Name(_PRT, Package(){ Package(4){ADDR,PIN,SRC,IDX}, ... })。
+ * SRC 为 0（Zero）表示直连 GSI；否则为链接设备 NameSeg（link 模式下通过
+ * _CRS 解析 GSI，失败则回落固件预编程的 INT_LINE）。 */
+static void acpi_parse_prt(void)
+{
+    if (!g_acpi.dsdt_phys) {
+        return;
+    }
+    const struct acpi_sdt_hdr *h =
+        (const struct acpi_sdt_hdr *)PHYS_TO_VIRT(g_acpi.dsdt_phys);
+    if (!acpi_checksum_ok(h, h->length)) {
+        kprintf("[acpi] PRT: DSDT bad checksum, skip\n");
+        return;
+    }
+    const uint8_t *aml = (const uint8_t *)h + sizeof(*h);
+    uint32_t len = h->length - sizeof(*h);
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i + 4 < len && count < ACPI_PRT_MAX; i++) {
+        if (aml[i] != 0x5F || aml[i + 1] != 'P' ||
+            aml[i + 2] != 'R' || aml[i + 3] != 'T') {
+            continue;                           /* 非 "_PRT" */
+        }
+        uint32_t p = i + 4;                     /* NameSeg 之后 */
+        /* 兼容 Name(_PRT, Package{}) 与 Method(_PRT){Return(Package{})} 两种
+         * 形态：在有限窗口内向前找首个 PackageOp(0x12) 并解析为 _PRT 包。 */
+        bool prt_found = false;
+        for (uint32_t ws = 0; ws <= 0x20 && p + ws < len; ws++) {
+            if (aml[p + ws] == 0x12) {
+                p = p + ws;
+                prt_found = true;
+                break;
+            }
+        }
+        if (!prt_found) {
+            continue;
+        }
+        uint32_t outer_start = 0, outer_len = 0;
+        outer_len = acpi_pkg_bounds(aml, p, &outer_start);
+        uint32_t outer_end = outer_start + outer_len;
+        if (outer_end > len) outer_end = len;
+        uint32_t k = outer_start;
+        uint32_t ne = (k < outer_end) ? aml[k] : 0;   /* 包元素个数 */
+        k++;
+        for (uint32_t e = 0; e < ne && count < ACPI_PRT_MAX; e++) {
+            if (k + 1 >= outer_end) break;
+            if (aml[k] != 0x12) { k++; continue; }     /* 期望内层 Package */
+            uint32_t in_start = 0, in_len = 0;
+            in_len = acpi_pkg_bounds(aml, k, &in_start);
+            uint32_t in_end = in_start + in_len;
+            if (in_end > outer_end) in_end = outer_end;
+            uint32_t f = in_start;
+            uint64_t addr = acpi_aml_const(aml, in_end, &f);
+            uint64_t pin  = acpi_aml_const(aml, in_end, &f);
+            uint8_t link[4] = {0, 0, 0, 0};
+            uint32_t gsi_idx = 0;
+            if (f < in_end && aml[f] == 0x00) {       /* Zero => 直连 GSI */
+                f++;
+                gsi_idx = (uint32_t)acpi_aml_const(aml, in_end, &f);
+            } else {                                   /* 链接设备 NameSeg */
+                if (f + 4 <= in_end) { memcpy(link, &aml[f], 4); f += 4; }
+                gsi_idx = (uint32_t)acpi_aml_const(aml, in_end, &f);
+            }
+            if (count < ACPI_PRT_MAX) {
+                g_acpi.prt[count].addr     = (uint32_t)addr;
+                g_acpi.prt[count].pin      = (uint8_t)pin;
+                memcpy(g_acpi.prt[count].link, link, 4);
+                g_acpi.prt[count].gsi_index = gsi_idx;
+                count++;
+            }
+            k = in_end;
+        }
+        break;                                   /* 仅取第一个 _PRT */
+    }
+    g_acpi.prt_count = count;
+    kprintf("[acpi] PRT: %u route entry(ies)\n", (unsigned)count);
+}
+
+/* P0-1/R8：依 _PRT 把 PCI 设备 (bus,dev,pin) 的 INTx#（0=A..3=D）解析为 GSI。
+ * 命中直连条目返回 GSI；命中 link 条目且能解析 _CRS 返回 GSI；否则返回 -1
+ * （调用方应回落到固件预编程的 INT_LINE 配置寄存器）。 */
+int acpi_pci_route(uint8_t bus, uint8_t dev, uint8_t pin)
+{
+    (void)bus;   /* 单根桥 _PRT 仅按 (dev,pin) 路由，不随 bus 区分 */
+    for (uint32_t i = 0; i < g_acpi.prt_count; i++) {
+        uint32_t addr = g_acpi.prt[i].addr;
+        uint8_t pdev  = (addr >> 16) & 0xFF;
+        if (pdev != dev) {
+            continue;
+        }
+        if (g_acpi.prt[i].pin != pin) {
+            continue;
+        }
+        bool is_direct = (g_acpi.prt[i].link[0] == 0 &&
+                          g_acpi.prt[i].link[1] == 0 &&
+                          g_acpi.prt[i].link[2] == 0 &&
+                          g_acpi.prt[i].link[3] == 0);
+        if (is_direct) {
+            return (int)g_acpi.prt[i].gsi_index;
+        }
+        int g = acpi_resolve_link_gsi(g_acpi.prt[i].link);
+        if (g >= 0) {
+            return g;
+        }
+        return -1;                              /* link 不可解析 => 回落 INT_LINE */
+    }
+    return -1;
+}
+
 /* P0-R8：ACPI S5 软关机。
  *
  * 写 PM1a_CNT（若存在则同时写 PM1b_CNT）：SLP_TYP<<10 | SLP_EN(1<<13)。
@@ -495,13 +801,14 @@ bool acpi_init(void)
     }
 
     acpi_parse_madt();
+    acpi_parse_prt();        /* P0-1/R8：解析 _PRT（依赖 FADT 已设 dsdt_phys） */
     kprintf("[acpi] HPET table %sfound @ %p\n",
             g_acpi.hpet_phys ? "" : "NOT ", (void *)g_acpi.hpet_phys);
 
     return true;
 }
 
-uint64_t acpi_find_table(const char sig[8])
+uint64_t acpi_find_table(const char *sig)
 {
     if (!g_acpi.found) {
         return 0;
@@ -514,6 +821,9 @@ uint64_t acpi_find_table(const char sig[8])
     }
     if (sig_eq(sig, ACPI_SIG_HPET)) {
         return g_acpi.hpet_phys;
+    }
+    if (sig_eq(sig, ACPI_SIG_MCFG)) {
+        return g_acpi.mcfg_phys;
     }
     return 0;
 }

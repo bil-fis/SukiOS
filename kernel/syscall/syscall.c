@@ -22,6 +22,7 @@
 #include <kernel/elf.h>
 #include <ipc/fs_proto.h>
 #include <kernel/hda.h>
+#include <kernel/acpi.h>   /* acpi_poweroff：SYS_REBOOT(mode!=0) 经 ACPI S5 软关机 */
 #include <kernel/percpu.h>   /* cpu_index()/MAX_CPUS：H8 per-CPU syscall 缓冲 */
 
 /* ---- 用户指针校验（A1 项）----

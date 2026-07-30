@@ -19,6 +19,8 @@
 #define LINE_MAX 120
 
 static uint8_t g_rx[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + FS_DATA_MAX + 16];
+/* 写请求发送缓冲（含 FS_WRITE_MAX 数据上限） */
+static uint8_t g_wreq[sizeof(mach_msg_header_t) + sizeof(fs_write_req_t) + 96 + FS_WRITE_MAX];
 
 static void prompt(void)
 {
@@ -30,7 +32,7 @@ static void fs_request(uint32_t id, const char *arg)
 {
     struct {
         mach_msg_header_t h;
-        char name[32];
+        char name[64];
     } req;
     uint32_t payload = 0;
     if (arg) {
@@ -89,6 +91,54 @@ static void upcase(char *s)
     }
 }
 
+/* 发送写文件请求（name NUL 结尾 + length 字节数据，紧跟其后）。 */
+static void fs_request_write(const char *name, const char *data, uint32_t len,
+                             uint32_t offset)
+{
+    mach_msg_header_t *h = (mach_msg_header_t *)g_wreq;
+    fs_write_req_t *wr = (fs_write_req_t *)(g_wreq + sizeof(mach_msg_header_t));
+    wr->offset = offset;
+    wr->length = len;
+    char *nm = (char *)(g_wreq + sizeof(mach_msg_header_t) + sizeof(fs_write_req_t));
+    uint32_t ni = 0;
+    while (name[ni] && ni < 63) { nm[ni] = name[ni]; ni++; }
+    nm[ni++] = 0;
+    u_memcpy(nm + ni, data, len);
+    h->msgh_bits = 0;
+    h->msgh_size = sizeof(mach_msg_header_t) + sizeof(fs_write_req_t) + ni + len;
+    h->msgh_remote_port = FS_PORT;
+    h->msgh_local_port = SHELL_PORT;
+    h->msgh_id = FS_MSG_WRITE;
+    h->msgh_reserved = 0;
+    mach_msg_send(g_wreq, h->msgh_size);
+}
+
+/* 阻塞等待写类操作的应答（忽略期间的键盘字符），打印结果。 */
+static void fs_wait_status(uint32_t expect_id)
+{
+    for (;;) {
+        if (mach_msg_recv(g_rx, sizeof(g_rx), SHELL_PORT) != MACH_MSG_SUCCESS) {
+            return;
+        }
+        mach_msg_header_t *h = (mach_msg_header_t *)g_rx;
+        if (h->msgh_id == MSG_ID_KEYCHAR) {
+            continue;
+        }
+        if (h->msgh_id != expect_id) {
+            continue;
+        }
+        fs_resp_t *fr = (fs_resp_t *)(g_rx + sizeof(*h));
+        if (fr->status == FS_OK) {
+            u_print("ok\n");
+        } else if (fr->status == FS_ERR_NOENT) {
+            u_print("fs: no such file\n");
+        } else {
+            u_print("fs: I/O error\n");
+        }
+        return;
+    }
+}
+
 static void run_command(char *line)
 {
     /* 去前导空格 */
@@ -117,6 +167,12 @@ static void run_command(char *line)
                 "  ls            - list FAT32 root directory (via FS_SERVER)\n"
                 "  cat <FILE>    - print file content (8.3 name, e.g. README.TXT)\n"
                 "  reboot        - reboot the machine\n"
+                "  mkfile <FILE> - create empty file\n"
+                "  mkdir <DIR>   - create directory\n"
+                "  write <FILE> <TEXT> - write TEXT to FILE at offset 0\n"
+                "  rm <FILE>     - delete file or empty directory\n"
+                "  rename <OLD> <NEW> - rename file/directory\n"
+                "  truncate <FILE> <SIZE> - set file size\n"
                 "  poweroff      - ACPI S5 soft power off\n");
     } else if (u_strcmp(line, "ls") == 0) {
         fs_request(FS_MSG_LIST, 0);
@@ -178,6 +234,86 @@ static void run_command(char *line)
                 u_print(" exited (code=");
                 u_print(u_utoa_s(rc, db, sizeof(db)));
                 u_print(")\n");
+            }
+        }
+    } else if (u_strcmp(line, "mkfile") == 0) {
+        if (!*arg) { u_print("usage: mkfile <FILE>\n"); }
+        else { upcase(arg); fs_request(FS_MSG_CREATE, arg); fs_wait_status(FS_MSG_CREATE); }
+    } else if (u_strcmp(line, "mkdir") == 0) {
+        if (!*arg) { u_print("usage: mkdir <DIR>\n"); }
+        else { upcase(arg); fs_request(FS_MSG_MKDIR, arg); fs_wait_status(FS_MSG_MKDIR); }
+    } else if (u_strcmp(line, "write") == 0) {
+        if (!*arg) { u_print("usage: write <FILE> <TEXT>\n"); }
+        else {
+            char *f = arg, *sp = arg;
+            while (*sp && *sp != ' ') sp++;
+            if (!*sp) { u_print("usage: write <FILE> <TEXT>\n"); }
+            else {
+                *sp++ = 0; while (*sp == ' ') sp++;
+                upcase(f);
+                uint32_t len = (uint32_t)u_strlen(sp);
+                if (len > FS_WRITE_MAX) len = FS_WRITE_MAX;
+                fs_request_write(f, sp, len, 0);
+                fs_wait_status(FS_MSG_WRITE);
+            }
+        }
+    } else if (u_strcmp(line, "rm") == 0) {
+        if (!*arg) { u_print("usage: rm <FILE>\n"); }
+        else { upcase(arg); fs_request(FS_MSG_UNLINK, arg); fs_wait_status(FS_MSG_UNLINK); }
+    } else if (u_strcmp(line, "rename") == 0) {
+        if (!*arg) { u_print("usage: rename <OLD> <NEW>\n"); }
+        else {
+            char *o = arg, *sp = arg;
+            while (*sp && *sp != ' ') sp++;
+            if (!*sp) { u_print("usage: rename <OLD> <NEW>\n"); }
+            else {
+                *sp++ = 0; while (*sp == ' ') sp++;
+                upcase(o); upcase(sp);
+                fs_rename_req_t *rr = (fs_rename_req_t *)g_wreq;
+                mach_msg_header_t *h = (mach_msg_header_t *)g_wreq;
+                uint32_t i = 0;
+                while (o[i] && i < 63) { rr->old_name[i] = o[i]; i++; }
+                rr->old_name[i] = 0;
+                i = 0;
+                while (sp[i] && i < 63) { rr->new_name[i] = sp[i]; i++; }
+                rr->new_name[i] = 0;
+                h->msgh_bits = 0;
+                h->msgh_size = sizeof(mach_msg_header_t) + sizeof(fs_rename_req_t);
+                h->msgh_remote_port = FS_PORT;
+                h->msgh_local_port = SHELL_PORT;
+                h->msgh_id = FS_MSG_RENAME;
+                h->msgh_reserved = 0;
+                mach_msg_send(g_wreq, h->msgh_size);
+                fs_wait_status(FS_MSG_RENAME);
+            }
+        }
+    } else if (u_strcmp(line, "truncate") == 0) {
+        if (!*arg) { u_print("usage: truncate <FILE> <SIZE>\n"); }
+        else {
+            char *f = arg, *sp = arg;
+            while (*sp && *sp != ' ') sp++;
+            if (!*sp) { u_print("usage: truncate <FILE> <SIZE>\n"); }
+            else {
+                *sp++ = 0; while (*sp == ' ') sp++;
+                upcase(f);
+                uint32_t size = 0;
+                for (uint32_t i = 0; sp[i] >= '0' && sp[i] <= '9'; i++)
+                    size = size * 10 + (uint32_t)(sp[i] - '0');
+                fs_trunc_req_t *tr = (fs_trunc_req_t *)(g_wreq + sizeof(mach_msg_header_t));
+                tr->size = size;
+                char *nm = (char *)(g_wreq + sizeof(mach_msg_header_t) + sizeof(fs_trunc_req_t));
+                uint32_t ni = 0;
+                while (f[ni] && ni < 63) { nm[ni] = f[ni]; ni++; }
+                nm[ni++] = 0;
+                mach_msg_header_t *h = (mach_msg_header_t *)g_wreq;
+                h->msgh_bits = 0;
+                h->msgh_size = sizeof(mach_msg_header_t) + sizeof(fs_trunc_req_t) + ni;
+                h->msgh_remote_port = FS_PORT;
+                h->msgh_local_port = SHELL_PORT;
+                h->msgh_id = FS_MSG_TRUNCATE;
+                h->msgh_reserved = 0;
+                mach_msg_send(g_wreq, h->msgh_size);
+                fs_wait_status(FS_MSG_TRUNCATE);
             }
         }
     } else {

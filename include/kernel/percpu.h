@@ -37,6 +37,7 @@ typedef struct percpu {
     struct task *rq_tail;           /* 本 CPU 运行队列尾 */
     uint32_t    rq_count;           /* 本 CPU 运行队列任务数（含 idle） */
     volatile uint32_t in_idle;      /* 本 CPU 是否处于 hlt 空闲（供 IPI 唤醒参考） */
+    uint64_t user_switches;         /* 本 CPU 切换到 Ring3 任务的次数（负载均衡观测） */
 } percpu_t;
 
 extern percpu_t g_percpu[MAX_CPUS];

@@ -131,7 +131,7 @@ static task_t *pick_next(void)
     task_t *cur = g_percpu[cpu_index()].current_task;
     task_t *t = g_percpu[cpu_index()].rq_head;
     for (uint32_t i = 0; i < g_percpu[cpu_index()].rq_count; i++) {
-        if (t && t != cur && t->alive &&
+        if (t && t != cur && !t->is_idle && t->alive &&
             (t->state == READY || t->state == RUNNING)) {
             return t;
         }
@@ -386,6 +386,33 @@ task_t *task_lookup(uint64_t pid)
     return NULL;
 }
 
+/* P0-R1 负载均衡：work-stealing。调用方须持 g_sched_lock。
+ * 扫描其它 CPU 的运行队列，摘取一个「就绪(READY)、非 idle、非该 CPU 当前运行
+ * 任务」的任务迁移到本 CPU（更新 t->cpu 以便后续 IPI 唤醒定位正确）。
+ * 返回 NULL 表示无任务可偷（其它 CPU 也仅剩 idle / 正在运行）。 */
+static task_t *steal_task(uint32_t self)
+{
+    for (uint32_t c = 0; c < MAX_CPUS; c++) {
+        if (c == self) {
+            continue;
+        }
+        if (g_percpu[c].rq_count <= 1) {
+            continue;   /* 该 CPU 仅含 idle，无可偷任务 */
+        }
+        task_t *t = g_percpu[c].rq_head;
+        while (t) {
+            if (t->alive && !t->is_idle && t->state == READY &&
+                t != g_percpu[c].current_task) {
+                rq_unlink_cpu(t, c);   /* 从源 CPU 队列摘链（rq_count--） */
+                t->cpu = self;         /* 迁移到本 CPU */
+                return t;
+            }
+            t = t->next;
+        }
+    }
+    return NULL;
+}
+
 /* 执行一次调度（调用时须处于关中断状态，或本函数内部会自行关中断）。
  * 在持有 g_sched_lock 期间完成“挑选 + 摘链 + 状态/CR3/栈切换”，随后释锁再做
  * context_switch（绝不在持锁时切栈，避免锁被新任务栈“带走”造成其它核死等）。 */
@@ -406,6 +433,15 @@ void schedule(void)
 
     task_t *next = pick_next();
     if (next == cur) {
+        /* P0-R1 负载均衡：本 CPU 运行队列无可运行任务时，从其它 CPU 窃取一个
+         * 就绪任务，避免 AP 在多任务场景下空转（work-stealing）。 */
+        task_t *stolen = steal_task(cpu);
+        if (stolen) {
+            rq_push_cpu(stolen, cpu);
+            next = stolen;
+        }
+    }
+    if (next == cur) {
         cur->ticks_remaining = TIME_SLICE_TICKS;
         spin_unlock_irqrestore(&g_sched_lock, f);
         return;
@@ -425,6 +461,9 @@ void schedule(void)
     }
     next->state = RUNNING;
     next->ticks_remaining = TIME_SLICE_TICKS;
+    if (next->is_user && next != cur) {
+        g_percpu[cpu].user_switches++;   /* 负载均衡观测：本核跑了一次 Ring3 任务 */
+    }
     g_percpu[cpu].current_task = next;
     g_syscall_kstack[cpu] = next->kstack_top;
     g_scratch[cpu]        = &next->scr_rip;
@@ -443,6 +482,18 @@ void schedule(void)
     reap_dead();
 }
 
+/* P0-R1 负载均衡观测：打印每 CPU 在线状态、运行队列长度、Ring3 任务切换计数。 */
+void sched_balance_report(void)
+{
+    kprintf("[sched] load balance: %u CPUs\n", (unsigned)smp_online_count());
+    for (uint32_t c = 0; c < smp_online_count(); c++) {
+        kprintf("  cpu%u: rq=%u user_switches=%llu%s\n",
+                (unsigned)c, (unsigned)g_percpu[c].rq_count,
+                (unsigned long long)g_percpu[c].user_switches,
+                g_percpu[c].online ? "" : " (offline)");
+    }
+}
+
 /* 由每 CPU LAPIC 定时器（IRQ0）调用 */
 void sched_tick(registers_t *r)
 {
@@ -450,6 +501,19 @@ void sched_tick(registers_t *r)
     /* P0-R3：BSP 每 tick（10ms）探测 COM2 是否有 GDB 数据到达；有则触发
      * int3 陷入 gdbstub 会话（函数内部自限 cpu0 + 未附着时才触发）。 */
     gdbstub_poll();
+    /* P0-R1：启动约 3 秒后（仅 BSP）打印一次负载均衡快照，验证 AP 也跑了
+     * Ring3 任务（user_switches 非 0），确认对称调度真正生效。 */
+    {
+        static uint64_t s_ticks = 0;
+        static bool s_reported = false;
+        if (cpu_index() == 0) {
+            s_ticks++;
+            if (!s_reported && s_ticks >= 300) {
+                s_reported = true;
+                sched_balance_report();
+            }
+        }
+    }
     task_t *cur = cpu_local()->current_task;
     if (!cur) {
         return;

@@ -151,6 +151,9 @@ uint32_t smp_init(void)
         PHYS_TO_VIRT(AP_TRAMP_PHYS + (uint64_t)(ap_mb_idx - ap_tramp_start));
 
     uint8_t bsp = lapic_id();
+    /* BSP 自身永远在线：AP 在 ap_main 中置位各自 .online，BSP 此前遗漏，
+     * 这里补置，保证 g_percpu[0].online 语义正确（IPI/TLB 目标判定与诊断一致）。 */
+    g_percpu[0].online = 1;
     uint32_t idx = 1;
 
     for (uint32_t i = 0; i < g_acpi.lapic_count && idx < MAX_CPUS; i++) {

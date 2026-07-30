@@ -3,16 +3,20 @@
  * -----------------------------------------------------------------------------
  * SMP：AP 启动、IPI（处理器间中断）、TLB shootdown（P0-3）。
  *
- * 当前阶段模型（诚实声明）：
+ * 对称多核模型（已实现并验证）：
  *   - 全部 AP 经 INIT-SIPI-SIPI 唤醒进入 64 位长模式，安装各自的
- *     GDT/TSS/IDT/LAPIC/percpu 后进入 idle(hlt) 循环，响应 IPI；
- *   - 任务调度仍由 BSP 独占（LAPIC 定时器仅 BSP 开启），把调度域扩展
- *     到 AP（per-CPU runqueue + swapgs 化 syscall 栈）随后续里程碑推进；
- *   - 因此本阶段锁体系保护的是「BSP 任务流 vs AP 的 IPI/诊断路径」，
- *     以及为多核调度提前铺设的正确性地基。
+ *     GDT/TSS/IDT/LAPIC/percpu，并在各自 CPU 上使能安全控制位
+ *     (CR4.SMAP/SMEP/UMIP + EFER.NXE，见 security.c cpu_apply_security_features)，
+ *     随后启动 LAPIC 周期定时器(100Hz, IRQ0)→sched_tick→schedule，
+ *     因此 AP 也参与 RR 调度、可运行 Ring3 用户任务；
+ *   - 调度器为对称 SMP RR（per-CPU runqueue + 全局 g_sched_lock），
+ *     当某 CPU 运行队列无可运行任务时通过 work-stealing 从其它 CPU
+ *     窃取就绪任务（见 sched.c steal_task），实现负载均衡；
+ *   - 任务创建时按 smp_online_count() 静态 RR 绑定初始 CPU，后续由窃取迁移。
  *
  * IPI 向量分配（避开 0x20..0x2F 的 IRQ 与 0xFF 伪中断）：
- *   0xF0 IPI_RESCHED   —— 重调度请求（当前为骨架：AP 无 runqueue）
+ *   0xF0 IPI_RESCHED   —— 重调度请求（唤醒目标 CPU 的 idle 循环或触发再调度；
+ *                          亦用于发布/唤醒任务时通知可能的空闲 AP 来窃取工作）
  *   0xF1 IPI_TLB_FLUSH —— TLB shootdown：收到后整体重载 CR3
  *   0xF2 IPI_HALT      —— panic 停机：收到后 cli+hlt 永久停车
  */

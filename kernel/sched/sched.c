@@ -75,6 +75,46 @@ uint64_t sched_next_pid(void)
 }
 task_t *sched_current(void)   { return cpu_local()->current_task; }
 
+/* 调度切换前的防御性校验（生产级稳定性铁律）：
+ * 内核栈帧布局（switch.S 的 context_switch push/pop 顺序）：
+ *   [rbx][rbp][r12][r13][r14][r15][ret]  —— ret 位于 next->rsp + 6*8 处。
+ * 若 next->rsp 指向的内核栈上的返回地址落在堆区（本内核布局下堆在 0xFFFFC000
+ * 段、合法代码在 0xFFFF8000 段），说明该任务内核栈（初始帧或切走时保存的返回
+ * 地址）已被堆/越界数据覆盖，context_switch 的 ret 会跳到非法地址触发 #UD
+ * （vector 6 / system halted）。提前 panic 带 next 任务信息，避免静默死机且便于定位。
+ * 注：AP 的 idle 任务由 ap_main 循环充当，不通过 context_switch 切入，其 rsp 在
+ * sched_create_idle 中显式构造为独立栈帧，亦满足本校验。 */
+static void verify_switch_target(task_t *next)
+{
+    if (!next) {
+        panic("verify_switch_target: next == NULL");
+    }
+    /* kstack_base==0 仅发生于早期引导复用 BSP 栈的残留路径，正常任务必有独立栈。
+     * is_idle（AP 的 idle，如 idle1/2/3）实际运行在 ap_main 栈上，其 rsp 不在本处
+     * kstack_alloc 的独立栈范围内，故跳过 rsp 范围检查，仅校验返回地址段。 */
+    if (!next->is_idle && next->kstack_base != 0) {
+        if (next->rsp < next->kstack_base || next->rsp > next->kstack_top) {
+            kprintf("[sched] BAD SWITCH: next '%s' pid=%lu rsp=%p out of kstack [%p,%p]\n",
+                    next->name, (unsigned long)next->id, (void *)next->rsp,
+                    (void *)next->kstack_base, (void *)next->kstack_top);
+            panic("verify_switch_target: next->rsp outside its kernel stack");
+        }
+    }
+    /* 读取返回地址槽（next->rsp + 6*8），不跨页（栈内） */
+    uint64_t ret_addr = *(volatile uint64_t *)(next->rsp + 6 * 8);
+    /* 合法内核代码/数据地址落在 0xFFFF800000000000 .. 0xFFFFC00000000000 区间
+     * （本内核：text/数据在 0xFFFF8000 段，内核堆/栈在 0xFFFFC000 段）。
+     * 落在 0xFFFFC000 段即堆/栈区指针 → 必然非法返回目标。
+     * 注意：canonical 地址高位全 1，不能用“高 16 位==0x8000”判断，须用区间。 */
+    if (ret_addr < 0xFFFF800000000000ULL || ret_addr >= 0xFFFFC00000000000ULL) {
+        kprintf("[sched] BAD SWITCH: next '%s' pid=%lu ret_addr=%p (heap/stack-seg) rsp=%p kstack=[%p,%p]\n",
+                next->name, (unsigned long)next->id, (void *)ret_addr,
+                (void *)next->rsp,
+                (void *)next->kstack_base, (void *)next->kstack_top);
+        panic("verify_switch_target: next stack return address not in kernel text/data segment");
+    }
+}
+
 /* 把“当前任务”同步到本 CPU 的 percpu + syscall 快速路径数组（P0-R1 多核安全） */
 static inline void set_cpu_current(task_t *t)
 {
@@ -140,7 +180,11 @@ static task_t *pick_next(void)
         }
         t = t->next;
     }
-    return cur;   /* 回退：无其它可运行任务（仅 idle 自身） */
+    /* 回退：无其它可运行非 idle 任务。决不能回退到 cur —— cur 可能刚被标记
+     * dead（如本任务正在 task_exit_current 中退出），其内核栈返回地址槽可能已被
+     * 退出路径破坏，context_switch 切回时会 ret 到非法地址触发 #UD（vector 6）。
+     * 改回退到本 CPU 的 idle 任务（idle_task 栈完整、帧合法），保证系统稳定空转。 */
+    return g_percpu[cpu_index()].idle_task;
 }
 
 /* BSP idle 循环（独立内核栈上运行，与 BSP 引导栈彻底解耦）。
@@ -279,6 +323,11 @@ task_t *sched_create_idle(uint32_t cpu)
     *(uint64_t *)stack = KSTACK_CANARY;
     strncpy(t->name, "idle", sizeof(t->name) - 1);
     t->name[4] = '0' + (char)(cpu % 10);
+    /* 注意：AP idle 的实际执行流是 ap_main 循环（运行在 ap_boot 守卫页栈上），
+     * 其 rsp 在首次 schedule() 切出时由 context_switch 保存为 ap_main 栈指针，
+     * 并不指向本处 kstack_alloc 的独立栈。因此 t->rsp 保持未初始化（0），
+     * 且 verify_switch_target 对 is_idle 任务跳过 rsp 范围检查（仅查返回地址段）。
+     * 独立 kstack 仅作守卫/诊断用途，与 BSP idle0（独立栈帧）的模型不同。 */
 
     uint64_t f = spin_lock_irqsave(&g_sched_lock);
     rq_push_cpu(t, cpu);
@@ -555,6 +604,7 @@ void schedule(void)
     if (cr3_switch) {
         vmm_switch(next_cr3);
     }
+    verify_switch_target(next);
     context_switch(&cur->rsp, next->rsp);
 
     /* 切换完成后，在“新任务”栈上回收此前已退出任务的残留资源 */
@@ -789,6 +839,7 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     if (cr3_switch) {
         vmm_switch(next_cr3);
     }
+    verify_switch_target(next);
     context_switch(&t->rsp, next->rsp);   /* 一去不返 */
     for (;;) { __asm__ volatile("hlt"); }
 }

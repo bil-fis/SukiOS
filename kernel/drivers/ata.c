@@ -175,7 +175,7 @@ static void ata_select_lba(uint64_t lba, uint8_t count, bool use48)
     }
 }
 
-bool ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
+bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
 {
     if (!g_disk_present || count == 0) {
         return false;
@@ -206,41 +206,53 @@ bool ata_read_sectors(uint32_t lba, uint8_t count, void *buf)
     return true;
 }
 
-/* PIO 写扇区（LBA28）：逐扇区等待 DRQ 后以 outw 写入 256 字，
- * 全部写完后发 FLUSH CACHE (0xE7) 确保数据落盘（掉电安全）。 */
-bool ata_write_sectors(uint32_t lba, uint8_t count, const void *buf)
+/* PIO 写扇区（LBA28/48）：逐扇区等待 DRQ 后以 outw 写入 256 字，
+ * 全部写完后发 FLUSH CACHE (0xE7) 确保数据落盘（掉电安全）。
+ * P0-生产修复：ATA 命令偶发超时/介质瞬时错误，单次失败直接丢数据不可接受，
+ * 这里在命令级重试（含 FLUSH），最多 3 次；仍失败才返回 false 由上层回传错误。*/
+bool ata_write_sectors(uint64_t lba, uint8_t count, const void *buf)
 {
     if (!g_disk_present || count == 0) {
         return false;
     }
-    if (lba + count > g_total_sectors) {        /* 越界写保护 */
+    if ((uint64_t)lba + count > g_total_sectors) {        /* 越界写保护 */
         return false;
     }
-    if (!ata_wait_not_busy()) {
-        return false;
-    }
-
-    bool use48 = g_lba48 && ((uint64_t)lba + count) > 0x0FFFFFFFULL;
-    ata_select_lba(lba, count, use48);
-    outb(ATA_CMD, use48 ? 0x34 : CMD_WRITE_SECTORS);  /* WRITE SECTORS EXT */
-
     const uint16_t *in = (const uint16_t *)buf;
-    for (uint8_t s = 0; s < count; s++) {
-        if (!ata_wait_drq()) {
-            return false;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (!ata_wait_not_busy()) {
+            continue;
         }
-        for (int i = 0; i < 256; i++) {
-            outw(ATA_DATA, *in++);
-        }
-        ata_delay400();
-    }
+        bool use48 = g_lba48 && ((uint64_t)lba + count) > 0x0FFFFFFFULL;
+        ata_select_lba(lba, count, use48);
+        outb(ATA_CMD, use48 ? 0x34 : CMD_WRITE_SECTORS);  /* WRITE SECTORS EXT */
 
-    /* 刷写磁盘写缓存 */
-    outb(ATA_CMD, CMD_FLUSH_CACHE);
-    if (!ata_wait_not_busy()) {
-        return false;
+        const uint16_t *p = in;
+        bool ok = true;
+        for (uint8_t s = 0; s < count; s++) {
+            if (!ata_wait_drq()) {
+                ok = false;
+                break;
+            }
+            for (int i = 0; i < 256; i++) {
+                outw(ATA_DATA, *p++);
+            }
+            ata_delay400();
+        }
+        if (!ok) {
+            continue;   /* 重试 */
+        }
+        /* 刷写磁盘写缓存 */
+        outb(ATA_CMD, CMD_FLUSH_CACHE);
+        if (!ata_wait_not_busy()) {
+            continue;
+        }
+        if (inb(ATA_STATUS) & ST_ERR) {
+            continue;   /* 写失败，重试 */
+        }
+        return true;
     }
-    return !(inb(ATA_STATUS) & ST_ERR);
+    return false;
 }
 
 uint64_t ata_total_sectors(void)
@@ -256,14 +268,14 @@ static bool blk_read(uint64_t lba, uint8_t count, void *buf)
     if (ahci_present()) {
         return ahci_read_sectors(lba, count, buf);
     }
-    return ata_read_sectors((uint32_t)lba, count, buf);
+    return ata_read_sectors(lba, count, buf);
 }
 static bool blk_write(uint64_t lba, uint8_t count, const void *buf)
 {
     if (ahci_present()) {
         return ahci_write_sectors(lba, count, buf);
     }
-    return ata_write_sectors((uint32_t)lba, count, buf);
+    return ata_write_sectors(lba, count, buf);
 }
 
 /* ---- DISK_PORT 内核服务任务 ----

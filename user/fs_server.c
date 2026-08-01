@@ -72,6 +72,13 @@ static uint32_t g_sec_per_clus, g_fat_begin, g_data_begin, g_root_clus;
 /* M13/M14 修复：卷总簇数，用于校验簇号落于数据区有效范围，并作为簇链遍历
  * 步数上限的依据，防止损坏文件系统的环簇链导致无限循环/读飞。 */
 static uint32_t g_total_clusters = 0;
+/* P0-生产修复：有效簇号上限（= 2 + g_total_clusters）。fat_next/fat_set/
+ * fat_alloc_cluster 用以判定簇号合法范围，取代散落的 0x0FFFFFF7 常量比较，
+ * 对大卷也不会误判。 */
+static uint32_t g_max_cluster = 0;
+/* P0-生产修复：卷末扇区 LBA（g_total_sectors-1）。read_file_at 预读边界
+ * 不得超过它，否则内核 ata_read_sectors 越界保护会拒绝请求导致读尾块失败。 */
+static uint32_t g_max_lba = 0xFFFFFFFFu;
 
 /* P1-2 写路径：FAT 副本数与每 FAT 扇区数（mount 时采集），用于写回全部
  * FAT 副本；g_fat_scan 为下次簇分配扫描起点（加速连续分配）。 */
@@ -94,7 +101,15 @@ static bool fat32_mount(void)
     if (!disk_read(0, 1, bpb)) {
         return false;
     }
+    /* P0-生产修复：基础 BPB 结构校验，拒绝挂载损坏/非 FAT32 镜像，
+     * 避免后续 g_fat_size/g_total_clusters 算出 0 或越界值导致读飞。 */
+    if (bpb[510] != 0x55 || bpb[511] != 0xAA) {
+        u_print("[fs] mount failed: bad boot signature\n");
+        return false;
+    }
     uint16_t byts_per_sec = rd16(bpb + 11);
+    uint16_t fatsz16      = rd16(bpb + 22);   /* FAT32 必须为 0 */
+    uint16_t root_ent     = rd16(bpb + 17);   /* FAT32 必须为 0 */
     g_sec_per_clus        = bpb[13];
     uint16_t rsvd         = rd16(bpb + 14);
     uint8_t  nfats        = bpb[16];
@@ -103,7 +118,11 @@ static bool fat32_mount(void)
     g_nfats               = nfats ? nfats : 1;   /* P1-2：写回全部 FAT 副本 */
     g_fat_size            = fatsz32;
 
-    if (byts_per_sec != SECTOR || g_sec_per_clus == 0 || fatsz32 == 0) {
+    /* FAT32 判定：每扇区字节数须为 512、每簇扇区>0、FAT 大小非 0、
+     * 16 位 FAT 大小与根目录项计数必须为 0、根目录首簇>=2。 */
+    if (byts_per_sec != SECTOR || g_sec_per_clus == 0 || fatsz32 == 0 ||
+        fatsz16 != 0 || root_ent != 0 || g_root_clus < 2) {
+        u_print("[fs] mount failed: not a valid FAT32 volume\n");
         return false;
     }
     g_fat_begin  = rsvd;
@@ -119,6 +138,10 @@ static bool fat32_mount(void)
     } else {
         g_total_clusters = 0;
     }
+    /* P0-生产修复：记录卷末扇区 LBA，供 read_file_at 预读边界裁剪。 */
+    g_max_lba = tot_sec == 0 ? 0xFFFFFFFFu : (tot_sec - 1);
+    /* 有效簇号上限（含环链遍历/分配判定用） */
+    g_max_cluster = 2 + g_total_clusters;
 
     char n[24];
     u_print("[fs] FAT32 mounted: spc=");
@@ -129,7 +152,13 @@ static bool fat32_mount(void)
     u_print(u_utoa_s(g_data_begin, n, sizeof(n)));
     u_print(" root_clus=");
     u_print(u_utoa_s(g_root_clus, n, sizeof(n)));
+    u_print(" clusters=");
+    u_print(u_utoa_s(g_total_clusters, n, sizeof(n)));
     u_print("\n");
+    if (g_total_clusters == 0 || g_total_clusters >= 0x0FFFFFF7) {
+        u_print("[fs] mount failed: implausible cluster count\n");
+        return false;
+    }
     return true;
 }
 
@@ -148,6 +177,9 @@ static bool     g_fat_cache_ok = false;
 
 static uint32_t fat_next(uint32_t clus)
 {
+    if (clus < 2 || clus >= g_max_cluster) {
+        return 0;   /* 非法簇号，按 EOF 处理 */
+    }
     uint32_t lba = g_fat_begin + (clus * 4) / SECTOR;
     if (!g_fat_cache_ok || lba != g_fat_cache_lba) {
         if (!disk_read(lba, 1, g_fat_cache)) {
@@ -156,7 +188,16 @@ static uint32_t fat_next(uint32_t clus)
         g_fat_cache_lba = lba;
         g_fat_cache_ok  = true;
     }
-    return rd32(g_fat_cache + (clus * 4) % SECTOR) & 0x0FFFFFFF;
+    uint32_t v = rd32(g_fat_cache + (clus * 4) % SECTOR) & 0x0FFFFFFF;
+    /* P0-生产修复：坏簇(0x0FFFFFF7)与 EOF(>=0x0FFFFFF8)统一视为链结束。
+     * 之前直接返回 v，调用方以 clus<0x0FFFFFF8 续链，会把坏簇 0x0FFFFFF7
+     * 当有效簇继续 walk，导致 clus_to_lba 算出越界 LBA、内核读盘失败。
+     * 这里把 >=0x0FFFFFF7 归一成 EOF 哨兵 0x0FFFFFFF，空闲簇(v==0)保持 0，
+     * 既让 walk 正确终止，又不影响 fat_alloc_cluster 的"==0 判空闲"语义。 */
+    if (v >= 0x0FFFFFF7) {
+        return 0x0FFFFFFF;
+    }
+    return v;
 }
 
 /* 目录项 -> "NAME.EXT"（返回长度） */
@@ -574,6 +615,22 @@ static uint32_t read_file_at(uint32_t first_clus, uint32_t size,
         }
         uint32_t run_secs = run * g_sec_per_clus;
         uint32_t base_lba = clus_to_lba(clus);
+        /* P0-生产修复：预读窗口不得超过卷末扇区 LBA，否则内核
+         * ata_read_sectors 的越界保护会拒绝请求、read_file_at 提前返回，
+         * 导致大文件（如 MP3）接近卷尾的尾块读不到。裁剪到合法区间。 */
+        if (base_lba + run_secs - 1 > g_max_lba) {
+            if (base_lba > g_max_lba) {
+                break;                      /* 整个 run 越界：停止读取 */
+            }
+            run_secs = (uint32_t)(g_max_lba - base_lba) + 1;
+            /* 重新计算本 run 实际覆盖的连续簇数（向下取整到整簇） */
+            run = run_secs / g_sec_per_clus;
+            if (run == 0) {
+                run_secs = g_sec_per_clus;
+                run = 1;
+            }
+            run_secs = run * g_sec_per_clus;
+        }
         uint32_t avail    = run_secs * SECTOR - within;   /* run 内可取字节 */
         uint32_t n = remain < avail ? remain : avail;
 
@@ -655,7 +712,14 @@ static bool disk_write(uint64_t lba, uint8_t count, const void *buf)
         return false;
     }
     disk_write_resp_t *rr = (disk_write_resp_t *)(g_diskbuf + sizeof(mach_msg_header_t));
-    return rr->status == 0;
+    bool ok = (rr->status == 0);
+    if (ok) {
+        /* P0-生产修复：写盘成功后立即使顺序读预读缓存失效，避免同一会话内
+         * "读->写->再读同一区间"命中写前的陈旧缓存导致数据不一致。FAT 读
+         * 缓存由 fat_set 单独失效，此处只针对数据区预读缓存。 */
+        g_blk_lba = 0;
+    }
+    return ok;
 }
 
 /* ---- FAT 写回 ---- */
@@ -1040,6 +1104,17 @@ static void dir_lookup(uint32_t start_clus, const char *want, dir_loc_t *out)
                 }
                 char name[LFN_CAP];
                 if (lfn_pull(name) == 0) fmt_83(e, name);
+                /* P0-生产修复：若累积了 LFN，校验其与 8.3 短名的校验和一致。
+                 * 损坏/不匹配的 LFN（如删除残留导致误拼接）一律回退 8.3 短名，
+                 * 避免用错误长名匹配，杜绝"改名/误删"类数据损坏。 */
+                if (nlfn > 0) {
+                    uint8_t sum, stored;
+                    lfn_checksum(e, &sum);
+                    stored = sec[lfn_slots[0].off + 13];
+                    if (sum != stored) {
+                        fmt_83(e, name);
+                    }
+                }
                 lfn_reset();
                 if (ci_strcmp(name, want) == 0) {
                     out->found = true;
@@ -1467,6 +1542,37 @@ static void fs_selftest(void)
     }
     u_print(ok ? "[fs] write-path self-test: ALL PASS\n"
                 : "[fs] write-path self-test: FAIL\n");
+
+    /* P0-生产修复验证：大文件（MOONHALO.MP3，接近卷尾）整读 + 尾块读，
+     * 确认 read_file_at 预读越界裁剪后尾块不丢（此前接近卷尾的流式读
+     * 会因内核 ata_read_sectors 越界保护而读不到尾块）。 */
+    {
+        path_cb_t mp3; resolve_path("MOONHALO.MP3", &mp3);
+        if (!mp3.found) {
+            u_print("[fs]   bigfile: SKIP (no MOONHALO.MP3)\n");
+        } else {
+            uint32_t total = 0, off = 0;
+            bool big_ok = true;
+            static uint8_t blk[FS_DATA_MAX];
+            while (off < mp3.size) {
+                uint32_t want = mp3.size - off;
+                if (want > FS_DATA_MAX) want = FS_DATA_MAX;
+                uint32_t got = read_file_at(mp3.clus, mp3.size, off,
+                                            (char *)blk, want);
+                if (got != want) { big_ok = false; break; }
+                off    += got;
+                total  += got;
+            }
+            /* 尾块读：size-100 处应返回 100 字节（裁剪后不越界） */
+            uint32_t tail = 100;
+            uint32_t tg = read_file_at(mp3.clus, mp3.size, mp3.size - tail,
+                                       (char *)blk, tail);
+            if (total != mp3.size || tg != tail) big_ok = false;
+            u_print(big_ok ? "[fs]   bigfile whole-read PASS\n"
+                           : "[fs]   bigfile whole-read FAIL\n");
+            if (!big_ok) ok = false;
+        }
+    }
 }
 
 /* ---- 服务循环 ---- */

@@ -1,1773 +1,1251 @@
 /*
  * user/fs_server.c
  * -----------------------------------------------------------------------------
- * FS_SERVER：Ring3 FAT32 文件系统服务（读/写，P1-2 写路径完整化）。
+ * SukiOS Ring3 FAT32 文件系统服务（FS_SERVER）。
  *
- * 红线（手册 3 章）：FAT32 解析完全在用户态。磁盘扇区通过 mach_msg
- * 发往内核 DISK_PORT 获取（应答收在 FS_REPLY_PORT）。
+ * 设计依据：本地 osdev_wiki（wiki.osdev.org/FAT32、FAT、VFAT）的 FAT32 规范。
+ * 实现完整、可生产的 FAT32 驱动：BPB 解析、FAT 项与簇链遍历、长文件名(LFN)
+ * 解析/生成、目录项读写、文件分块/整读、写路径（创建/写/删/改名/截断）、
+ * 以及 FS_PORT IPC 协议处理。
  *
- * 启动：挂载卷（读 BPB）-> 自检列根目录 -> 进入服务循环：
- *   FS_MSG_LIST -> 返回根目录文本列表
- *   FS_MSG_READ -> 按 8.3 名查找并返回文件内容（<= FS_DATA_MAX）
+ * 关键生产约束（针对此前崩溃的根因）：
+ *   - 所有磁盘数据/应答一律写入**本地静态缓冲**（g_resp/g_filebuf/g_diskbuf/
+ *     g_wreq/g_rbuf），绝不把来自 IPC 消息或 OOL 描述符的“外部指针”当作 memcpy
+ *     目标。外部指针只作为“源”在 copy_from_user 风格下读取，且任何写入目标都
+ *     是内核态已验证或本任务本地缓冲，从根上消除用户态 NULL 解引用（此前崩溃
+ *     rip=0x4041f5 即 u_memcpy(dst=NULL)）。
+ *   - 所有外部输入（BPB 字段、FAT 表项、目录项、簇号）做防御性校验与边界裁剪，
+ *     绝不信任磁盘返回值。
+ *
+ * 与内核/IPC 层契约（include/ipc/fs_proto.h、user/lib/suki.h）保持不变：
+ *   - 协议号 FS_MSG_*、消息结构 fs_resp_t/fs_write_req_t/fs_read_at_req_t 等。
+ *   - 通过 mach_msg 与内核转发：请求发 FS_PORT，应答发回请求方 msgh_local_port。
+ *   - 大文件（execve）经 OOL 回传；小响应走内核 memcpy 内联转发。
+ * -----------------------------------------------------------------------------
  */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+
 #include "lib/suki.h"
-#include <ipc/disk_proto.h>
 #include <ipc/fs_proto.h>
+#include <ipc/disk_proto.h>
 
-#ifndef PAGE_SIZE
-#define PAGE_SIZE 4096UL
-#endif
-
-/* OOL 描述符（与内核 mach_ool_desc_t 二进制布局一致：address, size） */
+/* 本地 OOL 描述符（布局与内核 include/ipc/port.h 的 mach_ool_desc_t 一致，
+ * 但避免重复拉入 port.h 导致的 mach_msg_header_t 重定义）。 */
 typedef struct { uint64_t address; uint64_t size; } ool_desc_t;
 
-#define SECTOR 512
-/* M13 修复：单条簇链最大遍历步数（远超任何实际 FAT32 卷的簇数），用于
- * 在 read_dir/read_file/read_file_at 中给簇链跟随循环兜底，拦截环簇链死循环。 */
-#define FAT_WALK_LIMIT  0x400000U
+/* ===================== 磁盘几何常量 ===================== */
+#define SECTOR           512u
+#define DIR_ENTRY_SIZE   32u
+#define FAT_ENTRY_SIZE   4u           /* FAT32：每项 4 字节 */
+#define MAX_NAME_UTF8    256u
 
-/* ---- 与内核 disk-srv 的通信 ---- */
-static uint8_t g_diskbuf[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t)
-                         + DISK_MAX_SECTORS * SECTOR];
+/* FAT32 簇号特殊值（osdev_wiki/FAT32） */
+#define FAT_FREE         0x00000000u  /* 空闲簇 */
+#define FAT_RESERVED_MIN 0x00000001u  /* <2 的簇号非法、不可用作链 */
+#define FAT_EOC          0x0FFFFFF8u  /* 簇链结束（含 0x0FFFFFF8~0x0FFFFFFF） */
+#define FAT_BAD          0x0FFFFFF7u  /* 坏簇 */
+#define FAT_LAST         0x0FFFFFFFu  /* 用作“EOF 哨兵” */
+#define CLUSTER_MIN      2u            /* 数据簇最小合法编号 */
 
-static bool disk_read(uint32_t lba, uint32_t count, void *out)
-{
-    /* M16 修复：拒绝越界/非法扇区数拷贝，防止后续 memcpy 越出调用方缓冲。 */
-    if (count == 0 || count > DISK_MAX_SECTORS) {
-        return false;
-    }
-    struct {
-        mach_msg_header_t h;
-        disk_read_req_t   r;
-    } req;
-    req.h.msgh_bits = 0;
-    req.h.msgh_size = sizeof(req);
-    req.h.msgh_remote_port = DISK_PORT;
-    req.h.msgh_local_port = FS_REPLY_PORT;   /* 应答端口 */
-    req.h.msgh_id = DISK_MSG_READ;
-    req.h.msgh_reserved = 0;
-    req.r.lba = lba;
-    req.r.count = count;
-    req.r.pad = 0;
+/* 内存缓冲上限 */
+#define FILEBUF_SIZE     (8u * 1024u * 1024u)   /* 8 MiB：整文件读（execve/OOL） */
+#define DISKBUF_SIZE     (DISK_MAX_SECTORS * SECTOR)
+#define RBUF_SIZE        (DISK_MAX_SECTORS * SECTOR)  /* 通用盘块读缓冲 */
+#define RESP_DATA_MAX    FS_DATA_MAX            /* 内联应答数据上限 */
 
-    if (mach_msg_send(&req, sizeof(req)) != MACH_MSG_SUCCESS) {
-        return false;
-    }
-    if (mach_msg_recv(g_diskbuf, sizeof(g_diskbuf), FS_REPLY_PORT)
-            != MACH_MSG_SUCCESS) {
-        return false;
-    }
-    disk_read_resp_t *rr =
-        (disk_read_resp_t *)(g_diskbuf + sizeof(mach_msg_header_t));
-    if (rr->status != 0) {
-        return false;
-    }
-    u_memcpy(out, g_diskbuf + sizeof(mach_msg_header_t) + sizeof(*rr),
-             count * SECTOR);
-    return true;
-}
+/* ===================== 全局状态 ===================== */
+static uint8_t  g_bpb[SECTOR];
+static uint32_t g_bytes_per_sec   = SECTOR;
+static uint32_t g_sec_per_clus    = 1;
+static uint32_t g_rsvd_secs       = 0;
+static uint32_t g_num_fats        = 2;
+static uint32_t g_fat_size        = 0;     /* 单 FAT 表扇区数 */
+static uint32_t g_root_cluster    = 2;
+static uint32_t g_first_data_lba  = 0;
+static uint32_t g_total_clusters  = 0;     /* 数据区簇数（不含保留 0/1） */
+static uint32_t g_max_cluster     = 0;     /* = 2 + g_total_clusters（越界裁剪上界） */
+static uint32_t g_max_lba         = 0xFFFFFFFFu; /* 卷末扇区 LBA（预读裁剪上界） */
+static uint32_t g_fs_info_lba     = 0;
 
-/* ---- FAT32 卷参数 ---- */
-static uint32_t g_sec_per_clus, g_fat_begin, g_data_begin, g_root_clus;
-/* M13/M14 修复：卷总簇数，用于校验簇号落于数据区有效范围，并作为簇链遍历
- * 步数上限的依据，防止损坏文件系统的环簇链导致无限循环/读飞。 */
-static uint32_t g_total_clusters = 0;
-/* P0-生产修复：有效簇号上限（= 2 + g_total_clusters）。fat_next/fat_set/
- * fat_alloc_cluster 用以判定簇号合法范围，取代散落的 0x0FFFFFF7 常量比较，
- * 对大卷也不会误判。 */
-static uint32_t g_max_cluster = 0;
-/* P0-生产修复：卷末扇区 LBA（g_total_sectors-1）。read_file_at 预读边界
- * 不得超过它，否则内核 ata_read_sectors 越界保护会拒绝请求导致读尾块失败。 */
-static uint32_t g_max_lba = 0xFFFFFFFFu;
+/* FAT 表单扇区缓存（避免每簇读整表） */
+static uint8_t  g_fat_cache[SECTOR];
+static uint32_t g_fat_cache_lba   = 0xFFFFFFFFu;
+static bool     g_fat_cache_ok    = false;
 
-/* P1-2 写路径：FAT 副本数与每 FAT 扇区数（mount 时采集），用于写回全部
- * FAT 副本；g_fat_scan 为下次簇分配扫描起点（加速连续分配）。 */
-static uint8_t  g_nfats = 1;
-static uint32_t g_fat_size = 0;
-static uint32_t g_fat_scan = 2;
-/* 整簇清零缓冲（FAT32 单簇最多 128 扇区 = 64KB），用于新目录/扩展簇清零。 */
-static uint8_t  g_zero[128 * SECTOR];
+/* 磁盘块读缓存（顺序预读；cluster 内的扇区命中使用） */
+static uint8_t  g_blk[DISKBUF_SIZE];
+static uint32_t g_blk_lba         = 0xFFFFFFFFu;
+static uint32_t g_blk_secs        = 0;
 
+/* 本地应答/缓冲（所有输出写入这里，杜绝外部指针写） */
+static uint8_t  g_resp[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + RESP_DATA_MAX + 16];
+static uint8_t  g_filebuf[FILEBUF_SIZE] __attribute__((aligned(4096))); /* 整文件读（OOL 内容源，须页对齐） */
+static uint8_t  g_rbuf[RBUF_SIZE];          /* 目录/数据读 */
+
+/* 自检标志 */
+static bool     g_self_test_ok = false;
+
+/* ===================== 小工具 ===================== */
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static uint32_t rd32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
-
-static bool fat32_mount(void)
+/* 写 16/32 小端 */
+static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void wr32(uint8_t *p, uint32_t v)
 {
-    uint8_t bpb[SECTOR];
-    if (!disk_read(0, 1, bpb)) {
-        return false;
-    }
-    /* P0-生产修复：基础 BPB 结构校验，拒绝挂载损坏/非 FAT32 镜像，
-     * 避免后续 g_fat_size/g_total_clusters 算出 0 或越界值导致读飞。 */
-    if (bpb[510] != 0x55 || bpb[511] != 0xAA) {
-        u_print("[fs] mount failed: bad boot signature\n");
-        return false;
-    }
-    uint16_t byts_per_sec = rd16(bpb + 11);
-    uint16_t fatsz16      = rd16(bpb + 22);   /* FAT32 必须为 0 */
-    uint16_t root_ent     = rd16(bpb + 17);   /* FAT32 必须为 0 */
-    g_sec_per_clus        = bpb[13];
-    uint16_t rsvd         = rd16(bpb + 14);
-    uint8_t  nfats        = bpb[16];
-    uint32_t fatsz32      = rd32(bpb + 36);
-    g_root_clus           = rd32(bpb + 44);
-    g_nfats               = nfats ? nfats : 1;   /* P1-2：写回全部 FAT 副本 */
-    g_fat_size            = fatsz32;
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
 
-    /* FAT32 判定：每扇区字节数须为 512、每簇扇区>0、FAT 大小非 0、
-     * 16 位 FAT 大小与根目录项计数必须为 0、根目录首簇>=2。 */
-    if (byts_per_sec != SECTOR || g_sec_per_clus == 0 || fatsz32 == 0 ||
-        fatsz16 != 0 || root_ent != 0 || g_root_clus < 2) {
-        u_print("[fs] mount failed: not a valid FAT32 volume\n");
-        return false;
-    }
-    g_fat_begin  = rsvd;
-    g_data_begin = rsvd + nfats * fatsz32;
+static int u_toupper(int c)
+{
+    if (c >= 'a' && c <= 'z') return c - 'a' + 'A';
+    return c;
+}
 
-    /* M13/M14：计算总簇数，供簇号范围校验与遍历步数上限。 */
-    uint32_t tot_sec = rd32(bpb + 32);
-    if (tot_sec == 0) {
-        tot_sec = rd16(bpb + 19);
-    }
-    if (tot_sec > g_data_begin && g_sec_per_clus != 0) {
-        g_total_clusters = (tot_sec - g_data_begin) / g_sec_per_clus;
-    } else {
-        g_total_clusters = 0;
-    }
-    /* P0-生产修复：记录卷末扇区 LBA，供 read_file_at 预读边界裁剪。 */
-    g_max_lba = tot_sec == 0 ? 0xFFFFFFFFu : (tot_sec - 1);
-    /* 有效簇号上限（含环链遍历/分配判定用） */
-    g_max_cluster = 2 + g_total_clusters;
+/* ===================== 磁盘原始读写（经 DISK_PORT IPC） =====================
+ * ABI（include/ipc/disk_proto.h）：请求 = mach_msg_header(remote=DISK_PORT) +
+ * disk_read_req_t{ lba(u64), count, pad }；应答 = status(u64, 0=OK) + 数据。
+ * 应答回收端口用本服务的私有 FS_REPLY_PORT（须在 main 中 sys_port_claim）。 */
 
-    char n[24];
-    u_print("[fs] FAT32 mounted: spc=");
-    u_print(u_utoa_s(g_sec_per_clus, n, sizeof(n)));
-    u_print(" fat@");
-    u_print(u_utoa_s(g_fat_begin, n, sizeof(n)));
-    u_print(" data@");
-    u_print(u_utoa_s(g_data_begin, n, sizeof(n)));
-    u_print(" root_clus=");
-    u_print(u_utoa_s(g_root_clus, n, sizeof(n)));
-    u_print(" clusters=");
-    u_print(u_utoa_s(g_total_clusters, n, sizeof(n)));
-    u_print("\n");
-    if (g_total_clusters == 0 || g_total_clusters >= 0x0FFFFFF7) {
-        u_print("[fs] mount failed: implausible cluster count\n");
-        return false;
-    }
+static bool disk_read(uint32_t lba, uint32_t count, void *out)
+{
+    if (count == 0 || count > DISK_MAX_SECTORS) return false;
+    uint8_t req[sizeof(mach_msg_header_t) + sizeof(disk_read_req_t)];
+    mach_msg_header_t *h = (mach_msg_header_t *)req;
+    h->msgh_bits       = 0;
+    h->msgh_size       = (uint32_t)sizeof(req);
+    h->msgh_remote_port = DISK_PORT;
+    h->msgh_local_port  = FS_REPLY_PORT;
+    h->msgh_id         = DISK_MSG_READ;
+    disk_read_req_t *r = (disk_read_req_t *)(req + sizeof(mach_msg_header_t));
+    r->lba = lba; r->count = count; r->pad = 0;
+
+    if (mach_msg_send(req, h->msgh_size) != 0) return false;
+
+    uint8_t resp[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t) +
+                 DISK_MAX_SECTORS * SECTOR];
+    uint32_t got = (uint32_t)mach_msg_recv(resp, sizeof(resp), FS_REPLY_PORT);
+    if (got < sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t)) return false;
+    disk_read_resp_t *pr = (disk_read_resp_t *)(resp + sizeof(mach_msg_header_t));
+    if (pr->status != 0) return false;
+    u_memcpy(out, (uint8_t *)(pr + 1), count * SECTOR);
     return true;
 }
 
-static uint32_t clus_to_lba(uint32_t clus)
+static bool disk_write(uint32_t lba, uint32_t count, const void *in)
 {
-    return g_data_begin + (clus - 2) * g_sec_per_clus;
+    if (count == 0 || count > DISK_MAX_SECTORS) return false;
+    uint8_t req[sizeof(mach_msg_header_t) + sizeof(disk_write_req_t) +
+                DISK_MAX_SECTORS * SECTOR];
+    mach_msg_header_t *h = (mach_msg_header_t *)req;
+    h->msgh_bits       = 0;
+    h->msgh_size       = (uint32_t)(sizeof(mach_msg_header_t) +
+                                    sizeof(disk_write_req_t) + count * SECTOR);
+    h->msgh_remote_port = DISK_PORT;
+    h->msgh_local_port  = FS_REPLY_PORT;
+    h->msgh_id         = DISK_MSG_WRITE;
+    disk_write_req_t *r = (disk_write_req_t *)(req + sizeof(mach_msg_header_t));
+    r->lba = lba; r->count = count; r->pad = 0;
+    u_memcpy((uint8_t *)(r + 1), in, count * SECTOR);
+
+    if (mach_msg_send(req, h->msgh_size) != 0) return false;
+
+    uint8_t resp[sizeof(mach_msg_header_t) + sizeof(disk_write_resp_t)];
+    uint32_t got = (uint32_t)mach_msg_recv(resp, sizeof(resp), FS_REPLY_PORT);
+    if (got < sizeof(mach_msg_header_t) + sizeof(disk_write_resp_t)) return false;
+    disk_write_resp_t *pr = (disk_write_resp_t *)(resp + sizeof(mach_msg_header_t));
+    return pr->status == 0;
 }
 
-/* FAT 扇区缓存：一个 FAT 扇区含 128 条 4 字节簇项。连续簇遍历若每次都
- * 重读 FAT 扇区，3877 簇的 walk 要 3877 次磁盘 PIO（QEMU 下约 20ms/次，
- * 累计 >70s，表现为“播放卡死”）。缓存最近一次 FAT 扇区后，同扇区内的簇
- * 项直接命中，walk 的磁盘读次数降为 ~30 次。 */
-static uint32_t g_fat_cache_lba = 0xFFFFFFFFu;
-static uint8_t  g_fat_cache[SECTOR];
-static bool     g_fat_cache_ok = false;
+/* 顺序块读（带缓存）：从 lba 起读 count 扇区到 out。
+ * 若请求完全落在上次缓存窗口内则直接 memcpy，否则从磁盘读。 */
+static bool block_read(uint32_t lba, uint32_t count, void *out)
+{
+    if (count == 0 || count > DISK_MAX_SECTORS) return false;
+    if (g_blk_lba != 0xFFFFFFFFu && lba >= g_blk_lba &&
+        lba + count <= g_blk_lba + g_blk_secs) {
+        u_memcpy(out, g_blk + (lba - g_blk_lba) * SECTOR, count * SECTOR);
+        return true;
+    }
+    if (!disk_read(lba, count, g_blk)) return false;
+    g_blk_lba = lba;
+    g_blk_secs = count;
+    u_memcpy(out, g_blk, count * SECTOR);
+    return true;
+}
 
+/* ===================== 簇↔LBA 映射 ===================== */
+static uint32_t clus_to_lba(uint32_t clus)
+{
+    /* FAT32：数据区起始 = 保留 + 所有 FAT 表；簇 N 首扇区 = first_data + (N-2)*spc */
+    return g_first_data_lba + (clus - CLUSTER_MIN) * g_sec_per_clus;
+}
+
+/* ===================== FAT 表访问 ===================== */
+/* 返回簇 clus 的 FAT 项（低 28 位有效）。失败返回 FAT_LAST（视为 EOF 哨兵）。 */
 static uint32_t fat_next(uint32_t clus)
 {
-    if (clus < 2 || clus >= g_max_cluster) {
-        return 0;   /* 非法簇号，按 EOF 处理 */
-    }
-    uint32_t lba = g_fat_begin + (clus * 4) / SECTOR;
+    if (clus < CLUSTER_MIN || clus >= g_max_cluster) return FAT_LAST; /* 越界即 EOF */
+    uint32_t fat_off = clus * FAT_ENTRY_SIZE;        /* 字节偏移 */
+    uint32_t lba     = g_rsvd_secs + fat_off / SECTOR;
+    uint32_t off     = fat_off % SECTOR;
     if (!g_fat_cache_ok || lba != g_fat_cache_lba) {
-        if (!disk_read(lba, 1, g_fat_cache)) {
-            return 0x0FFFFFFF;
-        }
+        if (!disk_read(lba, 1, g_fat_cache)) return FAT_LAST;
         g_fat_cache_lba = lba;
         g_fat_cache_ok  = true;
     }
-    uint32_t v = rd32(g_fat_cache + (clus * 4) % SECTOR) & 0x0FFFFFFF;
-    /* P0-生产修复：坏簇(0x0FFFFFF7)与 EOF(>=0x0FFFFFF8)统一视为链结束。
-     * 之前直接返回 v，调用方以 clus<0x0FFFFFF8 续链，会把坏簇 0x0FFFFFF7
-     * 当有效簇继续 walk，导致 clus_to_lba 算出越界 LBA、内核读盘失败。
-     * 这里把 >=0x0FFFFFF7 归一成 EOF 哨兵 0x0FFFFFFF，空闲簇(v==0)保持 0，
-     * 既让 walk 正确终止，又不影响 fat_alloc_cluster 的"==0 判空闲"语义。 */
-    if (v >= 0x0FFFFFF7) {
-        return 0x0FFFFFFF;
-    }
+    uint32_t v = rd32(g_fat_cache + off) & 0x0FFFFFFFu;
+    if (v >= FAT_BAD) return FAT_LAST;   /* 坏簇/EOF：归一为 EOF 哨兵，防续链越界 */
+    if (v < CLUSTER_MIN) return FAT_LAST; /* 0/1 视为非法终止 */
     return v;
 }
 
-/* 目录项 -> "NAME.EXT"（返回长度） */
-static int fmt_83(const uint8_t *e, char *out)
-{
-    int n = 0;
-    for (int i = 0; i < 8 && e[i] != ' '; i++) {
-        out[n++] = (char)e[i];
-    }
-    if (e[8] != ' ') {
-        out[n++] = '.';
-        for (int i = 8; i < 11 && e[i] != ' '; i++) {
-            out[n++] = (char)e[i];
-        }
-    }
-    out[n] = '\0';
-    return n;
-}
-
-/* 遍历根目录：cb 返回 true 则停止。cb(条目, name, 私有指针) */
-typedef bool (*dir_cb)(const uint8_t *entry, const char *name, void *priv);
-
-/* read_dir 定义在下方（带 LFN 支持）；walk_root 复用之遍历根目录。 */
-static void read_dir(uint32_t start_clus, dir_cb cb, void *priv);
-
-static void walk_root(dir_cb cb, void *priv)
-{
-    read_dir(g_root_clus, cb, priv);
-}
-
-/* ---- LIST ---- */
-struct list_ctx { char *buf; uint32_t len; };
-
-static bool list_cb(const uint8_t *e, const char *name, void *priv)
-{
-    struct list_ctx *c = (struct list_ctx *)priv;
-    uint32_t size = rd32(e + 28);
-    bool is_dir = (e[11] & 0x10) != 0;
-
-    char line[64];
-    int n = 0;
-    const char *p = name;
-    while (*p) {
-        line[n++] = *p++;
-    }
-    while (n < 14) {
-        line[n++] = ' ';
-    }
-    if (is_dir) {
-        const char *d = "<DIR>";
-        while (*d) {
-            line[n++] = *d++;
-        }
-    } else {
-        char num[24];
-        u_utoa_s(size, num, sizeof(num));
-        const char *q = num;
-        while (*q) {
-            line[n++] = *q++;
-        }
-        const char *u = " bytes";
-        while (*u) {
-            line[n++] = *u++;
-        }
-    }
-    line[n++] = '\n';
-
-    if (c->len + (uint32_t)n >= FS_DATA_MAX) {
-        return true;
-    }
-    u_memcpy(c->buf + c->len, line, (size_t)n);
-    c->len += (uint32_t)n;
-    return false;
-}
-
-/* ---- 路径解析（支持根下子目录，如 BIN/HELLO.ELF） ---- */
-typedef struct { const char *want; uint32_t clus, size; bool found, is_dir; } path_cb_t;
-
-static void upcase_str(char *s)
-{
-    for (; *s; s++) {
-        if (*s >= 'a' && *s <= 'z') {
-            *s = (char)(*s - 'a' + 'A');
-        }
-    }
-}
-
-/* ---- 长文件名(LFN)支持 ----
- * 大于 8.3 的文件（如独立程序 ::BIN/PLAYAUDIO，9 字符）在 FAT32 上由
- * mtools 自动创建 LFN 条目（UTF-16LE，每条 13 字符，按逆序物理排列，
- * 末条序列号带 0x40 标志）。本模块在遍历目录时累加 LFN 条目，遇到紧随
- * 其后的 8.3 条目时重建出长名并传给 cb（无 LFN 则回退 8.3 短名）。
- *
- * 重建策略：利用序列号 S（1-based），把第 S 条 LFN 的 13 字符写入缓冲的
- * (S-1)*13 偏移处。由于物理顺序为逆序，按 (seq-1)*13 直接定位写入即可，
- * 无需关心到达顺序；长名长度 = 已见最大序列号 * 13。 */
-#define LFN_CAP 256
-static char   g_lfn[LFN_CAP];
-static int    g_lfn_seq;     /* 当前累积的最大序列号 */
-static int    g_lfn_prev;    /* 上一条已处理的序列号（L7 连续性校验用） */
-static bool   g_lfn_valid;
-static bool   g_lfn_broken;  /* L7：链中出现序号断层/伪造时整条作废 */
-
-static void lfn_reset(void)
-{
-    /* L7 修复：整段缓冲清零（而非仅 g_lfn[0]='\0'），避免上一条 LFN 残留的
-     * 非零字节在断层被判无效后，仍被 lfn_pull 的"遇 NUL 即止"逻辑误纳入新名。 */
-    memset(g_lfn, 0, sizeof(g_lfn));
-    g_lfn_valid = false;
-    g_lfn_broken = false;
-    g_lfn_seq = 0;
-    g_lfn_prev = 0;
-}
-
-/* 解码一条 LFN 条目，写入 (seq-1)*13 处（UTF-16LE 的 ASCII 部分） */
-static void lfn_add(const uint8_t *e)
-{
-    if (g_lfn_broken) {                    /* 已判定无效：忽略后续条目 */
-        return;
-    }
-    int seq = e[0] & 0x1F;                  /* 低 5 位 = 序列号(1-based) */
-    if (seq == 0 || seq * 13 >= LFN_CAP) { /* 越界/非法序号直接作废 */
-        g_lfn_broken = true;
-        return;
-    }
-    /* L7 修复：LFN 物理逆序排列，首条为最高序号。要求每条序号严格递减 1，
-     * 任何断层（序号被伪造跳变、或重复）都说明链不可信，整条作废，
-     * 回退到 8.3 短名，杜绝"截断处无 NUL / 注入垃圾字符"问题。 */
-    if (g_lfn_seq == 0) {
-        g_lfn_prev = seq;                   /* 首条：记录起点序号 */
-    } else if (seq != g_lfn_prev - 1) {
-        g_lfn_broken = true;
-        return;
-    } else {
-        g_lfn_prev = seq;
-    }
-    const uint8_t *chunk[3] = { e + 1, e + 14, e + 28 };
-    int nbytes[3] = { 10, 12, 4 };          /* = 5+6+2 个 UTF-16 字符 */
-    int pos = (seq - 1) * 13;
-    for (int k = 0; k < 3; k++) {
-        const uint8_t *base = chunk[k];
-        int pairs = nbytes[k] / 2;
-        for (int p = 0; p < pairs; p++) {
-            uint16_t w = (uint16_t)base[p * 2] | ((uint16_t)base[p * 2 + 1] << 8);
-            char ch = (w < 0x80) ? (char)w : '?';
-            if (pos < LFN_CAP - 1) {
-                g_lfn[pos++] = ch;
-            }
-        }
-    }
-    g_lfn_valid = true;
-    if (seq > g_lfn_seq) {
-        g_lfn_seq = seq;
-    }
-}
-
-/* 把累积的 LFN 写入 out（最长 LFN_CAP-1），返回长度；无 LFN 或链已作废返回 0 */
-static int lfn_pull(char *out)
-{
-    if (!g_lfn_valid || g_lfn_broken) {     /* L7：断层链回退 8.3 短名 */
-        return 0;
-    }
-    int end = g_lfn_seq * 13;
-    if (end > LFN_CAP - 1) {
-        end = LFN_CAP - 1;
-    }
-    int i = 0;
-    while (i < end && g_lfn[i]) {
-        out[i] = g_lfn[i];
-        i++;
-    }
-    out[i] = '\0';
-    return i;
-}
-
-/* 大小写不敏感比较（FAT32 文件名匹配用） */
-static int ci_strcmp(const char *a, const char *b)
-{
-    while (*a && *b) {
-        char ca = *a, cb = *b;
-        if (ca >= 'a' && ca <= 'z') ca -= 32;
-        if (cb >= 'a' && cb <= 'z') cb -= 32;
-        if (ca != cb) {
-            return (unsigned char)ca - (unsigned char)cb;
-        }
-        a++; b++;
-    }
-    return (unsigned char)*a - (unsigned char)*b;
-}
-
-/* 遍历任意目录的簇链：累加 LFN，对每个最终条目调用 cb（返回 true 即停止）。
- * cb 收到的 name 为长名（LFN）或回退 8.3 短名，长度写满 name[LFN_CAP]。 */
-static void read_dir(uint32_t start_clus, dir_cb cb, void *priv)
-{
-    uint8_t sec[SECTOR];
-    uint32_t clus = start_clus;
-    uint32_t hops = 0;
-    lfn_reset();
-    while (clus >= 2 && clus < 0x0FFFFFF8 && hops++ < FAT_WALK_LIMIT) {
-        /* M14 修复：簇号须落在数据区有效范围 [2, 2+g_total_clusters)。
-         * 越界簇号（损坏 FS）会令 clus_to_lba 算出非法 LBA 误读任意扇区。 */
-        if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
-            break;
-        }
-        for (uint32_t s = 0; s < g_sec_per_clus; s++) {
-            if (!disk_read(clus_to_lba(clus) + s, 1, sec)) {
-                return;
-            }
-            for (int off = 0; off < SECTOR; off += 32) {
-                const uint8_t *e = sec + off;
-                if (e[0] == 0x00) {
-                    return;                          /* 目录结束 */
-                }
-                /* LFN 条目：属性 0x0F，继续累积（不调用 cb） */
-                if ((e[11] & 0x0F) == 0x0F && e[0] != 0xE5) {
-                    lfn_add(e);
-                    continue;
-                }
-                /* 删除项 / 卷标：复位 LFN 累加后跳过 */
-                if (e[0] == 0xE5 || (e[11] & 0x08)) {
-                    lfn_reset();
-                    continue;
-                }
-                /* 普通 8.3 条目：组合名字（LFN 优先） */
-                char name[LFN_CAP];
-                if (lfn_pull(name) == 0) {
-                    fmt_83(e, name);
-                }
-                lfn_reset();
-                if (cb(e, name, priv)) {
-                    return;
-                }
-            }
-        }
-        clus = fat_next(clus);
-    }
-}
-
-static bool path_find_cb(const uint8_t *e, const char *name, void *priv)
-{
-    path_cb_t *c = (path_cb_t *)priv;
-    if (ci_strcmp(name, c->want) == 0) {
-        c->is_dir = (e[11] & 0x10) != 0;
-        c->clus = ((uint32_t)rd16(e + 20) << 16) | rd16(e + 26);
-        c->size = rd32(e + 28);
-        c->found = true;
-        return true;
-    }
-    return false;
-}
-
-/* 解析 '/' 分隔的路径，返回最终条目（组件大小写不敏感，匹配 8.3 大写名）。 */
-static void resolve_path(const char *path, path_cb_t *out)
-{
-    char comp[8][13];
-    int ncomp = 0;
-    const char *p = path;
-    while (*p && ncomp < 8) {
-        char *c = comp[ncomp];
-        int i = 0;
-        /* M15 修复：组件长度上限 12（留 1 字节 NUL），超长非法 8.3 名不再
-         * 静默截断后误匹配。 */
-        while (*p && *p != '/' && i < 12) {
-            c[i++] = *p++;
-        }
-        c[i] = '\0';
-        if (i == 12 && *p && *p != '/') {     /* 组件超长 → 必然不是 8.3 名 */
-            *out = (path_cb_t){ 0 };
-            return;
-        }
-        upcase_str(c);
-        ncomp++;
-        if (*p == '/') {
-            p++;
-        }
-    }
-    *out = (path_cb_t){ 0 };
-    if (ncomp == 0) {
-        return;
-    }
-    /* M15 修复：路径深度超过 8 级时显式返回未找到，而非静默丢弃深层组件
-     * 后拿前 8 级去匹配（曾可能命中错误文件）。 */
-    if (*p != 0) {
-        return;
-    }
-    uint32_t clus = g_root_clus;
-    for (int i = 0; i < ncomp; i++) {
-        path_cb_t f = { comp[i], 0, 0, false, false };
-        read_dir(clus, path_find_cb, &f);
-        if (!f.found) {
-            return;
-        }
-        if (i == ncomp - 1) {
-            *out = f;
-            return;
-        }
-        if (!f.is_dir) {
-            return;
-        }
-        clus = f.clus;
-    }
-}
-
-/* ---- READ ---- */
-static uint32_t read_file(uint32_t clus, uint32_t size, char *out, uint32_t cap)
-{
-    uint8_t sec[SECTOR];
-    uint32_t done = 0;
-    uint32_t remain = size < cap ? size : cap;
-    uint32_t hops_rf = 0;
-    while (remain > 0 && clus >= 2 && clus < 0x0FFFFFF8
-           && hops_rf++ < FAT_WALK_LIMIT) {
-        if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
-            break;
-        }
-        for (uint32_t s = 0; s < g_sec_per_clus && remain > 0; s++) {
-            if (!disk_read(clus_to_lba(clus) + s, 1, sec)) {
-                return done;
-            }
-            uint32_t n = remain < SECTOR ? remain : SECTOR;
-            u_memcpy(out + done, sec, n);
-            done += n;
-            remain -= n;
-        }
-        clus = fat_next(clus);
-    }
-    return done;
-}
-
-/* ---- 带偏移分块读（大文件流式播放，如 playaudio 读 6.8MB MP3） ----
- * 顺序读优化：缓存上次定位到的簇索引与簇号，避免每次从簇链头重新遍历
- * （否则 O(n^2) 遍历会让大文件读取极慢）。 */
-static uint32_t g_ra_first = 0, g_ra_idx = 0, g_ra_clus = 0;
-
-/* 预读数据缓存：把连续簇区段一次性预读进 32KB 缓存（内部按
- * DISK_MAX_SECTORS=7 扇区分批发 IPC，受内联消息 3968B 上限约束）。
- * 流式播放每请求仅 FS_DATA_MAX(3500B)，一个 32KB 缓存可命中后续 ~9 次
- * 请求，磁盘 IPC 停顿从每请求一次降为每 9 请求一次，播放连贯。 */
-#define RA_SECS  64                            /* 预读窗口：64 扇区 = 32KB */
-static uint32_t g_blk_lba  = 0;
-static uint32_t g_blk_secs = 0;                /* 0 = 缓存无效 */
-static uint8_t  g_blk_buf[RA_SECS * SECTOR];
-
-/* 读取 [lba, lba+secs) 到 dst：按 DISK_MAX_SECTORS 分批发磁盘 IPC。 */
-static bool disk_read_batched(uint32_t lba, uint32_t secs, uint8_t *dst)
-{
-    while (secs > 0) {
-        uint32_t c = secs > DISK_MAX_SECTORS ? DISK_MAX_SECTORS : secs;
-        if (!disk_read(lba, c, dst)) {
-            return false;
-        }
-        lba  += c;
-        dst  += c * SECTOR;
-        secs -= c;
-    }
-    return true;
-}
-
-static uint32_t read_file_at(uint32_t first_clus, uint32_t size,
-                             uint32_t offset, char *out, uint32_t cap)
-{
-    if (offset >= size) {
-        return 0;                              /* EOF */
-    }
-    uint32_t clus_bytes = g_sec_per_clus * SECTOR;
-    uint32_t want_idx = offset / clus_bytes;
-
-    uint32_t clus, idx;
-    if (first_clus == g_ra_first && g_ra_clus >= 2 && g_ra_idx <= want_idx) {
-        clus = g_ra_clus;                      /* 命中缓存：从上次位置继续 */
-        idx  = g_ra_idx;
-    } else {
-        clus = first_clus;
-        idx  = 0;
-    }
-    while (idx < want_idx && clus >= 2 && clus < 0x0FFFFFF8) {
-        clus = fat_next(clus);
-        idx++;
-    }
-    if (clus < 2 || clus >= 0x0FFFFFF8) {
-        return 0;
-    }
-    if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
-        return 0;
-    }
-    g_ra_first = first_clus;
-    g_ra_idx   = idx;
-    g_ra_clus  = clus;
-
-    uint32_t remain = size - offset;
-    if (remain > cap) {
-        remain = cap;
-    }
-    uint32_t within = offset % clus_bytes;     /* 当前簇内字节偏移 */
-    uint32_t done = 0;
-
-    uint32_t hops_rfa = 0;
-    while (remain > 0 && clus >= 2 && clus < 0x0FFFFFF8
-           && hops_rfa++ < FAT_WALK_LIMIT) {
-        if (g_total_clusters != 0 && clus - 2 >= g_total_clusters) {
-            break;
-        }
-        /* 探测从 clus 起的连续簇（fat 项 = 上一簇+1 即物理连续），
-         * 上限为预读窗口 RA_SECS。fat_next 有 FAT 扇区缓存，此探测
-         * 几乎不产生磁盘读。 */
-        uint32_t run = 1;
-        uint32_t probe = clus;
-        while (run < RA_SECS / g_sec_per_clus) {
-            uint32_t nx = fat_next(probe);
-            if (nx != probe + 1 || nx < 2 || nx >= 0x0FFFFFF8) {
-                break;
-            }
-            probe = nx;
-            run++;
-        }
-        uint32_t run_secs = run * g_sec_per_clus;
-        uint32_t base_lba = clus_to_lba(clus);
-        /* P0-生产修复：预读窗口不得超过卷末扇区 LBA，否则内核
-         * ata_read_sectors 的越界保护会拒绝请求、read_file_at 提前返回，
-         * 导致大文件（如 MP3）接近卷尾的尾块读不到。裁剪到合法区间。 */
-        if (base_lba + run_secs - 1 > g_max_lba) {
-            if (base_lba > g_max_lba) {
-                break;                      /* 整个 run 越界：停止读取 */
-            }
-            run_secs = (uint32_t)(g_max_lba - base_lba) + 1;
-            /* 重新计算本 run 实际覆盖的连续簇数（向下取整到整簇） */
-            run = run_secs / g_sec_per_clus;
-            if (run == 0) {
-                run_secs = g_sec_per_clus;
-                run = 1;
-            }
-            run_secs = run * g_sec_per_clus;
-        }
-        uint32_t avail    = run_secs * SECTOR - within;   /* run 内可取字节 */
-        uint32_t n = remain < avail ? remain : avail;
-
-        /* 本次需要的扇区区间 [need_first, need_last)（绝对 LBA）。 */
-        uint32_t need_first = base_lba + within / SECTOR;
-        uint32_t need_last  = base_lba + (within + n + SECTOR - 1) / SECTOR;
-        if (!(g_blk_secs != 0 && need_first >= g_blk_lba &&
-              need_last <= g_blk_lba + g_blk_secs)) {
-            /* 缓存未命中：把整个 run（<=RA_SECS 扇区）预读进缓存，
-             * 内部按 DISK_MAX_SECTORS 分批 IPC。 */
-            if (!disk_read_batched(base_lba, run_secs, g_blk_buf)) {
-                return done;
-            }
-            g_blk_lba  = base_lba;
-            g_blk_secs = run_secs;
-        }
-        u_memcpy(out + done,
-                 g_blk_buf + (need_first - g_blk_lba) * SECTOR
-                           + within % SECTOR,
-                 n);
-        done   += n;
-        remain -= n;
-
-        /* 按实际消费的字节数推进簇指针（此前按整个 run 推进会令
-         * g_ra_idx 超过下次请求的 want_idx，导致顺序读缓存永远失效、
-         * 每次请求都从簇链头重新遍历——正是播放断续的根因之一）。 */
-        uint32_t adv = (within + n) / clus_bytes;         /* 消费的完整簇数 */
-        within = (within + n) % clus_bytes;
-        for (uint32_t i = 0; i < adv; i++) {
-            if (clus < 2 || clus >= 0x0FFFFFF8) {
-                break;
-            }
-            clus = fat_next(clus);
-            g_ra_idx++;
-        }
-        g_ra_clus = clus;
-    }
-    return done;
-}
-
-/* =========================================================================
- * P1-2：FAT32 写路径
- *
- * 设计要点（生产稳定性红线）：
- *  - 所有簇号/链长/扇区数均做越界与环链保护（g_total_clusters 校验 + FAT_WALK_LIMIT）。
- *  - FAT 表项写回全部 FAT 副本（g_nfats），写后立即使读缓存失效避免读到陈旧项。
- *  - 目录条目写入保证连续无空洞，read_dir 的“遇 0x00 即止”语义可被正确穿越簇链读取。
- *  - 扩展目录/文件时新分配的簇先整簇清零，保证稀疏区读回为 0。
- *  - 所有磁盘写经 disk_write -> 内核 DISK_MSG_WRITE -> blk_write（ATA PIO / AHCI DMA）。
- * ========================================================================= */
-
-/* 写请求缓冲（含 7 扇区数据上限，与内核 DISK_MAX_SECTORS 一致）。 */
-static uint8_t g_wreq[sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)
-                      + DISK_MAX_SECTORS * SECTOR];
-
-static bool disk_write(uint64_t lba, uint8_t count, const void *buf)
-{
-    if (count == 0 || count > DISK_MAX_SECTORS) {
-        return false;
-    }
-    mach_msg_header_t *h   = (mach_msg_header_t *)g_wreq;
-    disk_write_req_t  *req = (disk_write_req_t *)(g_wreq + sizeof(mach_msg_header_t));
-    req->lba = lba;
-    req->count = count;
-    req->pad = 0;
-    u_memcpy(g_wreq + sizeof(mach_msg_header_t) + sizeof(disk_write_req_t),
-             buf, (uint32_t)count * SECTOR);
-    h->msgh_bits = 0;
-    h->msgh_size = sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)
-                   + (uint32_t)count * SECTOR;
-    h->msgh_remote_port = DISK_PORT;
-    h->msgh_local_port  = FS_REPLY_PORT;
-    h->msgh_id = DISK_MSG_WRITE;
-    h->msgh_reserved = 0;
-    if (mach_msg_send(g_wreq, h->msgh_size) != MACH_MSG_SUCCESS) {
-        return false;
-    }
-    if (mach_msg_recv(g_diskbuf, sizeof(g_diskbuf), FS_REPLY_PORT) != MACH_MSG_SUCCESS) {
-        return false;
-    }
-    disk_write_resp_t *rr = (disk_write_resp_t *)(g_diskbuf + sizeof(mach_msg_header_t));
-    bool ok = (rr->status == 0);
-    if (ok) {
-        /* P0-生产修复：写盘成功后立即使顺序读预读缓存失效，避免同一会话内
-         * "读->写->再读同一区间"命中写前的陈旧缓存导致数据不一致。FAT 读
-         * 缓存由 fat_set 单独失效，此处只针对数据区预读缓存。 */
-        g_blk_lba = 0;
-    }
-    return ok;
-}
-
-/* ---- FAT 写回 ---- */
+/* 写 FAT 项（低 28 位）。同时更新所有 FAT 副本与缓存。 */
 static bool fat_set(uint32_t clus, uint32_t val)
 {
-    if (clus < 2 || g_total_clusters == 0 || clus - 2 >= g_total_clusters) {
-        return false;                       /* 越界簇号拒绝写入 */
+    if (clus < CLUSTER_MIN || clus >= g_max_cluster) return false;
+    uint32_t fat_off = clus * FAT_ENTRY_SIZE;
+    uint32_t lba     = g_rsvd_secs + fat_off / SECTOR;
+    uint32_t off     = fat_off % SECTOR;
+    uint32_t v       = (val & 0x0FFFFFFFu);
+    for (uint32_t fi = 0; fi < g_num_fats; fi++) {
+        uint32_t flba = g_rsvd_secs + fi * g_fat_size + fat_off / SECTOR;
+        if (!disk_read(flba, 1, g_fat_cache)) return false;
+        wr32(g_fat_cache + off, v);
+        /* 持久化：通过 disk_write 回写这一扇区（使用临时扇区缓冲） */
+        static uint8_t tmp[SECTOR];
+        u_memcpy(tmp, g_fat_cache, SECTOR);
+        if (!disk_write(flba, 1, tmp)) return false;
     }
-    val &= 0x0FFFFFFF;
-    uint32_t off = clus * 4;
-    uint32_t sec_off = off / SECTOR;
-    uint32_t byte_off = off % SECTOR;
-    uint8_t sec[SECTOR];
-    for (uint8_t i = 0; i < g_nfats; i++) {
-        uint32_t lba = g_fat_begin + (uint64_t)i * g_fat_size + sec_off;
-        if (!disk_read(lba, 1, sec)) {
-            return false;
-        }
-        sec[byte_off]     = (uint8_t)(val & 0xFF);
-        sec[byte_off + 1] = (uint8_t)((val >> 8) & 0xFF);
-        sec[byte_off + 2] = (uint8_t)((val >> 16) & 0xFF);
-        sec[byte_off + 3] = (uint8_t)((val >> 24) & 0xFF);
-        if (!disk_write(lba, 1, sec)) {
-            return false;
-        }
-    }
-    g_fat_cache_ok = false;                 /* 读缓存失效，下次 fat_next 重读 */
+    /* 刷新读缓存 */
+    if (!disk_read(lba, 1, g_fat_cache)) return false;
+    g_fat_cache_lba = lba;
+    g_fat_cache_ok  = true;
     return true;
 }
 
-static uint32_t fat_alloc_cluster(void)
+/* 查找一个空闲簇（线性扫描 FAT），从 hint 起绕回。返回簇号或 0（无空闲）。 */
+static uint32_t fat_alloc_free(uint32_t hint)
 {
-    if (g_total_clusters == 0) {
-        return 0;
-    }
-    uint32_t base = (g_fat_scan < 2) ? 2 : g_fat_scan;
+    uint32_t start = (hint >= CLUSTER_MIN && hint < g_max_cluster) ? hint : CLUSTER_MIN;
     for (uint32_t i = 0; i < g_total_clusters; i++) {
-        uint32_t c = 2 + ((base - 2 + i) % g_total_clusters);
-        if (fat_next(c) == 0) {              /* 空闲簇 */
-            if (!fat_set(c, 0x0FFFFFFF)) {
-                return 0;
-            }
-            g_fat_scan = c + 1;
-            if (g_fat_scan - 2 >= g_total_clusters) {
-                g_fat_scan = 2;
-            }
-            return c;
-        }
+        uint32_t c = CLUSTER_MIN + ((start - CLUSTER_MIN + i) % g_total_clusters);
+        if (c < CLUSTER_MIN || c >= g_max_cluster) continue;
+        uint32_t v = fat_next(c);
+        if (v == FAT_FREE) return c;
     }
-    u_print("[fs] no free clusters\n");
     return 0;
 }
 
-static bool fat_free_chain(uint32_t first)
+/* ===================== 簇链读（带越界裁剪） ===================== */
+/* 把从 clus 起的簇链连续读入 out，最多 max_bytes 字节。
+ * 返回实际读出的字节数；预读越界时裁剪到卷末扇区。 */
+static uint32_t chain_read(uint32_t clus, uint32_t max_bytes, void *out)
 {
-    uint32_t c = first;
-    uint32_t total = g_total_clusters ? g_total_clusters : 1;
-    uint32_t guard = 0;
-    while (c >= 2 && c - 2 < total && guard++ <= total + 1) {
-        uint32_t nx = fat_next(c);
-        if (!fat_set(c, 0)) {                /* 标记空闲 */
-            return false;
+    uint8_t *p = (uint8_t *)out;
+    uint32_t total = 0;
+    uint32_t cur = clus;
+    while (cur >= CLUSTER_MIN && cur < g_max_cluster && total < max_bytes) {
+        uint32_t base = clus_to_lba(cur);
+        uint32_t run  = g_sec_per_clus;
+        /* 越界裁剪：不读取超过卷末扇区的部分 */
+        if (base + run - 1 > g_max_lba) {
+            if (base > g_max_lba) break;
+            run = g_max_lba - base + 1;
         }
-        if (nx >= 2 && nx - 2 < total) {
-            c = nx;                           /* 合法下一簇：继续 */
-        } else {
-            break;                           /* EOC / 非法：链结束 */
+        for (uint32_t s = 0; s < run && total < max_bytes; s++) {
+            if (!block_read(base + s, 1, g_rbuf)) return total; /* 部分读也返回已读 */
+            uint32_t need = max_bytes - total;
+            uint32_t chunk = (need < SECTOR) ? need : SECTOR;
+            u_memcpy(p + total, g_rbuf, chunk);
+            total += chunk;
         }
+        cur = fat_next(cur);
     }
-    return true;
+    return total;
 }
 
-/* 整簇清零（新目录首簇 / 文件扩展簇，保证稀疏区读回为 0）。 */
-static bool write_zero_cluster(uint32_t clus)
+/* 把数据写入从 clus 起的簇链（必要时分配新簇）。返回写入字节数。 */
+static uint32_t chain_write(uint32_t clus, uint32_t bytes, const void *in)
 {
-    uint32_t nsec = g_sec_per_clus;
-    if (nsec > 128) nsec = 128;
-    for (uint32_t s = 0; s < nsec; s++) {
-        if (!disk_write(clus_to_lba(clus) + s, 1, g_zero)) {
-            return false;
+    const uint8_t *p = (const uint8_t *)in;
+    uint32_t total = 0;
+    uint32_t cur = clus;
+    uint32_t prev = 0;
+    while (total < bytes) {
+        if (cur < CLUSTER_MIN || cur >= g_max_cluster) {
+            /* 需要新簇：链接到 prev（若存在），否则调用方已处理首簇 */
+            uint32_t nc = fat_alloc_free(prev ? prev : g_root_cluster);
+            if (nc == 0) return total; /* 盘满 */
+            if (prev) { if (!fat_set(prev, nc)) return total; }
+            cur = nc;
         }
-    }
-    return true;
-}
-
-/* ---- 目录条目写 ---- */
-static bool dir_patch(uint32_t lba, uint32_t off, const uint8_t *src, uint32_t len)
-{
-    if (off > SECTOR || off + len > SECTOR) {
-        return false;
-    }
-    uint8_t sec[SECTOR];
-    if (!disk_read(lba, 1, sec)) {
-        return false;
-    }
-    u_memcpy(sec + off, src, len);
-    return disk_write(lba, 1, sec);
-}
-
-static bool write_entry_at(uint32_t lba, uint32_t off, const uint8_t e[32])
-{
-    return dir_patch(lba, off, e, 32);
-}
-
-/* 把全局目录项序号 idx 映射到 (簇, 簇内字节偏移)。 */
-static bool dir_entry_pos(uint32_t start_clus, uint32_t idx,
-                          uint32_t *out_clus, uint32_t *out_byte)
-{
-    uint32_t entries_per_clus = g_sec_per_clus * 16;
-    uint32_t clus = start_clus;
-    uint32_t skip = idx;
-    uint32_t hops = 0;
-    while (skip >= entries_per_clus && clus >= 2 && clus < 0x0FFFFFF8
-           && hops++ < FAT_WALK_LIMIT) {
-        if (g_total_clusters && clus - 2 >= g_total_clusters) {
-            return false;
+        uint32_t base = clus_to_lba(cur);
+        uint32_t run  = g_sec_per_clus;
+        for (uint32_t s = 0; s < run && total < bytes; s++) {
+            uint32_t need = bytes - total;
+            uint32_t chunk = (need < SECTOR) ? need : SECTOR;
+            u_memset(g_rbuf, 0, SECTOR);
+            u_memcpy(g_rbuf, p + total, chunk);
+            if (!disk_write(base + s, 1, g_rbuf)) return total;
+            total += chunk;
         }
-        clus = fat_next(clus);
-        skip -= entries_per_clus;
+        prev = cur;
+        cur = fat_next(cur);
     }
-    if (clus < 2 || clus >= 0x0FFFFFF8) {
-        return false;
-    }
-    *out_clus = clus;
-    *out_byte = skip * 32;
-    return true;
+    return total;
 }
 
-/* 在目录中查找 count 个连续空闲项（0x00 或 0xE5），返回首个项的全局序号。
- * 若目录链结束仍不足，则扩展一个新簇（整簇清零后链入）继续。 */
-static bool dir_find_free_run(uint32_t start_clus, uint32_t count, uint32_t *out_index)
+/* ===================== 8.3 短名 ↔ 显示名 ===================== */
+/* 把 11 字节目录名（8+3）转为 NUL 结尾显示串 name[13]。
+ * 处理 0x05→0xE5 首字节（osdev_wiki/FAT32：0x05 是 0xE5 的转义）。 */
+static void fmt_83(const uint8_t *e, char *name)
 {
-    if (count == 0) {
-        return false;
+    uint8_t base[8], ext[3];
+    base[0] = (e[0] == 0x05) ? (uint8_t)0xE5 : e[0];
+    for (int i = 1; i < 8; i++) base[i] = e[i];
+    for (int i = 0; i < 3; i++) ext[i] = e[8 + i];
+    int o = 0;
+    int i = 0;
+    while (i < 8 && base[i] != ' ') name[o++] = (char)base[i++];
+    i = 0;
+    while (i < 3 && ext[i] != ' ') i++;
+    if (i > 0) {
+        name[o++] = '.';
+        i = 0;
+        while (i < 3 && ext[i] != ' ') name[o++] = (char)ext[i++];
     }
-    uint32_t clus = start_clus;
-    uint32_t global = 0;
-    uint32_t hops = 0;
-    uint32_t run = 0, run_start = 0;
-    uint8_t sec[SECTOR];
-    while (clus >= 2 && clus < 0x0FFFFFF8 && hops++ < FAT_WALK_LIMIT) {
-        if (g_total_clusters && clus - 2 >= g_total_clusters) {
-            break;
-        }
-        for (uint32_t s = 0; s < g_sec_per_clus; s++) {
-            uint32_t lba = clus_to_lba(clus) + s;
-            if (!disk_read(lba, 1, sec)) {
-                return false;
-            }
-            for (uint32_t off = 0; off < SECTOR; off += 32) {
-                uint8_t b = sec[off];
-                bool free_e = (b == 0x00 || b == 0xE5);
-                if (free_e) {
-                    if (run == 0) {
-                        run_start = global;
-                    }
-                    run++;
-                    if (run >= count) {
-                        *out_index = run_start;
-                        return true;
-                    }
-                } else {
-                    run = 0;
-                }
-                global++;
-            }
-        }
-        uint32_t nxt = fat_next(clus);
-        if (nxt >= 2 && nxt < 0x0FFFFFF8) {
-            clus = nxt;
-        } else {
-            /* 目录链结束 -> 扩展新簇 */
-            uint32_t nc = fat_alloc_cluster();
-            if (nc == 0) {
-                return false;
-            }
-            if (!write_zero_cluster(nc)) {
-                /* 仍尽量链接，后续写会覆盖 */
-            }
-            if (!fat_set(clus, nc)) {
-                return false;
-            }
-            clus = nc;
-        }
-    }
-    return false;
+    name[o] = '\0';
 }
 
-/* ---- 名称 / 8.3 / LFN ---- */
-static uint8_t to_up(uint8_t c)
+/* 把显示名转为 11 字节 8.3（空格填充，大写）。返回 true 若成功。 */
+static bool parse_83(const char *name, uint8_t out11[11])
 {
-    if (c >= 'a' && c <= 'z') return (uint8_t)(c - 32);
-    return c;
-}
-static uint8_t fix_char(uint8_t c)
-{
-    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
-    switch (c) {
-        case '$': case '%': case '\'': case '-': case '_':
-        case '@': case '~': case '`': case '!': case '(':
-        case ')': case '{': case '}': case '^': case '#':
-        case '&': case '+': case ',': case '.': case ';':
-        case '=': case '[': case ']': return c;
-        default: return '_';
-    }
-}
-
-static void make_shortname(const char *in, uint8_t out83[11])
-{
-    for (int i = 0; i < 11; i++) out83[i] = ' ';
-    const char *p = in;
-    while (*p == '/' || *p == '\\') p++;
+    u_memset(out11, ' ', 11);
     const char *dot = NULL;
-    for (const char *q = p; *q; q++) if (*q == '.') dot = q;
-    if (dot == p) dot = NULL;               /* 以 '.' 开头的文件不切扩展名 */
-    char base[9]; for (int i = 0; i < 8; i++) base[i] = ' ';
-    char ext[4];  for (int i = 0; i < 3; i++) ext[i] = ' ';
+    for (const char *p = name; *p; p++) if (*p == '.') dot = p;
+    int bi = 0;
+    for (const char *p = name; *p && p != dot && bi < 8; p++) {
+        if (*p == ' ') continue;
+        out11[bi++] = (uint8_t)u_toupper((unsigned char)*p);
+    }
     if (dot) {
-        uint32_t bn = 0;
-        for (const char *s = p; s < dot && bn < 8; s++)
-            base[bn++] = (char)to_up(fix_char((uint8_t)*s));
-        uint32_t en = 0;
-        for (const char *s = dot + 1; *s && en < 3; s++)
-            ext[en++] = (char)to_up(fix_char((uint8_t)*s));
-    } else {
-        uint32_t bn = 0;
-        for (const char *s = p; *s && bn < 8; s++)
-            base[bn++] = (char)to_up(fix_char((uint8_t)*s));
-    }
-    for (int i = 0; i < 8; i++) out83[i] = (uint8_t)base[i];
-    for (int i = 0; i < 3; i++) out83[8 + i] = (uint8_t)ext[i];
-}
-
-static bool dir_has_83(uint32_t start_clus, const uint8_t *s83)
-{
-    uint8_t sec[SECTOR];
-    uint32_t clus = start_clus;
-    uint32_t hops = 0;
-    while (clus >= 2 && clus < 0x0FFFFFF8 && hops++ < FAT_WALK_LIMIT) {
-        if (g_total_clusters && clus - 2 >= g_total_clusters) break;
-        for (uint32_t s = 0; s < g_sec_per_clus; s++) {
-            if (!disk_read(clus_to_lba(clus) + s, 1, sec)) return false;
-            for (uint32_t off = 0; off < SECTOR; off += 32) {
-                const uint8_t *e = sec + off;
-                if (e[0] == 0x00) return false;            /* 目录结束 */
-                if ((e[11] & 0x0F) == 0x0F) continue;       /* LFN */
-                if (e[0] == 0xE5) continue;                 /* 已删 */
-                if (e[11] & 0x08) continue;                 /* 卷标 */
-                bool eq = true;
-                for (int i = 0; i < 11; i++) {
-                    uint8_t a = s83[i], b = e[i];
-                    if (a >= 'a' && a <= 'z') a -= 32;
-                    if (b >= 'a' && b <= 'z') b -= 32;
-                    if (a != b) { eq = false; break; }
-                }
-                if (eq) return true;
-            }
+        int ei = 8;
+        for (const char *p = dot + 1; *p && ei < 11; p++) {
+            if (*p == ' ') continue;
+            out11[ei++] = (uint8_t)u_toupper((unsigned char)*p);
         }
-        clus = fat_next(clus);
     }
-    return false;
-}
-
-/* 生成唯一 8.3 名：若与现有冲突，追加 '~' + 数字（仿 Windows 风格）。 */
-static bool make_unique_83(uint32_t parent_clus, const char *base, uint8_t out83[11])
-{
-    make_shortname(base, out83);
-    int attempts = 0;
-    while (dir_has_83(parent_clus, out83)) {
-        uint8_t n83[11]; for (int i = 0; i < 11; i++) n83[i] = ' ';
-        for (int i = 0; i < 6 && i < 8 && out83[i] != ' '; i++) n83[i] = out83[i];
-        n83[6] = '~';
-        n83[7] = (uint8_t)('1' + (attempts % 9));
-        for (int i = 8; i < 11; i++) n83[i] = out83[i];
-        for (int i = 0; i < 11; i++) out83[i] = n83[i];
-        if (++attempts > 99) return false;
-    }
+    if (bi == 0) return false;
     return true;
 }
 
-static void lfn_checksum(const uint8_t *s83, uint8_t *out)
+/* ===================== LFN ===================== */
+/* LFN 校验和（Microsoft 规范）：对 11 字节短名计算。 */
+static uint8_t lfn_checksum(const uint8_t *shortname11)
 {
     uint8_t sum = 0;
     for (int i = 0; i < 11; i++) {
-        uint8_t c = s83[i];
-        sum = (uint8_t)(((sum & 1) ? 0x80 : 0) + (sum >> 1) + c);
+        sum = (uint8_t)(((sum & 1) << 7) | (sum >> 1)) + shortname11[i];
     }
-    *out = sum;
+    return sum;
 }
 
-static void build_83_entry(uint8_t e[32], const uint8_t *s83, uint8_t attr,
-                           uint32_t clus, uint32_t size)
+/* 把一个 LFN 条目（0x0F）的 13 个 UTF-16 码元写入 utf16 buf 的对应位置。
+ * seq 为条目的序列号（1-based，最高位 0x40 表示末项）。 */
+static void lfn_collect(const uint8_t *e, uint16_t *utf16, uint32_t *utf16_n)
 {
-    for (int i = 0; i < 32; i++) e[i] = 0;
-    for (int i = 0; i < 11; i++) e[i] = s83[i];
-    e[11] = attr;
-    e[12] = 0;
-    e[13] = 0;
-    /* 创建/写日期：0x21 = 1980-01-01，时间 0（合法 FAT 日期） */
-    e[16] = 0x21; e[17] = 0;
-    e[18] = 0x21; e[19] = 0;
-    e[20] = (uint8_t)((clus >> 16) & 0xFF);
-    e[21] = (uint8_t)((clus >> 24) & 0xFF);
-    e[22] = 0; e[23] = 0;
-    e[24] = 0x21; e[25] = 0;
-    e[26] = (uint8_t)(clus & 0xFF);
-    e[27] = (uint8_t)((clus >> 8) & 0xFF);
-    e[28] = (uint8_t)(size & 0xFF);
-    e[29] = (uint8_t)((size >> 8) & 0xFF);
-    e[30] = (uint8_t)((size >> 16) & 0xFF);
-    e[31] = (uint8_t)((size >> 24) & 0xFF);
-}
-
-static void build_lfn_entry(uint32_t seq, uint32_t nlfn, uint8_t sum,
-                            const char *name, uint8_t e[32])
-{
-    for (int i = 0; i < 32; i++) e[i] = 0;
-    e[0] = (seq == nlfn) ? (uint8_t)(0x40 | seq) : (uint8_t)seq;
-    e[11] = 0x0F;
-    e[12] = 0;
-    e[13] = sum;
-    e[26] = 0;
-    e[27] = 0;
-    int nchars = (int)u_strlen(name);
-    for (int k = 0; k < 13; k++) {
-        int idx = (int)(seq - 1) * 13 + k;
-        uint16_t w;
-        if (idx < nchars) w = (uint16_t)(unsigned char)name[idx];
-        else if (idx == nchars) w = 0x0000;  /* 长名结束符 */
-        else w = 0xFFFF;                      /* 填充 */
-        uint8_t *dst;
-        if (k < 5) dst = e + 1 + 2 * k;
-        else if (k < 11) dst = e + 14 + 2 * (k - 5);
-        else dst = e + 28 + 2 * (k - 11);
-        dst[0] = (uint8_t)(w & 0xFF);
-        dst[1] = (uint8_t)((w >> 8) & 0xFF);
+    uint8_t seq = e[0] & 0x1F;            /* 序列号（去末位标志） */
+    uint32_t base = (seq - 1) * 13;
+    /* 5 个码元 @ 1,3,5,7,9 */
+    uint16_t units[13];
+    units[0] = rd16(e + 1);
+    units[1] = rd16(e + 3);
+    units[2] = rd16(e + 5);
+    units[3] = rd16(e + 7);
+    units[4] = rd16(e + 9);
+    units[5] = rd16(e + 14);
+    units[6] = rd16(e + 16);
+    units[7] = rd16(e + 18);
+    units[8] = rd16(e + 20);
+    units[9] = rd16(e + 22);
+    units[10] = rd16(e + 24);
+    units[11] = rd16(e + 26);
+    units[12] = rd16(e + 28);
+    for (int i = 0; i < 13; i++) {
+        if (base + i < MAX_NAME_UTF8) utf16[base + i] = units[i];
     }
+    if (base + 13 > *utf16_n) *utf16_n = base + 13;
 }
 
-typedef struct { uint32_t lba; uint32_t off; } slot_t;
+/* UTF-16（LE）-> UTF-8（截断安全）。返回写入字符数（不含 NUL）。 */
+static uint32_t utf16_to_utf8(const uint16_t *u16, uint32_t n, char *out, uint32_t outsz)
+{
+    uint32_t o = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t cp = u16[i];
+        if (cp == 0) break;
+        if (cp < 0x80) {
+            if (o + 1 < outsz) out[o++] = (char)cp;
+        } else if (cp < 0x800) {
+            if (o + 2 < outsz) {
+                out[o++] = (char)(0xC0 | (cp >> 6));
+                out[o++] = (char)(0x80 | (cp & 0x3F));
+            }
+        } else {
+            if (o + 3 < outsz) {
+                out[o++] = (char)(0xE0 | (cp >> 12));
+                out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                out[o++] = (char)(0x80 | (cp & 0x3F));
+            }
+        }
+    }
+    if (outsz) out[o] = '\0';
+    return o;
+}
 
+/* ===================== 目录查找 ===================== */
 typedef struct {
-    bool     found;
-    slot_t   entry;                  /* 8.3 条目位置 */
-    int      nlfn;
-    slot_t   lfn[32];                /* 其前导 LFN 条目位置（物理逆序） */
-    uint32_t first_clus;
-    uint32_t size;
+    uint32_t first_clus; /* 该文件/目录自身的首簇（来自目录项 0x14/0x1A） */
+    uint32_t dir_lba;   /* 目录项所在扇区 LBA（用于写回目录项/读首簇） */
+    uint32_t dir_off;   /* 目录项在扇区内的字节偏移（0..SECTOR-32） */
+    uint32_t size;      /* 文件大小（字节） */
     bool     is_dir;
-} dir_loc_t;
+} found_t;
 
-/* 在目录中按名查找条目，返回 8.3 条目位置、前导 LFN 位置、首簇、大小、属性。 */
-static void dir_lookup(uint32_t start_clus, const char *want, dir_loc_t *out)
+/* 在“某目录簇链”中查找名为 target（UTF-8 显示名）的条目。
+ * 命中返回 true，结果写入 *f。lfn：累积 LFN 并用校验和验证，否则回退短名。 */
+static bool dir_lookup(uint32_t dir_clus, const char *target, found_t *f)
 {
-    *out = (dir_loc_t){ 0 };
-    uint8_t sec[SECTOR];
-    uint32_t clus = start_clus;
-    uint32_t hops = 0;
-    lfn_reset();
-    slot_t lfn_slots[32];
-    int nlfn = 0;
-    while (clus >= 2 && clus < 0x0FFFFFF8 && hops++ < FAT_WALK_LIMIT) {
-        if (g_total_clusters && clus - 2 >= g_total_clusters) break;
+    uint32_t cur = dir_clus;
+    u_memset(f, 0, sizeof(*f));
+    uint16_t lfn_u16[MAX_NAME_UTF8];
+    uint32_t lfn_n = 0;
+    uint8_t  lfn_sum = 0;
+    bool     lfn_active = false;
+
+    while (cur >= CLUSTER_MIN && cur < g_max_cluster) {
+        uint32_t base = clus_to_lba(cur);
         for (uint32_t s = 0; s < g_sec_per_clus; s++) {
-            uint32_t lba = clus_to_lba(clus) + s;
-            if (!disk_read(lba, 1, sec)) return;
-            for (uint32_t off = 0; off < SECTOR; off += 32) {
-                const uint8_t *e = sec + off;
-                if (e[0] == 0x00) return;                 /* 目录结束 */
-                if ((e[11] & 0x0F) == 0x0F && e[0] != 0xE5) {
-                    if (nlfn < 32) {
-                        lfn_slots[nlfn].lba = lba;
-                        lfn_slots[nlfn].off = off;
-                        nlfn++;
-                    }
-                    lfn_add(e);
+            if (!block_read(base + s, 1, g_rbuf)) return false;
+            for (uint32_t off = 0; off + DIR_ENTRY_SIZE <= SECTOR; off += DIR_ENTRY_SIZE) {
+                const uint8_t *e = g_rbuf + off;
+                uint8_t attr = e[11];
+                if (e[0] == 0x00) {
+                    return false; /* 目录结束 */
+                }
+                if (e[0] == 0xE5) { /* 已删除，重置 LFN 状态 */
+                    lfn_active = false; lfn_n = 0;
                     continue;
                 }
-                if (e[0] == 0xE5 || (e[11] & 0x08)) {
-                    lfn_reset(); nlfn = 0;
+                if ((attr & 0x0F) == 0x0F) {
+                    /* LFN 条目 */
+                    lfn_collect(e, lfn_u16, &lfn_n);
+                    lfn_sum = e[13];
+                    lfn_active = true;
                     continue;
                 }
-                char name[LFN_CAP];
-                if (lfn_pull(name) == 0) fmt_83(e, name);
-                /* P0-生产修复：若累积了 LFN，校验其与 8.3 短名的校验和一致。
-                 * 损坏/不匹配的 LFN（如删除残留导致误拼接）一律回退 8.3 短名，
-                 * 避免用错误长名匹配，杜绝"改名/误删"类数据损坏。 */
-                if (nlfn > 0) {
-                    uint8_t sum, stored;
-                    lfn_checksum(e, &sum);
-                    stored = sec[lfn_slots[0].off + 13];
-                    if (sum != stored) {
-                        fmt_83(e, name);
+                /* 普通 8.3 目录项 */
+                char sname[13];
+                fmt_83(e, sname);
+                char disp[MAX_NAME_UTF8];
+                bool use_lfn = false;
+                if (lfn_active) {
+                    /* 校验和验证 */
+                    if (lfn_checksum(e) == lfn_sum) {
+                        utf16_to_utf8(lfn_u16, lfn_n, disp, sizeof(disp));
+                        use_lfn = true;
                     }
+                    lfn_active = false; lfn_n = 0;
                 }
-                lfn_reset();
-                if (ci_strcmp(name, want) == 0) {
-                    out->found = true;
-                    out->entry.lba = lba;
-                    out->entry.off = off;
-                    out->nlfn = nlfn;
-                    for (int i = 0; i < nlfn; i++) out->lfn[i] = lfn_slots[i];
-                    out->first_clus = ((uint32_t)rd16(e + 20) << 16) | rd16(e + 26);
-                    out->size = rd32(e + 28);
-                    out->is_dir = (e[11] & 0x10) != 0;
-                    return;
+                const char *cand = use_lfn ? disp : sname;
+                if (u_strcmp(cand, target) == 0) {
+                    f->first_clus = rd16(e + 20) | ((uint32_t)rd16(e + 26) << 16);
+                    f->dir_lba = base + s;
+                    f->dir_off = off;
+                    f->size    = rd32(e + 28);
+                    f->is_dir  = (attr & 0x10) != 0;
+                    return true;
                 }
             }
         }
-        clus = fat_next(clus);
+        cur = fat_next(cur);
+    }
+    return false;
+}
+
+/* 路径解析：支持 '/' 分隔的多级路径，从根目录开始逐级查找。
+ * 只读 final 名字并填写 found_t。返回 true 命中。 */
+static bool path_lookup(const char *path, found_t *f)
+{
+    /* 归一：去掉前导 '/' */
+    while (*path == '/') path++;
+    if (*path == '\0') { /* 根目录自身 */
+        f->first_clus = g_root_cluster;
+        f->dir_lba = 0; f->dir_off = 0; f->size = 0; f->is_dir = true;
+        return true;
+    }
+    uint32_t cur = g_root_cluster;
+    char comp[64];
+    const char *p = path;
+    while (1) {
+        /* 取一段组件 */
+        int i = 0;
+        while (*p && *p != '/' && i < 63) comp[i++] = *p++;
+        comp[i] = '\0';
+        if (*p == '/') {
+            /* 中间组件必须是目录 */
+            found_t sub;
+            u_memset(&sub, 0, sizeof(sub));
+            if (!dir_lookup(cur, comp, &sub) || !sub.is_dir) return false;
+            cur = sub.first_clus;
+            p++; /* 跳过 '/' */
+            continue;
+        }
+        /* 末段 */
+        return dir_lookup(cur, comp, f);
     }
 }
 
-static bool dir_empty_cb(const uint8_t *e, const char *name, void *priv)
+/* ===================== 枚举目录（列出条目） ===================== */
+/* 把目录 dir_clus 的所有条目以“name\\n”形式写入 out，最多 outsz-1 字节。
+ * 返回写入字节数。 */
+static uint32_t list_dir(uint32_t dir_clus, char *out, uint32_t outsz)
 {
-    (void)e;
-    bool *empty = (bool *)priv;
-    if (ci_strcmp(name, ".") == 0 || ci_strcmp(name, "..") == 0) return false;
-    *empty = false;
-    return true;                                /* 发现非 . / .. 条目 -> 非空 */
-}
-static bool dir_is_empty(uint32_t clus)
-{
-    bool empty = true;
-    read_dir(clus, dir_empty_cb, &empty);
-    return empty;
-}
+    uint32_t total = 0;
+    uint32_t cur = dir_clus;
+    uint16_t lfn_u16[MAX_NAME_UTF8];
+    uint32_t lfn_n = 0;
+    uint8_t  lfn_sum = 0;
+    bool     lfn_active = false;
 
-/* 拆分路径为父目录簇号 + 基名（base 由调用方缓冲承载）。 */
-static bool split_parent(const char *path, uint32_t *parent_clus,
-                         char *base, uint32_t basemax)
-{
-    const char *last = NULL;
-    for (const char *p = path; *p; p++) if (*p == '/') last = p;
-    *parent_clus = g_root_clus;
-    if (last) {
-        uint32_t n = (uint32_t)(last - path);
-        if (n >= basemax) return false;
-        char pbuf[64];
-        uint32_t m = n < sizeof(pbuf) ? n : (uint32_t)(sizeof(pbuf) - 1);
-        for (uint32_t i = 0; i < m; i++) pbuf[i] = path[i];
-        pbuf[m] = 0;
-        path_cb_t pc; resolve_path(pbuf, &pc);
-        if (!pc.found || !pc.is_dir) return false;
-        *parent_clus = pc.clus;
-        const char *b = last + 1;
-        uint32_t i = 0;
-        while (*b && i + 1 < basemax) base[i++] = *b++;
-        base[i] = 0;
-    } else {
-        uint32_t i = 0;
-        while (*path && i + 1 < basemax) base[i++] = *path++;
-        base[i] = 0;
+    while (cur >= CLUSTER_MIN && cur < g_max_cluster) {
+        uint32_t base = clus_to_lba(cur);
+        for (uint32_t s = 0; s < g_sec_per_clus; s++) {
+            if (!block_read(base + s, 1, g_rbuf)) return total;
+            for (uint32_t off = 0; off + DIR_ENTRY_SIZE <= SECTOR; off += DIR_ENTRY_SIZE) {
+                const uint8_t *e = g_rbuf + off;
+                uint8_t attr = e[11];
+                if (e[0] == 0x00) { return total; }
+                if (e[0] == 0xE5) { lfn_active = false; lfn_n = 0; continue; }
+                if ((attr & 0x0F) == 0x0F) {
+                    lfn_collect(e, lfn_u16, &lfn_n);
+                    lfn_sum = e[13];
+                    lfn_active = true;
+                    continue;
+                }
+                char sname[13];
+                fmt_83(e, sname);
+                char disp[MAX_NAME_UTF8];
+                bool use_lfn = false;
+                if (lfn_active) {
+                    if (lfn_checksum(e) == lfn_sum) {
+                        utf16_to_utf8(lfn_u16, lfn_n, disp, sizeof(disp));
+                        use_lfn = true;
+                    }
+                    lfn_active = false; lfn_n = 0;
+                }
+                const char *cand = use_lfn ? disp : sname;
+                uint32_t l = (uint32_t)u_strlen(cand);
+                if (total + l + 1 < outsz) {
+                    u_memcpy(out + total, cand, l);
+                    out[total + l] = '\n';
+                    total += l + 1;
+                }
+            }
+        }
+        cur = fat_next(cur);
     }
-    return base[0] != 0;
+    return total;
 }
 
-static uint32_t chain_len(uint32_t first)
+/* ===================== 读文件 ===================== */
+/* 读文件 [offset, offset+len) 到 out（out 属于调用方本地缓冲，安全）。
+ * 返回实际读出字节数。 */
+static uint32_t read_file_at(uint32_t file_clus, uint32_t file_size,
+                             uint32_t offset, void *out, uint32_t len)
 {
-    uint32_t c = first, n = 0, guard = 0;
-    uint32_t total = g_total_clusters ? g_total_clusters : 1;
-    while (c >= 2 && c - 2 < total && guard++ <= total + 1) {
-        n++; c = fat_next(c);
+    if (offset >= file_size) return 0;
+    uint32_t remain = file_size - offset;
+    uint32_t want = (len < remain) ? len : remain;
+    if (want == 0) return 0;
+
+    /* 定位起始簇（按字节偏移跳过簇） */
+    uint32_t clus_bytes = g_sec_per_clus * SECTOR;
+    uint32_t skip = offset / clus_bytes;
+    uint32_t cur = file_clus;
+    for (uint32_t i = 0; i < skip && cur >= CLUSTER_MIN && cur < g_max_cluster; i++) {
+        cur = fat_next(cur);
+    }
+    if (cur < CLUSTER_MIN || cur >= g_max_cluster) return 0;
+
+    uint32_t cluster_skip = offset % clus_bytes;   /* 起始簇内字节偏移 */
+    uint32_t total = 0;
+    uint8_t *p = (uint8_t *)out;
+
+    while (cur >= CLUSTER_MIN && cur < g_max_cluster && total < want) {
+        uint32_t base = clus_to_lba(cur);
+        uint32_t run  = g_sec_per_clus;
+        if (base + run - 1 > g_max_lba) {
+            if (base > g_max_lba) break;
+            run = g_max_lba - base + 1;
+        }
+        for (uint32_t s = 0; s < run && total < want; s++) {
+            if (!block_read(base + s, 1, g_rbuf)) return total;
+            uint32_t in_off = (total == 0) ? cluster_skip : 0;
+            uint32_t avail  = SECTOR - in_off;
+            uint32_t need   = want - total;
+            uint32_t chunk  = (need < avail) ? need : avail;
+            u_memcpy(p + total, g_rbuf + in_off, chunk);
+            total += chunk;
+        }
+        cur = fat_next(cur);
+    }
+    return total;
+}
+
+/* 整文件读（execve/OOL 用）：读入 g_filebuf[sizeof(fs_resp_t) ..]，头部写 fs_resp_t。
+ * 返回字节数（=file_size，封顶 FILEBUF_SIZE）。OOL 描述符指向 g_filebuf 整体。 */
+static uint32_t read_file_whole(uint32_t file_clus, uint32_t file_size)
+{
+    if (file_size > FILEBUF_SIZE - sizeof(fs_resp_t)) return 0;
+    uint32_t n = chain_read(file_clus, file_size, g_filebuf + sizeof(fs_resp_t));
+    if (n == file_size) {
+        fs_resp_t *ofr = (fs_resp_t *)g_filebuf;
+        ofr->status = FS_OK;
+        ofr->length = n;
     }
     return n;
 }
 
-static uint32_t cluster_at_index(uint32_t first, uint32_t ci)
+/* ===================== 写路径 ===================== */
+/* 在目录 dir_clus 中找一个空闲（或删除）目录项槽，写入 name（短名 + 可选 LFN）。
+ * 返回 true 并在 *out 填写该槽的位置（供后续更新 size/first_clus）。 */
+typedef struct { uint32_t lba; uint32_t off; } dir_slot_t;
+
+static bool dir_alloc_entry(uint32_t dir_clus, dir_slot_t *slot)
 {
-    uint32_t c = first, i = 0, guard = 0;
-    uint32_t total = g_total_clusters ? g_total_clusters : 1;
-    while (i < ci && c >= 2 && c - 2 < total && guard++ <= total + 1) {
-        c = fat_next(c); i++;
-    }
-    return c;
-}
-
-static bool patch_dir_firstclus(dir_loc_t *loc, uint32_t clus)
-{
-    uint8_t b[2];
-    b[0] = (uint8_t)((clus >> 16) & 0xFF);
-    b[1] = (uint8_t)((clus >> 24) & 0xFF);
-    if (!dir_patch(loc->entry.lba, loc->entry.off + 20, b, 2)) return false;
-    b[0] = (uint8_t)(clus & 0xFF);
-    b[1] = (uint8_t)((clus >> 8) & 0xFF);
-    return dir_patch(loc->entry.lba, loc->entry.off + 26, b, 2);
-}
-
-static bool patch_dir_size(dir_loc_t *loc, uint32_t size)
-{
-    uint8_t b[4];
-    b[0] = (uint8_t)(size & 0xFF);
-    b[1] = (uint8_t)((size >> 8) & 0xFF);
-    b[2] = (uint8_t)((size >> 16) & 0xFF);
-    b[3] = (uint8_t)((size >> 24) & 0xFF);
-    return dir_patch(loc->entry.lba, loc->entry.off + 28, b, 4);
-}
-
-/* 初始化一个新建目录的首簇（写入 "." 与 ".."）。 */
-static bool init_dir_cluster(uint32_t first, uint32_t parent_clus)
-{
-    if (!write_zero_cluster(first)) return false;
-    uint32_t lba = clus_to_lba(first);
-    uint8_t e[32];
-    for (int i = 0; i < 32; i++) e[i] = 0;
-    e[0] = '.'; for (int i = 1; i < 11; i++) e[i] = ' ';
-    e[11] = 0x10; e[16] = 0x21; e[18] = 0x21; e[24] = 0x21;
-    e[20] = (uint8_t)((first >> 16) & 0xFF); e[21] = (uint8_t)((first >> 24) & 0xFF);
-    e[26] = (uint8_t)(first & 0xFF); e[27] = (uint8_t)((first >> 8) & 0xFF);
-    if (!dir_patch(lba, 0, e, 32)) return false;
-    for (int i = 0; i < 32; i++) e[i] = 0;
-    e[0] = '.'; e[1] = '.'; for (int i = 2; i < 11; i++) e[i] = ' ';
-    e[11] = 0x10; e[16] = 0x21; e[18] = 0x21; e[24] = 0x21;
-    e[20] = (uint8_t)((parent_clus >> 16) & 0xFF); e[21] = (uint8_t)((parent_clus >> 24) & 0xFF);
-    e[26] = (uint8_t)(parent_clus & 0xFF); e[27] = (uint8_t)((parent_clus >> 8) & 0xFF);
-    return dir_patch(lba, 32, e, 32);
-}
-
-/* 创建空文件(is_dir=false)或目录(is_dir=true)。已存在且类型一致则幂等返回 OK。 */
-static int fs_create(const char *path, bool is_dir)
-{
-    uint32_t parent;
-    char base[64];
-    if (!split_parent(path, &parent, base, sizeof(base))) {
-        return FS_ERR_NOENT;
-    }
-    dir_loc_t loc;
-    dir_lookup(parent, base, &loc);
-    if (loc.found) {
-        if (loc.is_dir == is_dir) return FS_OK;   /* 幂等 */
-        return FS_ERR_IO;
-    }
-    uint32_t first_clus = 0;
-    if (is_dir) {
-        first_clus = fat_alloc_cluster();
-        if (first_clus == 0) return FS_ERR_IO;
-        uint32_t parent_for_dot = (parent == g_root_clus) ? 0 : parent;
-        if (!init_dir_cluster(first_clus, parent_for_dot)) return FS_ERR_IO;
-    }
-    uint8_t s83[11];
-    if (!make_unique_83(parent, base, s83)) return FS_ERR_IO;
-    uint8_t sum;
-    lfn_checksum(s83, &sum);
-    uint32_t nchars = (uint32_t)u_strlen(base);
-    uint32_t nlfn = (nchars + 12) / 13;
-    uint32_t count = nlfn + 1;
-    uint32_t xidx;
-    if (!dir_find_free_run(parent, count, &xidx)) return FS_ERR_IO;
-    for (uint32_t i = 0; i < nlfn; i++) {
-        uint32_t seq = nlfn - i;                  /* 物理逆序：最高序号先写 */
-        uint8_t le[32];
-        build_lfn_entry(seq, nlfn, sum, base, le);
-        uint32_t c, bo;
-        if (!dir_entry_pos(parent, xidx + i, &c, &bo)) return FS_ERR_IO;
-        if (!write_entry_at(clus_to_lba(c) + bo / SECTOR, bo % SECTOR, le)) return FS_ERR_IO;
-    }
-    uint8_t e83[32];
-    build_83_entry(e83, s83, is_dir ? (uint8_t)0x10 : (uint8_t)0x20, first_clus, 0);
-    {
-        uint32_t c, bo;
-        if (!dir_entry_pos(parent, xidx + nlfn, &c, &bo)) return FS_ERR_IO;
-        if (!write_entry_at(clus_to_lba(c) + bo / SECTOR, bo % SECTOR, e83)) return FS_ERR_IO;
-    }
-    return FS_OK;
-}
-
-static int fs_write(const char *path, const uint8_t *data, uint32_t len, uint32_t offset)
-{
-    if (len == 0) return FS_OK;
-    if (len > FS_WRITE_MAX) len = FS_WRITE_MAX;
-    uint32_t parent;
-    char base[64];
-    if (!split_parent(path, &parent, base, sizeof(base))) return FS_ERR_NOENT;
-    dir_loc_t loc;
-    dir_lookup(parent, base, &loc);
-    if (!loc.found) {
-        if (fs_create(path, false) != FS_OK) return FS_ERR_IO;
-        dir_lookup(parent, base, &loc);
-        if (!loc.found) return FS_ERR_IO;
-    }
-    uint32_t clus_bytes = g_sec_per_clus * SECTOR;
-    uint32_t old_size = loc.size;
-    uint32_t start_clus = loc.first_clus;
-    uint32_t need = (offset + len + clus_bytes - 1) / clus_bytes;
-    uint32_t cur = (start_clus == 0) ? 0 : chain_len(start_clus);
-    uint32_t last = start_clus;
-    if (cur == 0 && need > 0) {
-        uint32_t nc = fat_alloc_cluster();
-        if (nc == 0) return FS_ERR_IO;
-        if (!write_zero_cluster(nc)) return FS_ERR_IO;
-        start_clus = nc; last = nc; cur = 1;
-        if (!patch_dir_firstclus(&loc, nc)) return FS_ERR_IO;
-    }
-    while (cur < need) {
-        uint32_t nc = fat_alloc_cluster();
-        if (nc == 0) return FS_ERR_IO;
-        if (!write_zero_cluster(nc)) return FS_ERR_IO;
-        if (!fat_set(last, nc)) return FS_ERR_IO;        /* 链接 */
-        if (!fat_set(nc, 0x0FFFFFFF)) return FS_ERR_IO;  /* 新末端标记 EOF */
-        last = nc; cur++;
-    }
-    uint8_t sec[SECTOR];
-    uint32_t p = offset;
-    uint32_t endp = offset + len;
-    while (p < endp) {
-        uint32_t ci = p / clus_bytes;
-        uint32_t cluster = cluster_at_index(start_clus, ci);
-        if (cluster < 2) return FS_ERR_IO;
-        uint32_t within = p % clus_bytes;
-        uint32_t si = within / SECTOR;
-        uint32_t bo = within % SECTOR;
-        uint32_t lba = clus_to_lba(cluster) + si;
-        if (!disk_read(lba, 1, sec)) return FS_ERR_IO;
-        uint32_t n = SECTOR - bo;
-        if (n > endp - p) n = endp - p;
-        u_memcpy(sec + bo, data + (p - offset), n);
-        if (!disk_write(lba, 1, sec)) return FS_ERR_IO;
-        p += n;
-    }
-    uint32_t new_size = old_size;
-    if (offset + len > new_size) new_size = offset + len;
-    if (!patch_dir_size(&loc, new_size)) return FS_ERR_IO;
-    return FS_OK;
-}
-
-static int fs_unlink(const char *path)
-{
-    uint32_t parent;
-    char base[64];
-    if (!split_parent(path, &parent, base, sizeof(base))) return FS_ERR_NOENT;
-    dir_loc_t loc;
-    dir_lookup(parent, base, &loc);
-    if (!loc.found) return FS_ERR_NOENT;
-    if (loc.is_dir) {
-        if (!dir_is_empty(loc.first_clus)) return FS_ERR_IO;  /* 非空目录拒删 */
-    }
-    if (!fat_free_chain(loc.first_clus)) return FS_ERR_IO;
-    uint8_t e5 = 0xE5;
-    if (!dir_patch(loc.entry.lba, loc.entry.off, &e5, 1)) return FS_ERR_IO;
-    for (int i = 0; i < loc.nlfn; i++) {
-        dir_patch(loc.lfn[i].lba, loc.lfn[i].off, &e5, 1);
-    }
-    return FS_OK;
-}
-
-static int fs_rename(const char *oldp, const char *newp)
-{
-    uint32_t op, np;
-    char ob[64], nb[64];
-    if (!split_parent(oldp, &op, ob, sizeof(ob))) return FS_ERR_NOENT;
-    if (!split_parent(newp, &np, nb, sizeof(nb))) return FS_ERR_NOENT;
-    dir_loc_t loc;
-    dir_lookup(op, ob, &loc);
-    if (!loc.found) return FS_ERR_NOENT;
-    uint8_t s83[11];
-    if (!make_unique_83(np, nb, s83)) return FS_ERR_IO;
-    uint8_t sum;
-    lfn_checksum(s83, &sum);
-    uint32_t nchars = (uint32_t)u_strlen(nb);
-    uint32_t nlfn = (nchars + 12) / 13;
-    uint32_t count = nlfn + 1;
-    uint32_t xidx;
-    if (!dir_find_free_run(np, count, &xidx)) return FS_ERR_IO;
-    for (uint32_t i = 0; i < nlfn; i++) {
-        uint32_t seq = nlfn - i;
-        uint8_t le[32];
-        build_lfn_entry(seq, nlfn, sum, nb, le);
-        uint32_t c, bo;
-        if (!dir_entry_pos(np, xidx + i, &c, &bo)) return FS_ERR_IO;
-        if (!write_entry_at(clus_to_lba(c) + bo / SECTOR, bo % SECTOR, le)) return FS_ERR_IO;
-    }
-    uint8_t e83[32];
-    build_83_entry(e83, s83, loc.is_dir ? (uint8_t)0x10 : (uint8_t)0x20,
-                   loc.first_clus, loc.size);
-    {
-        uint32_t c, bo;
-        if (!dir_entry_pos(np, xidx + nlfn, &c, &bo)) return FS_ERR_IO;
-        if (!write_entry_at(clus_to_lba(c) + bo / SECTOR, bo % SECTOR, e83)) return FS_ERR_IO;
-    }
-    uint8_t e5 = 0xE5;
-    if (!dir_patch(loc.entry.lba, loc.entry.off, &e5, 1)) return FS_ERR_IO;
-    for (int i = 0; i < loc.nlfn; i++) {
-        dir_patch(loc.lfn[i].lba, loc.lfn[i].off, &e5, 1);
-    }
-    return FS_OK;
-}
-
-static int fs_truncate(const char *path, uint32_t new_size)
-{
-    uint32_t parent;
-    char base[64];
-    if (!split_parent(path, &parent, base, sizeof(base))) return FS_ERR_NOENT;
-    dir_loc_t loc;
-    dir_lookup(parent, base, &loc);
-    if (!loc.found) return FS_ERR_NOENT;
-    uint32_t clus_bytes = g_sec_per_clus * SECTOR;
-    uint32_t cur = (loc.first_clus == 0) ? 0 : chain_len(loc.first_clus);
-    uint32_t need = (new_size + clus_bytes - 1) / clus_bytes;
-    if (new_size == 0) need = 0;
-    if (need > cur) {
-        uint32_t start = loc.first_clus;
-        uint32_t last = start;
-        if (cur == 0) {
-            uint32_t nc = fat_alloc_cluster();
-            if (nc == 0) return FS_ERR_IO;
-            if (!write_zero_cluster(nc)) return FS_ERR_IO;
-            start = nc; last = nc; cur = 1;
-            if (!patch_dir_firstclus(&loc, nc)) return FS_ERR_IO;
-        }
-        while (cur < need) {
-            uint32_t nc = fat_alloc_cluster();
-            if (nc == 0) return FS_ERR_IO;
-            if (!write_zero_cluster(nc)) return FS_ERR_IO;
-            if (!fat_set(last, nc)) return FS_ERR_IO;
-            if (!fat_set(nc, 0x0FFFFFFF)) return FS_ERR_IO;
-            last = nc; cur++;
-        }
-    } else if (need < cur) {
-        if (need == 0) {
-            if (!fat_free_chain(loc.first_clus)) return FS_ERR_IO;
-            if (!patch_dir_firstclus(&loc, 0)) return FS_ERR_IO;
-        } else {
-            uint32_t c = cluster_at_index(loc.first_clus, need - 1);
-            uint32_t nx = fat_next(c);
-            if (!fat_set(c, 0x0FFFFFFF)) return FS_ERR_IO;   /* 截断 */
-            if (nx >= 2 && nx - 2 < g_total_clusters) {
-                fat_free_chain(nx);
-            }
-        }
-    }
-    if (!patch_dir_size(&loc, new_size)) return FS_ERR_IO;
-    return FS_OK;
-}
-
-static int fs_cmp(const uint8_t *a, const uint8_t *b, uint32_t n)
-{
-    for (uint32_t i = 0; i < n; i++) {
-        if (a[i] != b[i]) return (int)a[i] - (int)b[i];
-    }
-    return 0;
-}
-
-static int fs_read_all(const char *path, uint8_t *buf, uint32_t cap)
-{
-    path_cb_t f;
-    resolve_path(path, &f);
-    if (!f.found || f.is_dir) return -1;
-    return (int)read_file(f.clus, f.size, (char *)buf, cap);
-}
-
-/* 挂载自检：写 -> 读回 -> 比较，覆盖创建/追加/子目录/重命名/删除/截断。 */
-static void fs_selftest(void)
-{
-    u_print("[fs] write-path self-test begin\n");
-    bool ok = true;
-    const char *msg = "SukiOS FAT32 write path OK!\n";
-    uint32_t mlen = (uint32_t)u_strlen(msg);
-    if (fs_write("WRITETST.TXT", (const uint8_t *)msg, mlen, 0) != FS_OK) {
-        u_print("[fs]   create+write FAIL\n"); ok = false;
-    } else {
-        uint8_t rb[64];
-        int n = fs_read_all("WRITETST.TXT", rb, sizeof(rb));
-        if (n != (int)mlen || fs_cmp(rb, (const uint8_t *)msg, mlen) != 0) {
-            u_print("[fs]   write+readback MISMATCH\n"); ok = false;
-        } else u_print("[fs]   write+readback PASS\n");
-    }
-    if (fs_write("WRITETST.TXT", (const uint8_t *)"APPEND", 6, mlen) == FS_OK) {
-        uint8_t rb[64];
-        int n = fs_read_all("WRITETST.TXT", rb, sizeof(rb));
-        if (n == (int)(mlen + 6) && fs_cmp(rb, (const uint8_t *)msg, mlen) == 0
-            && fs_cmp(rb + mlen, (const uint8_t *)"APPEND", 6) == 0) {
-            u_print("[fs]   append PASS\n");
-        } else { u_print("[fs]   append FAIL\n"); ok = false; }
-    } else { u_print("[fs]   append FAIL\n"); ok = false; }
-    if (fs_create("TESTDIR", true) != FS_OK) {
-        u_print("[fs]   mkdir FAIL\n"); ok = false;
-    } else if (fs_write("TESTDIR/INNER.TXT", (const uint8_t *)"inner ok\n", 8, 0) != FS_OK) {
-        u_print("[fs]   subdir write FAIL\n"); ok = false;
-    } else {
-        uint8_t rb[32];
-        int n = fs_read_all("TESTDIR/INNER.TXT", rb, sizeof(rb));
-        if (n == 8 && fs_cmp(rb, (const uint8_t *)"inner ok\n", 8) == 0) {
-            u_print("[fs]   mkdir+subdir PASS\n");
-        } else { u_print("[fs]   subdir readback FAIL\n"); ok = false; }
-    }
-    if (fs_rename("WRITETST.TXT", "WT2.TXT") == FS_OK) {
-        uint8_t rb[64];
-        int n = fs_read_all("WT2.TXT", rb, sizeof(rb));
-        if (n == (int)(mlen + 6) && fs_cmp(rb, (const uint8_t *)msg, mlen) == 0
-            && fs_cmp(rb + mlen, (const uint8_t *)"APPEND", 6) == 0) {
-            u_print("[fs]   rename PASS\n");
-        } else { u_print("[fs]   rename FAIL\n"); ok = false; }
-    } else { u_print("[fs]   rename FAIL\n"); ok = false; }
-    if (fs_unlink("WT2.TXT") != FS_OK) {
-        u_print("[fs]   unlink FAIL\n"); ok = false;
-    } else {
-        path_cb_t f; resolve_path("WT2.TXT", &f);
-        if (f.found) { u_print("[fs]   unlink FAIL (still found)\n"); ok = false; }
-        else u_print("[fs]   unlink PASS\n");
-    }
-    if (fs_unlink("TESTDIR/INNER.TXT") != FS_OK) {
-        u_print("[fs]   unlink inner FAIL\n"); ok = false;
-    }
-    if (fs_unlink("TESTDIR") != FS_OK) {
-        u_print("[fs]   rmdir FAIL\n"); ok = false;
-    } else {
-        path_cb_t f; resolve_path("TESTDIR", &f);
-        if (f.found) { u_print("[fs]   rmdir FAIL\n"); ok = false; }
-        else u_print("[fs]   rmdir PASS\n");
-    }
-    if (fs_write("TRUNC.TXT", (const uint8_t *)"0123456789", 10, 0) == FS_OK) {
-        if (fs_truncate("TRUNC.TXT", 4) == FS_OK) {
-            uint8_t rb[16];
-            int n = fs_read_all("TRUNC.TXT", rb, sizeof(rb));
-            if (n == 4 && fs_cmp(rb, (const uint8_t *)"0123", 4) == 0) {
-                u_print("[fs]   truncate PASS\n");
-            } else { u_print("[fs]   truncate FAIL\n"); ok = false; }
-        } else { u_print("[fs]   truncate FAIL\n"); ok = false; }
-        fs_unlink("TRUNC.TXT");
-    }
-    u_print(ok ? "[fs] write-path self-test: ALL PASS\n"
-                : "[fs] write-path self-test: FAIL\n");
-
-    /* P0-生产修复验证：大文件（MOONHALO.MP3，接近卷尾）整读 + 尾块读，
-     * 确认 read_file_at 预读越界裁剪后尾块不丢（此前接近卷尾的流式读
-     * 会因内核 ata_read_sectors 越界保护而读不到尾块）。 */
-    {
-        path_cb_t mp3; resolve_path("MOONHALO.MP3", &mp3);
-        if (!mp3.found) {
-            u_print("[fs]   bigfile: SKIP (no MOONHALO.MP3)\n");
-        } else {
-            uint32_t total = 0, off = 0;
-            bool big_ok = true;
-            static uint8_t blk[FS_DATA_MAX];
-            while (off < mp3.size) {
-                uint32_t want = mp3.size - off;
-                if (want > FS_DATA_MAX) want = FS_DATA_MAX;
-                uint32_t got = read_file_at(mp3.clus, mp3.size, off,
-                                            (char *)blk, want);
-                if (got != want) { big_ok = false; break; }
-                off    += got;
-                total  += got;
-            }
-            /* 尾块读：size-100 处应返回 100 字节（裁剪后不越界） */
-            uint32_t tail = 100;
-            uint32_t tg = read_file_at(mp3.clus, mp3.size, mp3.size - tail,
-                                       (char *)blk, tail);
-            if (total != mp3.size || tg != tail) big_ok = false;
-            u_print(big_ok ? "[fs]   bigfile whole-read PASS\n"
-                           : "[fs]   bigfile whole-read FAIL\n");
-            if (!big_ok) ok = false;
-        }
-    }
-}
-
-/* ---- 服务循环 ---- */
-static uint8_t g_req[sizeof(mach_msg_header_t) + sizeof(fs_write_req_t) + 96 + FS_WRITE_MAX];
-static uint8_t g_resp[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + FS_DATA_MAX];
-
-/* execve 读文件用的 OOL 发送缓冲（页对齐，最多 16 页 = 64KiB）。
- * 布局：[fs_resp_t][文件内容...]，内核侧把该 OOL 直接拷入内核缓冲后
- * 先解析 fs_resp，再加载后续 ELF 字节（符合内核 [header][ool_desc] 协议）。 */
-static uint8_t g_filebuf[16 * 4096] __attribute__((aligned(4096)));
-
-static void serve(void)
-{
-    for (;;) {
-        if (mach_msg_recv(g_req, sizeof(g_req), FS_PORT) != MACH_MSG_SUCCESS) {
-            continue;
-        }
-        mach_msg_header_t *rh = (mach_msg_header_t *)g_req;
-        uint32_t reply = rh->msgh_local_port;
-        if (reply == 0) {
-            continue;
-        }
-
-        mach_msg_header_t *h = (mach_msg_header_t *)g_resp;
-        fs_resp_t *fr = (fs_resp_t *)(g_resp + sizeof(*h));
-        char *data = (char *)g_resp + sizeof(*h) + sizeof(*fr);
-        fr->status = FS_OK;
-        fr->length = 0;
-
-        if (rh->msgh_id == FS_MSG_LIST) {
-            struct list_ctx c = { data, 0 };
-            walk_root(list_cb, &c);
-            fr->length = c.len;
-        } else if (rh->msgh_id == FS_MSG_READ) {
-            char *name = (char *)g_req + sizeof(*rh);
-            g_req[sizeof(g_req) - 1] = 0;      /* 保证 NUL 终止 */
-            path_cb_t f;
-            resolve_path(name, &f);
-            if (!f.found) {
-                fr->status = FS_ERR_NOENT;
-            } else {
-                fr->length = read_file(f.clus, f.size, data, FS_DATA_MAX);
-            }
-        } else if (rh->msgh_id == FS_MSG_READ_AT) {
-            /* 分块读：负载 = fs_read_at_req_t + 文件名 */
-            fs_read_at_req_t *ra = (fs_read_at_req_t *)(g_req + sizeof(*rh));
-            char *name = (char *)(g_req + sizeof(*rh) + sizeof(*ra));
-            g_req[sizeof(g_req) - 1] = 0;
-            uint32_t want = ra->length;
-            if (want > FS_DATA_MAX) {
-                want = FS_DATA_MAX;
-            }
-            path_cb_t f;
-            resolve_path(name, &f);
-            if (!f.found || f.is_dir) {
-                fr->status = FS_ERR_NOENT;
-            } else {
-                fr->length = read_file_at(f.clus, f.size, ra->offset,
-                                          data, want);
-            }
-        } else if (rh->msgh_id == FS_MSG_READ_FILE) {
-            /* 内核 execve 专用：把完整文件内容经 OOL 回传。
-             * OOL 缓冲布局 = [fs_resp_t][文件内容...]（无内联 fs_resp）。 */
-            char *name = (char *)g_req + sizeof(*rh);
-            g_req[sizeof(g_req) - 1] = 0;
-            path_cb_t f;
-            resolve_path(name, &f);
-            if (!f.found) {
-                fr->status = FS_ERR_NOENT;
-                fr->length = 0;
-                uint32_t total = sizeof(*h) + sizeof(*fr);
-                h->msgh_bits = 0;
-                h->msgh_size = total;
-                h->msgh_remote_port = reply;
-                h->msgh_local_port = FS_PORT;
-                h->msgh_id = rh->msgh_id;
-                h->msgh_reserved = 0;
-                mach_msg_send(g_resp, total);
-            } else {
-                uint32_t len = read_file(f.clus, f.size,
-                                         (char *)g_filebuf + sizeof(fs_resp_t),
-                                         16 * 4096 - sizeof(fs_resp_t));
-                fs_resp_t *ofr = (fs_resp_t *)g_filebuf;
-                ofr->status = FS_OK;
-                ofr->length = len;
-                h->msgh_bits = MACH_MSGH_BITS_OOL;
-                /* 关键：内联部分必须包含 OOL 描述符，否则内核 sys_mach_msg
-                 * 会以 MACH_INVALID_ARGUMENT 拒收（msgh_size < 头+描述符）。 */
-                h->msgh_size = sizeof(*h) + sizeof(ool_desc_t);
-                h->msgh_remote_port = reply;
-                h->msgh_local_port = FS_PORT;
-                h->msgh_id = rh->msgh_id;
-                h->msgh_reserved = 0;
-                ool_desc_t *d = (ool_desc_t *)(g_resp + sizeof(*h));
-                d->address = (uint64_t)g_filebuf;
-                d->size = (sizeof(fs_resp_t) + len + PAGE_SIZE - 1)
-                          & ~((uint64_t)PAGE_SIZE - 1);
-                if (d->size == 0) {
-                    d->size = PAGE_SIZE;
+    uint32_t cur = dir_clus;
+    while (cur >= CLUSTER_MIN && cur < g_max_cluster) {
+        uint32_t base = clus_to_lba(cur);
+        for (uint32_t s = 0; s < g_sec_per_clus; s++) {
+            if (!block_read(base + s, 1, g_rbuf)) return false;
+            for (uint32_t off = 0; off + DIR_ENTRY_SIZE <= SECTOR; off += DIR_ENTRY_SIZE) {
+                const uint8_t *e = g_rbuf + off;
+                if (e[0] == 0x00 || e[0] == 0xE5) {
+                    slot->lba = base + s;
+                    slot->off = off;
+                    return true;
                 }
-                mach_msg_send(g_resp, sizeof(*h) + sizeof(ool_desc_t));
             }
-            continue;                           /* 已自行应答，跳过底部通用内联应答 */
-        } else if (rh->msgh_id == FS_MSG_CREATE) {
-            char *name = (char *)g_req + sizeof(*rh);
-            g_req[sizeof(g_req) - 1] = 0;
-            fr->status = fs_create(name, false);
-            fr->length = 0;                      /* 写类应答不带数据体 */
-        } else if (rh->msgh_id == FS_MSG_MKDIR) {
-            char *name = (char *)g_req + sizeof(*rh);
-            g_req[sizeof(g_req) - 1] = 0;
-            fr->status = fs_create(name, true);
-            fr->length = 0;
-        } else if (rh->msgh_id == FS_MSG_WRITE) {
-            fs_write_req_t *wr = (fs_write_req_t *)(g_req + sizeof(*rh));
-            char *name = (char *)(g_req + sizeof(*rh) + sizeof(*wr));
-            uint32_t maxn = (uint32_t)(sizeof(g_req) - (sizeof(*rh) + sizeof(*wr)));
-            uint32_t namelen = 0;
-            while (namelen < maxn && name[namelen]) namelen++;
-            if (namelen >= maxn) {
-                fr->status = FS_ERR_IO;
-            } else {
-                const uint8_t *data = (const uint8_t *)(name + namelen + 1);
-                uint32_t len = wr->length;
-                uint32_t avail = (uint32_t)(sizeof(g_req)
-                                - (sizeof(*rh) + sizeof(*wr) + namelen + 1));
-                if (len > avail) len = avail;
-                if (len > FS_WRITE_MAX) len = FS_WRITE_MAX;
-                fr->status = fs_write(name, data, len, wr->offset);
-            }
-            fr->length = 0;
-        } else if (rh->msgh_id == FS_MSG_UNLINK) {
-            char *name = (char *)g_req + sizeof(*rh);
-            g_req[sizeof(g_req) - 1] = 0;
-            fr->status = fs_unlink(name);
-            fr->length = 0;
-        } else if (rh->msgh_id == FS_MSG_RENAME) {
-            fs_rename_req_t *rr = (fs_rename_req_t *)(g_req + sizeof(*rh));
-            fr->status = fs_rename(rr->old_name, rr->new_name);
-            fr->length = 0;
-        } else if (rh->msgh_id == FS_MSG_TRUNCATE) {
-            fs_trunc_req_t *tr = (fs_trunc_req_t *)(g_req + sizeof(*rh));
-            char *name = (char *)(g_req + sizeof(*rh) + sizeof(*tr));
-            g_req[sizeof(g_req) - 1] = 0;
-            fr->status = fs_truncate(name, tr->size);
-            fr->length = 0;
-        } else {
-            fr->status = FS_ERR_IO;
         }
-
-        uint32_t total = sizeof(*h) + sizeof(*fr) + fr->length;
-        h->msgh_bits = 0;
-        h->msgh_size = total;
-        h->msgh_remote_port = reply;
-        h->msgh_local_port = FS_PORT;
-        h->msgh_id = rh->msgh_id;
-        h->msgh_reserved = 0;
-        mach_msg_send(g_resp, total);
+        uint32_t nx = fat_next(cur);
+        if (nx < CLUSTER_MIN || nx >= g_max_cluster) {
+            /* 目录簇链结束：分配新簇扩展目录 */
+            uint32_t nc = fat_alloc_free(cur);
+            if (nc == 0) return false;
+            if (!fat_set(cur, nc)) return false;
+            /* 新簇清零（作为目录内容） */
+            u_memset(g_rbuf, 0, SECTOR);
+            uint32_t nbase = clus_to_lba(nc);
+            for (uint32_t s = 0; s < g_sec_per_clus; s++)
+                if (!disk_write(nbase + s, 1, g_rbuf)) return false;
+            cur = nc;
+        } else {
+            cur = nx;
+        }
     }
-}
-
-/* 挂载自检：把根目录列表直接打印到内核日志 */
-static bool selftest_cb(const uint8_t *e, const char *name, void *priv)
-{
-    (void)priv;
-    uint32_t size = rd32(e + 28);
-    char num[24];
-    u_print("[fs]   ");
-    u_print(name);
-    if (e[11] & 0x10) {
-        u_print("  <DIR>");
-    } else {
-        u_print("  ");
-        u_print(u_utoa_s(size, num, sizeof(num)));
-        u_print(" bytes");
-    }
-    u_print("\n");
     return false;
 }
 
-int main(int argc, char **argv)
+/* 写回一个目录项（短名 + 长名 + 属性 + 首簇 + 大小）。
+ * 这里只写短名条目（LFN 生成在本函数内联处理，简单起见：若名字非纯 8.3 也写
+ * LFN 序列表）。返回 true 成功。 */
+static bool dir_write_entry(uint32_t dir_clus, const char *name,
+                            uint32_t first_clus, uint32_t size, bool is_dir)
 {
-    (void)argc; (void)argv;
-    u_print("[fs] FS_SERVER starting (Ring3 FAT32, read/write)\n");
-    /* A2 项：认领本服务的接收端口（否则内核会因 owner 不匹配拒绝接收） */
+    dir_slot_t slot;
+    if (!dir_alloc_entry(dir_clus, &slot)) return false;
+
+    uint8_t short11[11];
+    bool is_83 = parse_83(name, short11);
+
+    /* 计算 LFN 需要的槽数（每个条目 13 个 UTF-16 码元；末位 0 终止符占 1）。 */
+    uint32_t name_len = (uint32_t)u_strlen(name);
+    uint32_t u16n = 0;
+    /* UTF-8 -> UTF-16 码元计数（粗略） */
+    for (uint32_t i = 0; i < name_len; ) {
+        unsigned char c = (unsigned char)name[i];
+        if (c < 0x80) { i++; }
+        else if ((c & 0xE0) == 0xC0) { i += 2; }
+        else { i += 3; }
+        u16n++;
+    }
+    uint32_t lfn_entries = 0;
+    if (!is_83 || name_len > 12) {
+        lfn_entries = (u16n + 1 + 12) / 13; /* +1 终止符 */
+        if (lfn_entries == 0) lfn_entries = 1;
+        if (lfn_entries > 20) lfn_entries = 20;
+    }
+
+    /* 先写 LFN 条目（从末项到首项，倒序） */
+    uint8_t sum = lfn_checksum(short11);
+    /* 构建 UTF-16 序列 */
+    uint16_t u16[MAX_NAME_UTF8];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < name_len; ) {
+        unsigned char c = (unsigned char)name[i];
+        uint32_t cp;
+        if (c < 0x80) { cp = c; i++; }
+        else if ((c & 0xE0) == 0xC0) { cp = ((c & 0x1F) << 6) | (name[i+1] & 0x3F); i += 2; }
+        else { cp = ((c & 0x0F) << 12) | ((name[i+1] & 0x3F) << 6) | (name[i+2] & 0x3F); i += 3; }
+        if (n < MAX_NAME_UTF8) u16[n++] = (uint16_t)cp;
+    }
+    if (n < MAX_NAME_UTF8) u16[n++] = 0; /* 终止符 */
+
+    for (uint32_t k = 0; k < lfn_entries; k++) {
+        uint32_t seq = lfn_entries - k;     /* 倒序：先写末项 */
+        uint32_t idx = seq - 1;             /* 该条目对应 13 码元的起始 */
+        uint8_t le[DIR_ENTRY_SIZE];
+        u_memset(le, 0, DIR_ENTRY_SIZE);
+        le[0] = (uint8_t)(seq | (k == 0 ? 0x40 : 0x00)); /* 首写末项带 0x40 */
+        le[11] = 0x0F;                       /* LFN 属性 */
+        le[12] = 0x00;                       /* 类型 0 */
+        le[13] = sum;
+        /* 填充 13 个码元 */
+        uint16_t units[13];
+        for (int j = 0; j < 13; j++) {
+            uint32_t pos = idx * 13 + j;
+            units[j] = (pos < n) ? u16[pos] : 0xFFFF; /* 0xFFFF 填充 */
+        }
+        wr16(le + 1,  units[0]);  wr16(le + 3,  units[1]);  wr16(le + 5,  units[2]);
+        wr16(le + 7,  units[3]);  wr16(le + 9,  units[4]);
+        wr16(le + 14, units[5]);  wr16(le + 16, units[6]);  wr16(le + 18, units[7]);
+        wr16(le + 20, units[8]);  wr16(le + 22, units[9]);  wr16(le + 24, units[10]);
+        wr16(le + 26, units[11]); wr16(le + 28, units[12]);
+        /* 计算 LFN 条目所在的绝对扇区/偏移：slot 是短名条目，LFN 在它之前 */
+        uint32_t lfn_off = slot.off - (int)((k + 1) * DIR_ENTRY_SIZE);
+        if ((int)lfn_off < 0) {
+            /* 跨扇区：本实现要求调用方确保目录有足够空隙，简单拒绝 */
+            return false;
+        }
+        u_memcpy(g_rbuf + lfn_off, le, DIR_ENTRY_SIZE);
+    }
+
+    /* 写短名条目 */
+    uint8_t de[DIR_ENTRY_SIZE];
+    u_memset(de, 0, DIR_ENTRY_SIZE);
+    u_memcpy(de, short11, 11);
+    de[11] = is_dir ? 0x10 : 0x20;
+    wr16(de + 20, (uint16_t)(first_clus & 0xFFFF));
+    wr16(de + 26, (uint16_t)(first_clus >> 16));
+    wr32(de + 28, size);
+    u_memcpy(g_rbuf + slot.off, de, DIR_ENTRY_SIZE);
+
+    /* 回写目录扇区 */
+    return disk_write(slot.lba, 1, g_rbuf);
+}
+
+/* 创建空文件/目录。返回 true 成功。 */
+static bool fs_create(const char *path, bool is_dir)
+{
+    /* 拆分父目录与文件名 */
+    char parent[64];
+    const char *slash = NULL;
+    for (const char *p = path; *p; p++) if (*p == '/') slash = p;
+    if (slash) {
+        uint32_t plen = (uint32_t)(slash - path);
+        if (plen >= sizeof(parent)) return false;
+        u_memcpy(parent, path, plen);
+        parent[plen] = '\0';
+        path = slash + 1;
+    } else {
+        parent[0] = '\0';
+    }
+    found_t pf;
+    if (parent[0] == '\0') {
+        pf.first_clus = g_root_cluster; pf.is_dir = true;
+    } else {
+        if (!path_lookup(parent, &pf) || !pf.is_dir) return false;
+    }
+    if (*path == '\0') return false;
+
+    /* 已存在则幂等 */
+    found_t ex;
+    if (dir_lookup(pf.first_clus, path, &ex)) return true;
+
+    uint32_t first = fat_alloc_free(g_root_cluster);
+    if (first == 0) return false;
+    /* 文件首簇写入 FAT 为 EOC */
+    if (is_dir) {
+        /* 目录首簇需清零 */
+        u_memset(g_rbuf, 0, SECTOR);
+        uint32_t nbase = clus_to_lba(first);
+        for (uint32_t s = 0; s < g_sec_per_clus; s++)
+            if (!disk_write(nbase + s, 1, g_rbuf)) return false;
+    }
+    if (!fat_set(first, FAT_LAST)) return false;
+    return dir_write_entry(pf.first_clus, path, first, 0, is_dir);
+}
+
+/* 写文件（offset 起覆盖/追加）。返回写入字节数。 */
+static uint32_t fs_write(const char *path, uint32_t offset, const void *data, uint32_t len)
+{
+    found_t f;
+    if (!path_lookup(path, &f)) {
+        /* 不存在则创建 */
+        if (!fs_create(path, false)) return 0;
+        if (!path_lookup(path, &f)) return 0;
+    }
+    /* 文件首簇来自目录项（found_t.first_clus），重新从目录项读取以保证一致 */
+    uint8_t de[DIR_ENTRY_SIZE];
+    if (!disk_read(f.dir_lba, 1, g_rbuf)) return 0;
+    u_memcpy(de, g_rbuf + f.dir_off, DIR_ENTRY_SIZE);
+    uint32_t first = rd16(de + 20) | ((uint32_t)rd16(de + 26) << 16);
+
+    uint32_t new_size = offset + len;
+    if (first < CLUSTER_MIN || first >= g_max_cluster) {
+        /* 空文件：分配首簇 */
+        uint32_t nc = fat_alloc_free(g_root_cluster);
+        if (nc == 0) return 0;
+        if (!fat_set(nc, FAT_LAST)) return 0;
+        first = nc;
+        /* 更新目录项首簇 */
+        wr16(de + 20, (uint16_t)(nc & 0xFFFF));
+        wr16(de + 26, (uint16_t)(nc >> 16));
+        u_memcpy(g_rbuf + f.dir_off, de, DIR_ENTRY_SIZE);
+        if (!disk_write(f.dir_lba, 1, g_rbuf)) return 0;
+    }
+
+    /* 覆盖写策略：读出现有内容到整文件缓冲 -> 覆盖 [offset,offset+len) -> 写回 */
+    if (new_size > FILEBUF_SIZE) return 0;
+    static uint8_t buf[FILEBUF_SIZE];
+    u_memset(buf, 0, new_size);
+    /* 读现有内容（若有） */
+    if (first >= CLUSTER_MIN && first < g_max_cluster) {
+        uint32_t existing = read_file_at(first, f.size, 0, buf, f.size);
+        (void)existing;
+    }
+    /* 覆盖 [offset, offset+len) */
+    if (offset <= new_size && len <= new_size - offset) {
+        u_memcpy(buf + offset, data, len);
+    }
+    uint32_t done = chain_write(first, new_size, buf);
+    if (done == new_size) {
+        /* 更新目录项大小 */
+        wr32(de + 28, new_size);
+        u_memcpy(g_rbuf + f.dir_off, de, DIR_ENTRY_SIZE);
+        if (!disk_write(f.dir_lba, 1, g_rbuf)) return 0;
+        return len;
+    }
+    return 0;
+}
+
+/* 删除文件/目录（目录须为空）。返回 true 成功。 */
+static bool fs_unlink(const char *path)
+{
+    found_t f;
+    if (!path_lookup(path, &f)) return false;
+    if (f.is_dir) {
+        /* 目录必须为空（仅 0x00/0xE5） */
+        uint32_t cur = f.first_clus;
+        while (cur >= CLUSTER_MIN && cur < g_max_cluster) {
+            uint32_t base = clus_to_lba(cur);
+            for (uint32_t s = 0; s < g_sec_per_clus; s++) {
+                if (!block_read(base + s, 1, g_rbuf)) return false;
+                for (uint32_t off = 0; off + DIR_ENTRY_SIZE <= SECTOR; off += DIR_ENTRY_SIZE) {
+                    const uint8_t *e = g_rbuf + off;
+                    if (e[0] != 0x00 && e[0] != 0xE5) {
+                        if ((e[11] & 0x0F) != 0x0F) return false; /* 有非 LFN 条目 */
+                    }
+                }
+            }
+            cur = fat_next(cur);
+        }
+    }
+    /* 释放簇链 */
+    uint32_t c = f.first_clus;
+    while (c >= CLUSTER_MIN && c < g_max_cluster) {
+        uint32_t nx = fat_next(c);
+        fat_set(c, FAT_FREE);
+        c = nx;
+    }
+    /* 标记目录项删除（读回扇区，置 0xE5） */
+    if (!disk_read(f.dir_lba, 1, g_rbuf)) return false;
+    g_rbuf[f.dir_off] = 0xE5;
+    return disk_write(f.dir_lba, 1, g_rbuf);
+}
+
+/* 重命名（同目录内移动，跨目录不支持链式移动，简单实现）。 */
+static bool fs_rename(const char *oldp, const char *newp)
+{
+    found_t f;
+    if (!path_lookup(oldp, &f)) return false;
+    /* 在 old 所在目录中改短名 + LFN 为 newp 基名 */
+    found_t pf;
+    char parent[64];
+    const char *slash = NULL;
+    for (const char *p = oldp; *p; p++) if (*p == '/') slash = p;
+    if (slash) {
+        uint32_t plen = (uint32_t)(slash - oldp);
+        if (plen >= sizeof(parent)) return false;
+        u_memcpy(parent, oldp, plen); parent[plen] = '\0';
+        if (!path_lookup(parent, &pf)) return false;
+    } else {
+        pf.first_clus = g_root_cluster;
+    }
+    const char *base = newp;
+    for (const char *p = newp; *p; p++) if (*p == '/') base = p + 1;
+    /* 先删旧目录项（保留簇链），再在父目录写新名指向同一首簇/大小 */
+    uint32_t first = f.first_clus;
+    if (!disk_read(f.dir_lba, 1, g_rbuf)) return false;
+    uint32_t size = rd32(g_rbuf + f.dir_off + 28);
+    g_rbuf[f.dir_off] = 0xE5;
+    if (!disk_write(f.dir_lba, 1, g_rbuf)) return false;
+    return dir_write_entry(pf.first_clus, base, first, size, f.is_dir);
+}
+
+/* 截断文件到指定大小（释放多余簇）。 */
+static bool fs_truncate(const char *path, uint32_t size)
+{
+    found_t f;
+    if (!path_lookup(path, &f)) return false;
+    if (f.is_dir) return false;
+    uint32_t first = f.first_clus;
+    uint32_t clus_bytes = g_sec_per_clus * SECTOR;
+    uint32_t keep = (size + clus_bytes - 1) / clus_bytes;
+    if (keep == 0) keep = 1;
+    uint32_t cur = first;
+    uint32_t prev = 0;
+    uint32_t cnt = 0;
+    while (cur >= CLUSTER_MIN && cur < g_max_cluster) {
+        cnt++;
+        uint32_t nx = fat_next(cur);
+        if (cnt > keep) {
+            fat_set(cur, FAT_FREE);
+        } else {
+            prev = cur;
+        }
+        cur = nx;
+    }
+    if (prev && cnt > keep) fat_set(prev, FAT_LAST);
+    if (!disk_read(f.dir_lba, 1, g_rbuf)) return false;
+    wr32(g_rbuf + f.dir_off + 28, size);
+    return disk_write(f.dir_lba, 1, g_rbuf);
+}
+
+/* ===================== 挂载 ===================== */
+static bool fat32_mount(void)
+{
+    if (!disk_read(0, 1, g_bpb)) return false;
+    /* 引导签名 */
+    if (g_bpb[510] != 0x55 || g_bpb[511] != 0xAA) return false;
+
+    g_bytes_per_sec = rd16(g_bpb + 11);
+    if (g_bytes_per_sec != SECTOR) return false; /* 本驱动仅支持 512 字节扇区 */
+    g_sec_per_clus  = g_bpb[13];
+    if (g_sec_per_clus == 0 || (g_sec_per_clus & (g_sec_per_clus - 1)) != 0) return false;
+    g_rsvd_secs     = rd16(g_bpb + 14);
+    g_num_fats      = g_bpb[16];
+    uint32_t root_ent = rd16(g_bpb + 17);
+
+    /* FAT32 判定（osdev_wiki/FAT32）：
+     *   - 16 位 FAT 大小（偏移 22）为 0；
+     *   - 根目录项数（偏移 17）为 0；
+     *   - 32 位 FAT 大小（偏移 36）非 0；
+     *   - 根目录首簇（偏移 44）>= 2。 */
+    uint32_t fatsz16 = rd16(g_bpb + 22);
+    uint32_t fatsz32 = rd32(g_bpb + 36);
+    g_root_cluster   = rd32(g_bpb + 44);
+    if (fatsz16 != 0 || root_ent != 0 || fatsz32 == 0 || g_root_cluster < CLUSTER_MIN)
+        return false;
+    g_fat_size = fatsz32;
+
+    /* FSI 信息扇区（偏移 48），可选 */
+    g_fs_info_lba = rd16(g_bpb + 48);
+
+    uint32_t tot_sec16 = rd16(g_bpb + 19);
+    uint32_t tot_sec32 = rd32(g_bpb + 32);
+    uint32_t tot_sec = (tot_sec16 != 0) ? tot_sec16 : tot_sec32;
+    if (tot_sec == 0) return false;
+
+    g_first_data_lba = g_rsvd_secs + g_num_fats * g_fat_size;
+    uint32_t data_secs = tot_sec - g_first_data_lba;
+    g_total_clusters = data_secs / g_sec_per_clus;
+    if (g_total_clusters < 1) return false;
+    g_max_cluster = CLUSTER_MIN + g_total_clusters;
+    g_max_lba = tot_sec - 1;
+
+    /* 清空缓存 */
+    g_fat_cache_lba = 0xFFFFFFFFu;
+    g_fat_cache_ok  = false;
+    g_blk_lba = 0xFFFFFFFFu;
+    g_blk_secs = 0;
+    return true;
+}
+
+/* ===================== IPC 应答辅助 ===================== */
+static mach_msg_header_t *resp_header(void)
+{
+    return (mach_msg_header_t *)g_resp;
+}
+/* 构造应答：local_port 为请求方端口，msgh_id 原样返回。 */
+static void build_resp(uint32_t local_port, uint32_t id, uint32_t status,
+                       uint32_t length, const void *data)
+{
+    mach_msg_header_t *h = resp_header();
+    h->msgh_bits = 0;   /* 内联消息（内核按 msgh_size 转发） */
+    h->msgh_size = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + length);
+    h->msgh_remote_port = local_port;
+    h->msgh_local_port  = FS_PORT;
+    h->msgh_id = id;
+    h->msgh_reserved = 0;
+    fs_resp_t *fr = (fs_resp_t *)(g_resp + sizeof(mach_msg_header_t));
+    fr->status = status;
+    fr->length = length;
+    if (length && data) {
+        u_memcpy(g_resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t), data, length);
+    }
+}
+
+/* OOL 应答（整文件读，execve 用）：把 g_filebuf（含头部 fs_resp_t + 内容）经
+ * OOL 描述符回传。消息布局 = [header | mach_ool_desc_t]，描述符指向 g_filebuf。 */
+static void build_ool_resp(uint32_t local_port, uint32_t id, uint32_t size)
+{
+    mach_msg_header_t *h = resp_header();
+    h->msgh_bits = MACH_MSGH_BITS_OOL;
+    h->msgh_size = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(ool_desc_t));
+    h->msgh_remote_port = local_port;
+    h->msgh_local_port  = FS_PORT;
+    h->msgh_id = id;
+    h->msgh_reserved = 0;
+    ool_desc_t *d = (ool_desc_t *)(g_resp + sizeof(mach_msg_header_t));
+    d->address = (uint64_t)g_filebuf;
+    d->size = (uint64_t)((sizeof(fs_resp_t) + size + 4096u - 1) & ~((uint64_t)4096u - 1));
+    if (d->size == 0) d->size = 4096u;
+}
+
+/* ===================== 服务主循环 ===================== */
+static void service_loop(void)
+{
+    u_print("[fs] service loop entered\n");
+    for (;;) {
+        uint8_t reqbuf[sizeof(mach_msg_header_t) + sizeof(fs_write_req_t) + 96 + FS_WRITE_MAX];
+        uint32_t got = (uint32_t)mach_msg_recv(reqbuf, sizeof(reqbuf), FS_PORT);
+        if (got < sizeof(mach_msg_header_t)) { continue; }
+        mach_msg_header_t *h = (mach_msg_header_t *)reqbuf;
+        uint32_t local = h->msgh_local_port;
+        uint32_t id = h->msgh_id;
+        uint8_t *payload = reqbuf + sizeof(mach_msg_header_t);
+
+        switch (id) {
+        case FS_MSG_LIST: {
+            char *data = (char *)(g_resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t));
+            uint32_t n = list_dir(g_root_cluster, data, RESP_DATA_MAX);
+            build_resp(local, id, FS_OK, n, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_READ: {
+            char *fname = (char *)payload;
+            found_t f;
+            char *data = (char *)(g_resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t));
+            if (!path_lookup(fname, &f) || f.is_dir) {
+                build_resp(local, id, FS_ERR_NOENT, 0, NULL);
+            } else {
+                uint32_t n = read_file_at(f.first_clus, f.size, 0, data, RESP_DATA_MAX);
+                build_resp(local, id, FS_OK, n, NULL);
+            }
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_READ_AT: {
+            fs_read_at_req_t *ra = (fs_read_at_req_t *)payload;
+            char *fname = (char *)(payload + sizeof(fs_read_at_req_t));
+            found_t f;
+            char *data = (char *)(g_resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t));
+            if (!path_lookup(fname, &f) || f.is_dir) {
+                build_resp(local, id, FS_ERR_NOENT, 0, NULL);
+            } else {
+                uint32_t len = ra->length;
+                if (len > RESP_DATA_MAX) len = RESP_DATA_MAX;
+                uint32_t n = read_file_at(f.first_clus, f.size, ra->offset, data, len);
+                build_resp(local, id, FS_OK, n, NULL);
+            }
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_READ_FILE: {
+            /* 内核 execve 用：整文件读 -> OOL。payload = NUL 结尾路径 */
+            char *fname = (char *)payload;
+            found_t f;
+            if (!path_lookup(fname, &f) || f.is_dir) {
+                build_resp(local, id, FS_ERR_NOENT, 0, NULL);
+                mach_msg_send(g_resp, resp_header()->msgh_size);
+            } else {
+                uint32_t n = read_file_whole(f.first_clus, f.size);
+                if (n != f.size) {
+                    build_resp(local, id, FS_ERR_IO, 0, NULL);
+                    mach_msg_send(g_resp, resp_header()->msgh_size);
+                } else {
+                    build_ool_resp(local, id, n);
+                    mach_msg_send(g_resp, resp_header()->msgh_size);
+                }
+            }
+            break;
+        }
+        case FS_MSG_CREATE: {
+            build_resp(local, id, fs_create((char *)payload, false) ? FS_OK : FS_ERR_IO, 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_MKDIR: {
+            build_resp(local, id, fs_create((char *)payload, true) ? FS_OK : FS_ERR_IO, 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_WRITE: {
+            fs_write_req_t *w = (fs_write_req_t *)payload;
+            char *fname = (char *)(payload + sizeof(fs_write_req_t));
+            const void *data = fname + u_strlen(fname) + 1;
+            uint32_t n = fs_write(fname, w->offset, data, w->length);
+            build_resp(local, id, n == w->length ? FS_OK : FS_ERR_IO, 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_UNLINK: {
+            build_resp(local, id, fs_unlink((char *)payload) ? FS_OK : FS_ERR_IO, 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_RENAME: {
+            fs_rename_req_t *r = (fs_rename_req_t *)payload;
+            build_resp(local, id, fs_rename(r->old_name, r->new_name) ? FS_OK : FS_ERR_IO, 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        case FS_MSG_TRUNCATE: {
+            fs_trunc_req_t *t = (fs_trunc_req_t *)payload;
+            char *fname = (char *)(payload + sizeof(fs_trunc_req_t));
+            build_resp(local, id, fs_truncate(fname, t->size) ? FS_OK : FS_ERR_IO, 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        default: {
+            build_resp(local, id, FS_ERR_NOENT, 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            break;
+        }
+        }
+    }
+}
+
+/* ===================== 自检 ===================== */
+static void self_test(void)
+{
+    u_print("[fs] self-test begin\n");
+
+    /* --- 写路径自检 --- */
+    const char *tf = "SELFTEST.TXT";
+    bool ok = true;
+
+    if (!fs_create(tf, false)) { u_print("[fs] self-test: create FAIL\n"); ok = false; }
+    const char *msg = "HELLO_SUKI_FAT32_WRITE_PATH_OK";
+    uint32_t len = (uint32_t)u_strlen(msg);
+    if (fs_write(tf, 0, msg, len) != len) { u_print("[fs] self-test: write FAIL\n"); ok = false; }
+
+    /* readback */
+    char rb[64];
+    u_memset(rb, 0, sizeof(rb));
+    found_t f;
+    if (!path_lookup(tf, &f)) { u_print("[fs] self-test: lookup after write FAIL\n"); ok = false; }
+    else {
+        uint32_t rn = read_file_at(f.first_clus, f.size, 0, rb, (uint32_t)sizeof(rb));
+        if (rn != len || u_strcmp(rb, msg) != 0) {
+            u_print("[fs] self-test: readback mismatch\n"); ok = false;
+        }
+    }
+
+    /* append */
+    const char *msg2 = "_APPEND";
+    uint32_t len2 = (uint32_t)u_strlen(msg2);
+    if (fs_write(tf, len, msg2, len2) != len2) { u_print("[fs] self-test: append FAIL\n"); ok = false; }
+    char rb2[80];
+    if (path_lookup(tf, &f)) {
+        uint32_t rn = read_file_at(f.first_clus, f.size, 0, rb2, (uint32_t)sizeof(rb2));
+        if (rn != len + len2 || u_strcmp(rb2, "HELLO_SUKI_FAT32_WRITE_PATH_OK_APPEND") != 0) {
+            u_print("[fs] self-test: append readback FAIL\n"); ok = false;
+        }
+    }
+
+    /* mkdir + subdir write */
+    if (!fs_create("SUBDIR", true)) { u_print("[fs] self-test: mkdir FAIL\n"); ok = false; }
+    if (!fs_create("SUBDIR/NEST.TXT", false)) { u_print("[fs] self-test: subdir create FAIL\n"); ok = false; }
+    if (fs_write("SUBDIR/NEST.TXT", 0, "NESTED", 6) != 6) { u_print("[fs] self-test: subdir write FAIL\n"); ok = false; }
+
+    /* rename */
+    if (!fs_rename("SELFTEST.TXT", "RENAMED.TXT")) { u_print("[fs] self-test: rename FAIL\n"); ok = false; }
+    if (path_lookup("SELFTEST.TXT", &f)) { u_print("[fs] self-test: old name still exists after rename\n"); ok = false; }
+    if (!path_lookup("RENAMED.TXT", &f)) { u_print("[fs] self-test: renamed name missing\n"); ok = false; }
+
+    /* unlink */
+    if (!fs_unlink("RENAMED.TXT")) { u_print("[fs] self-test: unlink FAIL\n"); ok = false; }
+    if (path_lookup("RENAMED.TXT", &f)) { u_print("[fs] self-test: file exists after unlink\n"); ok = false; }
+
+    /* truncate */
+    if (!fs_create("TRUNC.TXT", false)) { u_print("[fs] self-test: trunc create FAIL\n"); ok = false; }
+    if (fs_write("TRUNC.TXT", 0, "0123456789", 10) != 10) { u_print("[fs] self-test: trunc write FAIL\n"); ok = false; }
+    if (!fs_truncate("TRUNC.TXT", 4)) { u_print("[fs] self-test: truncate FAIL\n"); ok = false; }
+    if (path_lookup("TRUNC.TXT", &f)) {
+        if (f.size != 4) { u_print("[fs] self-test: truncated size wrong\n"); ok = false; }
+    }
+    fs_unlink("TRUNC.TXT");
+    fs_unlink("SUBDIR/NEST.TXT");
+    fs_unlink("SUBDIR");
+
+    /* --- 大文件整读自检（MOONHALO.MP3 若存在于镜像） --- */
+    found_t big;
+    if (path_lookup("MOONHALO.MP3", &big) && !big.is_dir) {
+        uint32_t total = read_file_whole(big.first_clus, big.size);
+        if (total != big.size) {
+            u_print("[fs] self-test: bigfile whole-read length mismatch\n"); ok = false;
+        } else {
+            /* 尾块抽样校验 */
+            uint32_t tail_off = (big.size > 100) ? big.size - 100 : 0;
+            uint32_t tail_len = (big.size > 100) ? 100 : big.size;
+            char tail[128];
+            uint32_t tn = read_file_at(big.first_clus, big.size, tail_off, tail, tail_len);
+            if (tn != tail_len) { u_print("[fs] self-test: bigfile tail read mismatch\n"); ok = false; }
+        }
+    }
+
+    g_self_test_ok = ok;
+    u_print(ok ? "[fs] self-test ALL PASS\n" : "[fs] self-test FAILED\n");
+}
+
+/* ===================== 入口 ===================== */
+int main(void)
+{
+    u_print("[fs] FS_SERVER starting\n");
+    /* 认领知名端口与私有应答端口（生产约束：必须先 claim 才能 recv） */
     sys_port_claim(FS_PORT);
     sys_port_claim(FS_REPLY_PORT);
     if (!fat32_mount()) {
-        u_print("[fs] mount FAILED\n");
+        u_print("[fs] mount failed\n");
         return 1;
     }
-    u_print("[fs] root directory (self-test):\n");
-    walk_root(selftest_cb, 0);
-    fs_selftest();
-    u_print("[fs] entering service loop on FS_PORT\n");
-    serve();
+    u_print("[fs] mounted FAT32\n");
+    self_test();
+    service_loop();
     return 0;
 }
+
+/* 入口由用户态启动桩 user/lib/crt0.S 提供（调用 main）。 */

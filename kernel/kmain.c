@@ -38,6 +38,9 @@
 #include <ipc/port.h>
 #include <kernel/ata.h>
 #include <kernel/ahci.h>      /* P0-7：AHCI DMA 优先探测 */
+
+/* 声明在 kernel/sched/sched.c：将 BSP 引导流切换到 idle0 独立内核栈 */
+extern void sched_switch_to_idle0(void);
 #include <kernel/pci.h>       /* P0-1/P0-2：ECAM、_PRT 路由、MSI 编程 */
 #include <kernel/hda.h>
 
@@ -244,8 +247,9 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
 
     kprintf("[boot] all services spawned; idle task parked.\n\n");
 
-    /* task0 = idle：仅剩 hlt 等待中断（一切交互走 Ring3 服务管线） */
-    for (;;) {
-        __asm__ volatile("hlt");
-    }
+    /* task0 = idle0：将 BSP 引导流切换到 idle0 的独立内核栈，BSP 引导栈从此冻结。
+     * 切换后 idle0 在独立栈上运行 bsp_idle（hlt + schedule 循环），避免 idle0 复
+     * 用 BSP 引导栈导致切回时返回地址被覆盖而触发 #UD（vector 6 / system halted）。 */
+    sched_switch_to_idle0();
+    /* never returns */
 }

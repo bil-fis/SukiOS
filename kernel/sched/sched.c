@@ -143,11 +143,37 @@ static task_t *pick_next(void)
     return cur;   /* 回退：无其它可运行任务（仅 idle 自身） */
 }
 
+/* BSP idle 循环（独立内核栈上运行，与 BSP 引导栈彻底解耦）。
+ * 对齐 AP 的 ap_main idle 循环：开中断、hlt 省电、被唤醒后调度。 */
+static void bsp_idle(void)
+{
+    (void)g_percpu;
+    interrupts_enable();
+    for (;;) {
+        g_percpu[0].in_idle = 1;
+        __asm__ volatile("hlt");
+        g_percpu[0].in_idle = 0;
+        schedule();
+    }
+}
+
 void sched_init(void)
 {
     spinlock_init(&g_sched_lock, "sched");
-    /* 将当前引导执行流封装为 task0（BSP idle/boot 线程） */
+    /* 将引导执行流封装为 task0（idle0）。
+     * 关键：idle0 使用 *独立* 内核栈（kstack_alloc，带守卫页），并构造独立栈帧
+     * 令首次 context_switch 落到 bsp_idle 的 hlt 循环；绝不复用 BSP 引导栈
+     * （&kernel_stack_top）。否则 idle0 被切回时其“停泊点”落在共享的 BSP 引导栈上，
+     * 而 kmain 后续在 BSP 引导栈上的调用会覆盖该返回地址，导致切回时执行非法指令
+     * （#UD / vector 6），表现为 '[EXC] vector 6' + 'system halted'。 */
     task_t *t0 = (task_t *)kzalloc(sizeof(task_t));
+    if (!t0) {
+        panic("sched_init: kzalloc idle0 failed");
+    }
+    uint64_t stack = kstack_alloc();   /* P0-R5：守卫页栈 */
+    if (!stack) {
+        panic("sched_init: kstack_alloc idle0 failed");
+    }
     t0->id = sched_next_pid();
     t0->state = RUNNING;
     t0->cr3 = vmm_kernel_pml4();
@@ -157,20 +183,73 @@ void sched_init(void)
     t0->alive = true;
     t0->is_idle = true;
     t0->cpu = 0;
+    t0->kstack_base = stack;
+    t0->kstack_top  = stack + KERNEL_STACK_BYTES;
+    *(uint64_t *)stack = KSTACK_CANARY;
     strncpy(t0->name, "idle0", sizeof(t0->name) - 1);
-    /* idle 任务栈：复用 BSP 引导内核栈（higher_half_entry 用的 kernel_stack_top），
-     * 故 kstack_base=0 标记“无独立栈”，schedule 跳过其哨兵校验。 */
-    t0->kstack_base = 0;
-    t0->kstack_top  = (uint64_t)&kernel_stack_top;   /* boot.S 符号 */
+
+    /* 构造初始内核栈帧，令首次 context_switch 落到 bsp_idle
+     * 布局必须与 switch.S 的 context_switch pop 顺序匹配：
+     *   pushq %rbx; %rbp; %r12; %r13; %r14; %r15  ->  pop 逆序
+     *   [rbx][rbp][r12=entry][r13=arg][r14][r15][ret=task entry] */
+    uint64_t *sp = (uint64_t *)t0->kstack_top;
+    *(--sp) = (uint64_t)bsp_idle;   /* ret 目标 */
+    *(--sp) = 0;                    /* r15 */
+    *(--sp) = 0;                    /* r14 */
+    *(--sp) = (uint64_t)bsp_idle;   /* r12 = entry */
+    *(--sp) = 0;                    /* r13 = arg */
+    *(--sp) = 0;                    /* rbp */
+    *(--sp) = 0;                    /* rbx */
+    t0->rsp = (uint64_t)sp;
 
     /* idle0 入 CPU0 运行队列，置为本核当前任务 */
     rq_push_cpu(t0, 0);
     g_percpu[0].current_task = t0;
     g_percpu[0].idle_task    = t0;
+    g_syscall_kstack[0] = t0->kstack_top;
+    g_scratch[0]        = &t0->scr_rip;
     set_cpu_current(t0);
     g_task_count = 1;
-    kprintf("[sched] scheduler initialized (SMP RR), idle0 pid=%lu\n",
-            (unsigned long)t0->id);
+    kprintf("[sched] scheduler initialized (SMP RR), idle0 pid=%lu stack=%p\n",
+            (unsigned long)t0->id, (void *)t0->kstack_base);
+}
+
+/* 由 BSP 引导流（kmain）在一切初始化、所有用户服务创建完毕后调用：
+ * 将 BSP 当前执行流从“共享的 BSP 引导栈”切换到 idle0 的 *独立* 内核栈，
+ * 从此 BSP 引导栈被冻结，idle0 的空转/调度循环在独立栈上运行。
+ *
+ * 关键：调用前先关中断，防止切换间隙 100Hz tick 触发 schedule() 把 BSP 引导栈
+ * 指针写回 idle0->rsp（那样会重新引入“idle0 返回地址落在 BSP 引导栈、被后续调用
+ * 覆盖”的根因）；并强制重置 idle0->rsp 为独立栈帧，抵消初始化阶段可能发生的覆盖。
+ *
+ * 本函数一去不返：切走后 BSP 引导流停在局部 krsp（冻结），idle0 独立栈上执行
+ * bsp_idle 的 hlt+schedule 循环。 */
+void sched_switch_to_idle0(void)
+{
+    task_t *idle0 = g_percpu[0].current_task;
+    if (!idle0 || !idle0->is_idle) {
+        panic("sched_switch_to_idle0: idle0 missing");
+    }
+    interrupts_disable();
+
+    /* 强制重置 idle0 初始栈帧（与 sched_init 构造一致），确保 rsp 指向独立栈，
+     * 不被初始化阶段 timer tick 的 schedule() 切走所覆盖。 */
+    uint64_t *sp = (uint64_t *)idle0->kstack_top;
+    *(--sp) = (uint64_t)bsp_idle;   /* ret 目标 */
+    *(--sp) = 0;                    /* r15 */
+    *(--sp) = 0;                    /* r14 */
+    *(--sp) = (uint64_t)bsp_idle;   /* r12 = entry */
+    *(--sp) = 0;                    /* r13 = arg */
+    *(--sp) = 0;                    /* rbp */
+    *(--sp) = 0;                    /* rbx */
+    idle0->rsp = (uint64_t)sp;
+
+    uint64_t krsp;
+    /* 注意：第一个参数是局部 krsp（非 &idle0->rsp），因此 idle0->rsp 不被覆盖，
+     * 始终指向上面的独立栈帧。 */
+    context_switch(&krsp, idle0->rsp);
+    /* never returns */
+    for (;;) { __asm__ volatile("cli; hlt"); }
 }
 
 /* 创建某 CPU 的 idle 任务（smp_init 在 SIPI 前为各 AP 调用，P0-R1） */

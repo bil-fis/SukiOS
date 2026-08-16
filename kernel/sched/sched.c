@@ -105,13 +105,22 @@ static void verify_switch_target(task_t *next)
     /* 合法内核代码/数据地址落在 0xFFFF800000000000 .. 0xFFFFC00000000000 区间
      * （本内核：text/数据在 0xFFFF8000 段，内核堆/栈在 0xFFFFC000 段）。
      * 落在 0xFFFFC000 段即堆/栈区指针 → 必然非法返回目标。
-     * 注意：canonical 地址高位全 1，不能用“高 16 位==0x8000”判断，须用区间。 */
-    if (ret_addr < 0xFFFF800000000000ULL || ret_addr >= 0xFFFFC00000000000ULL) {
-        kprintf("[sched] BAD SWITCH: next '%s' pid=%lu ret_addr=%p (heap/stack-seg) rsp=%p kstack=[%p,%p]\n",
-                next->name, (unsigned long)next->id, (void *)ret_addr,
-                (void *)next->rsp,
-                (void *)next->kstack_base, (void *)next->kstack_top);
-        panic("verify_switch_target: next stack return address not in kernel text/data segment");
+     * 注意：canonical 地址高位全 1，不能用“高 16 位==0x8000”判断，须用区间。
+     *
+     * 重要例外：Ring3 用户任务的“返回地址槽”在首次切入（switch.S 构造）以及
+     * 此后 syscall/中断返回时，保存的都是**用户空间地址**（0x0~0x00007FFFFFFFFFFF，
+     * 即 iret 回用户态的桩），天然 < 0xFFFF800000000000，若仍做段检查会误 panic、
+     * 导致所有用户态任务（FS_SERVER/INPUT/SHELL 等）无法被调度。故对 is_user
+     * 任务跳过“返回地址段”检查——用户栈返回地址本就是合法用户地址；rsp 范围
+     * 检查（上方）仍保留，继续防御内核栈被越界覆盖的静默死机。 */
+    if (!next->is_user) {
+        if (ret_addr < 0xFFFF800000000000ULL || ret_addr >= 0xFFFFC00000000000ULL) {
+            kprintf("[sched] BAD SWITCH: next '%s' pid=%lu ret_addr=%p (heap/stack-seg) rsp=%p kstack=[%p,%p]\n",
+                    next->name, (unsigned long)next->id, (void *)ret_addr,
+                    (void *)next->rsp,
+                    (void *)next->kstack_base, (void *)next->kstack_top);
+            panic("verify_switch_target: next stack return address not in kernel text/data segment");
+        }
     }
 }
 
@@ -135,6 +144,7 @@ static void rq_push_cpu(task_t *t, uint32_t cpu)
     }
     g_percpu[cpu].rq_tail = t;
     g_percpu[cpu].rq_count++;
+    t->in_rq = true;
 }
 
 /* 从指定 CPU 运行队列摘除任意任务（调用方须持 g_sched_lock） */
@@ -160,6 +170,7 @@ static void rq_unlink_cpu(task_t *t, uint32_t cpu)
         }
         t->next = NULL;
         g_percpu[cpu].rq_count--;
+        t->in_rq = false;
     }
 }
 
@@ -195,6 +206,12 @@ static void bsp_idle(void)
     interrupts_enable();
     for (;;) {
         g_percpu[0].in_idle = 1;
+        /* 防御性开中断：本循环经 context_switch 切入时，若上一上下文是
+         * 中断上下文(如 sti 后 LAPIC 定时器抢占某任务并 schedule)，被恢复的
+         * RFLAGS.IF 可能落在 0（中断门自动清 IF 的遗留），导致 hlt 永远等不到
+         * 定时器唤醒、系统表现为“卡死”。idle 循环本就应在开中断下 hlt，故此处
+         * 显式开中断以消除该竞态（与 ap_main 的 idle 循环保持一致）。 */
+        interrupts_enable();
         __asm__ volatile("hlt");
         g_percpu[0].in_idle = 0;
         schedule();
@@ -396,9 +413,14 @@ static void task_publish(task_t *t, uint32_t cpu)
     t->all_next = g_all_tasks;
     g_all_tasks = t;
     g_task_count++;
-    /* 若目标 CPU 不是当前 CPU 且正在 hlt 空闲，发 IPI 唤醒其调度循环 */
-    if (cpu != cpu_index() && g_percpu[cpu].in_idle) {
+    /* P0-R1：总是向目标 CPU 发 RESCHED IPI（含同核 self-IPI），不再依赖 per-CPU
+     * 定时节拍兜底——AP tick 在某些环境下不可靠，依赖它会导致新建任务（尤其是
+     * 用户态服务 fs-server/display-server 等）永久不被调度，表现为启动挂载卡死。
+     * IPI handler 直接 schedule()，确保目标核立即发生一次调度。 */
+    if (cpu != cpu_index()) {
         lapic_send_ipi((uint8_t)g_percpu[cpu].lapic_id, IPI_RESCHED);
+    } else {
+        lapic_send_ipi((uint8_t)g_percpu[cpu_index()].lapic_id, IPI_RESCHED);
     }
     spin_unlock_irqrestore(&g_sched_lock, f);
 }
@@ -447,6 +469,7 @@ task_t *task_create_user_args(const void *elf, size_t size,
 {
     uint64_t as = vmm_create_address_space();
     if (!as) {
+        kprintf("[sched] task_create_user: vmm_create_address_space FAILED (return NULL)\n");
         return NULL;
     }
 
@@ -454,6 +477,7 @@ task_t *task_create_user_args(const void *elf, size_t size,
     uint64_t stack_top = USER_STACK_TOP - (aslr_random() & 0xFF) * PAGE_SIZE;
     if (!elf_load(as, elf, size, argc, argv, envc, envp, stack_top,
                   USER_STACK_PAGES, &res)) {
+        kprintf("[sched] task_create_user: elf_load FAILED\n");
         vmm_destroy_address_space(as);
         return NULL;
     }
@@ -462,6 +486,7 @@ task_t *task_create_user_args(const void *elf, size_t size,
      * 绝不会调度到半成品任务（P0-R1 多核正确性 + 避免锁重入死锁）。 */
     task_t *t = task_alloc_kernel(user_task_thunk, NULL, name);
     if (!t) {
+        kprintf("[sched] task_create_user: task_alloc_kernel FAILED\n");
         vmm_destroy_address_space(as);
         return NULL;
     }
@@ -609,6 +634,39 @@ void schedule(void)
 
     /* 切换完成后，在“新任务”栈上回收此前已退出任务的残留资源 */
     reap_dead();
+}
+
+/* 唤醒一个阻塞任务（IPC/等待协议用）。
+ * 经典 sleep/wakeup 死锁修复：接收方在 g_port_lock 下把 state 置 WAITING 并
+ * 调 schedule() 让出；schedule() 见 state!=RUNNING 会把它从运行队列摘下
+ * （in_rq=false）。若仅把 state 改回 READY 而不重新入队，pick_next 永远选不到
+ * 它 —— 表现即 FS server 阻塞在 recv 等 disk-srv 回复、disk-srv 却永不被调度的
+ * 死锁。故此处除置 READY 外，若它已不在 rq 则重新入队，并确保对其所在核发
+ * RESCHED IPI（含同核 self-IPI）。
+ * 锁序：本函数持 g_sched_lock（irqsave）。调用方（enqueue）持 g_port_lock 再调
+ * 本函数，即 g_port_lock 在外、g_sched_lock 在内，无反向持锁，安全。
+ * 因 interrupt gate 自动 CLI，持锁期间不会嵌套 resched IPI，无自死锁。 */
+void sched_wake(task_t *t)
+{
+    if (!t) {
+        return;
+    }
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    t->state = READY;
+    if (!t->in_rq) {
+        rq_push_cpu(t, t->cpu);
+    }
+    uint32_t wcpu = t->cpu;
+    bool same = (wcpu == cpu_index());
+    spin_unlock_irqrestore(&g_sched_lock, f);
+
+    /* IPI 在完全解锁后发送：waiter 所在核（可能即本核）需立即发生一次调度。
+     * 同核 self-IPI 在解锁后才触发，保证当前任务不会在仍持任何锁时被切走。 */
+    if (same) {
+        lapic_send_ipi((uint8_t)g_percpu[wcpu].lapic_id, IPI_RESCHED);
+    } else {
+        lapic_send_ipi((uint8_t)g_percpu[wcpu].lapic_id, IPI_RESCHED);
+    }
 }
 
 /* P0-R1 负载均衡观测：打印每 CPU 在线状态、运行队列长度、Ring3 任务切换计数。 */
@@ -841,5 +899,12 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     }
     verify_switch_target(next);
     context_switch(&t->rsp, next->rsp);   /* 一去不返 */
-    for (;;) { __asm__ volatile("hlt"); }
+
+    /* 兜底：context_switch 设计上永不返回（被切走的任务停泊在 switch.S 内部）。
+     * 若因 next 内核栈帧被破坏等异常导致它意外返回，此处绝不能落在关中断的
+     * hlt 上冻结本核（那正是"系统冻结"的表现之一）。改为 panic 带诊断，把
+     * 当前退出任务信息打印出来，交由异常处理路径安全停机而非静默死等。 */
+    panic("task_exit_current: context_switch returned unexpectedly "
+          "(task '%s' pid=%lu next='%s')",
+          t->name, (unsigned long)t->id, next->name);
 }

@@ -85,7 +85,17 @@ syscall_entry:
 
     /* 保存可能被子 C 调用破坏的用户寄存器（%r9 此刻为暂存指针残值，属
      * caller-saved 临时值，按 ABI 无需为用户恢复，pop 时还原为无关值；
-     * %r10 保有真实的用户第 4 参数） */
+     * %r10 保有真实的用户第 4 参数）。
+     * 关键修复（P0 生产稳定性）：必须同时保存/恢复所有 callee-saved 寄存器
+     * （rbx, rbp, r12-r15）——System V AMD64 ABI 规定 C 函数可自由改写的
+     * 被调用者保存寄存器，若不在 syscall 边界保存，用户态程序跨 syscall 后
+     * 这些寄存器的值会被内核 C 调用链破坏，导致概率性控制流错乱/挂死。 */
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
     pushq %rdi
     pushq %rsi
     pushq %rdx
@@ -109,6 +119,12 @@ syscall_entry:
     popq  %rdx
     popq  %rsi
     popq  %rdi
+    popq  %r15
+    popq  %r14
+    popq  %r13
+    popq  %r12
+    popq  %rbp
+    popq  %rbx
 
     /* execve 可能改写当前任务的 scr_rip/scr_rsp：用最新值覆盖 iretq 帧
      * （0(%rsp)=RIP 槽, 24(%rsp)=RSP 槽）。重新取本核索引（r11 已被 C 破坏）。 */

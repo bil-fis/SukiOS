@@ -65,8 +65,14 @@ static void udelay(uint64_t usec)
 static void ipi_resched_handler(registers_t *r)
 {
     (void)r;
-    /* 骨架：AP 尚无 runqueue。收到即返回（EOI 已由 isr_dispatch 发送）。 */
+    /* 跨 CPU 唤醒的关键：发送方 enqueue 唤醒一个绑定在别核的任务后，必须让
+     * 目标核真正发生一次调度，否则该任务可能永久睡眠（丢失唤醒）。
+     * 与 100Hz LAPIC 节拍(sched_tick 内 schedule())同处中断上下文，直接在
+     * 此处 schedule() 是安全的——中断返回(iretq)会落到被选中任务上下文。
+     * IPI handler 不持 g_sched_lock，无重入死锁风险。 */
     cpu_local()->ticks++;
+    kprintf("[smp] ipi_resched_handler on cpu=%u\n", (unsigned)cpu_index());
+    schedule();
 }
 
 static void ipi_tlb_handler(registers_t *r)
@@ -111,10 +117,13 @@ void ap_main(uint64_t idx)
      * sched_tick -> schedule()，从而真正参与对称多核调度（不再空转）。 */
     lapic_timer_start((uint8_t)IRQ0, 100);
 
-    /* 进入 idle 循环：开中断；无任务时 hlt 省电，被 IPI/定时器唤醒后调度。 */
+    /* 进入 idle 循环：开中断；无任务时 hlt 省电，被 IPI/定时器唤醒后调度。
+     * 循环内 hlt 前再显式开中断：与 bsp_idle 同理，消除从中断上下文切入时
+     * RFLAGS.IF 落在 0 导致 hlt 无法被唤醒的竞态。 */
     interrupts_enable();
     for (;;) {
         g_percpu[idx].in_idle = 1;
+        interrupts_enable();
         __asm__ volatile("hlt");
         g_percpu[idx].in_idle = 0;
         schedule();

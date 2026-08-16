@@ -39,3 +39,13 @@ others_tests/
 # ---- minimp3：外部依赖（内嵌 git 仓库，不入库）----
 # 构建 playaudio 前需自行获取：git clone https://github.com/lieff/minimp3
 minimp3/
+
+# ---- 压缩包 ----
+zipres/
+
+# ---- Web 相关内容 (为后续使用html技术构建图形界面准备) ----
+dist/
+node_modules/
+
+# ---- 其他文件 -----
+.gdbinit

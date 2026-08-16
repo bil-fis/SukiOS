@@ -3,9 +3,13 @@
  * -----------------------------------------------------------------------------
  * Intel High Definition Audio (HDA) 驱动。
  *
- * 依据：Intel HDA Specification Rev 1.0a（寄存器布局 §3.3，CORB/RIRB §4.4.1，
- *       流描述符/BDL §3.3.35+/§3.6.2，编解码器 verb §7.3）与
- *       wiki.osdev.org/Intel_High_Definition_Audio。
+ * 依据：Intel HDA Specification Rev 1.0a（high-definition-audio-specification.pdf，
+ *       CORB/RIRB §4.4.1，流描述符/BDL §3.3.35+，编解码器 verb §7.3.3/§7.3.4）
+ *       与 wiki.osdev.org/Intel_High_Definition_Audio。
+ * 注：寄存器布局遵循 QEMU intel-hda / osdev 采用的简化模型（流描述符每项 0x20
+ *     字节，byte0=CTL0/RUN/SRST、byte2[7:4]=流号、0x5A=RINTCNT 等），与严格
+ *     1.0a 的 SDnCTL 位布局略有差异；本驱动以 QEMU 验证为准，verb 编码数值与
+ *     规范完全一致。
  *
  * 结构：
  *   1. PCI 探测：class 0x04 (Multimedia) / subclass 0x03 (Audio Device)。
@@ -240,10 +244,14 @@ static bool hda_ring_init(void)
     w32(REG_RIRBLBASE, (uint32_t)g_rirb_phys);
     w32(REG_RIRBUBASE, (uint32_t)(g_rirb_phys >> 32));
     w16(REG_RIRBWP, 0x8000);    /* 复位写指针（bit15，自清）：wp = 0 */
-    /* 写 RINTCNT（0x5A，QEMU 的 rirb_cnt）= 0xFF。QEMU 的 CORB 引擎在
-     * rirb_count == rirb_cnt 时停止，默认 0 会导致 CORB 永不运行；置 255
-     * 使整个枚举/打开阶段（远少于 255 条 verb）都能被控制器消费。
-     * 注意：真实硬件此处应复位 RIRBRP 并在 RIRBCTL[3:0] 设 RINTCNT。 */
+    /* 写 RINTCNT（0x5A）= 0xFF。
+     * 规范权威定义（《high-definition-audio-specification.pdf》§3.3.28）：
+     *   0x5A 即 RINTCNT（Response Interrupt Count）寄存器，绝非 RIRBRP
+     *   （规范中本无 RIRBRP 寄存器，RIRB 读指针由硬件隐式维护，软件不写）。
+     * QEMU 的 intel-hda 把 0x5A 建模为 rirb_cnt，且 CORB 引擎在
+     *   rirb_count == rirb_cnt 时停止；默认 0 会导致 CORB 永不运行，故置 255
+     *   使整个枚举/打开阶段（远少于 255 条 verb）都能被控制器消费。
+     * 真机同样为 RINTCNT 寄存器（置非零值合理），故 QEMU 与真机在此处一致。 */
     w16(REG_RINTCNT, 0x00FF);
     g_rirb_rp = 0;               /* QEMU 响应落在槽 (wp+1)，读取时加 1 偏移到 */
 

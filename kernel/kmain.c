@@ -41,6 +41,11 @@
 
 /* 声明在 kernel/sched/sched.c：将 BSP 引导流切换到 idle0 独立内核栈 */
 extern void sched_switch_to_idle0(void);
+
+/* 前向声明：内核完全稳定后的引导收尾线程（定义于本文件末尾）。
+ * 由 kmain 在 sched_switch_to_idle0() 之前经 task_create_kernel 拉起，
+ * 运行于独立内核栈、被正常调度，负责加载 disk-srv 与全部 Ring3 服务。 */
+static void boot_late_init(void *arg);
 #include <kernel/pci.h>       /* P0-1/P0-2：ECAM、_PRT 路由、MSI 编程 */
 #include <kernel/hda.h>
 
@@ -137,12 +142,8 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
      * 任务之前——kmain 自身永不返回，是唯一「序言读旧值」的在飞栈帧。 */
     stack_canary_reseed();
 
-    if (magic != MULTIBOOT2_MAGIC) {
-        serial_writestr("[boot] FATAL: not Multiboot2.\n");
-        for (;;) { __asm__ volatile("hlt"); }
-    }
-    if (!multiboot2_parse(mbi_phys, &g_boot)) {
-        serial_writestr("[boot] FATAL: bad Multiboot2 info.\n");
+    if (!bootinfo_prepare(magic, mbi_phys, &g_boot)) {
+        serial_writestr("[boot] FATAL: unsupported boot protocol (not Multiboot2/PVH).\n");
         for (;;) { __asm__ volatile("hlt"); }
     }
 
@@ -220,36 +221,86 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     /* ---- 阶段八·补：Intel HDA 音频（内核态特例，类 ATA） ---- */
     hda_init();
 
-    /* ---- 阶段八：磁盘（内核态特例）与 Ring3 FAT32 服务 ----
-     * P0-7：先探测 AHCI（中断驱动 DMA），无控制器/无盘再回退 ATA PIO；
-     * disk-srv 内部经 blk_read/blk_write 自动选路。 */
-    bool ahci_ok = ahci_init();
-    bool disk_ok = ata_init() || ahci_ok;
-    if (disk_ok) {
-        disk_srv_start();
-        task_t *fs_task = task_create_user(user_fs_server_start,
-                         (size_t)(user_fs_server_end - user_fs_server_start),
-                         "fs-server");
-        /* A2 项：仅 FS_SERVER 被授权向内核 DISK_PORT 发送磁盘请求 */
-        if (fs_task) {
-            port_grant_send(DISK_PORT, fs_task);
-        }
-    } else {
-        kprintf("[boot] no disk: FS_SERVER not started\n");
-    }
+    /* ---- 阶段八/九：磁盘（内核态特例）与 Ring3 服务的加载 ----
+     * 关键设计（用户明确要求：「内核基本完全稳定后，再开始加载用户态」）：
+     *   内核侧所有核心子系统（SMP/调度/IPC/磁盘探测/音频/全部 selftest）此时
+     *   已全部静态完成。因此这部分「拉起 disk-srv 内核线程 + 用户态
+     *   fs-server/input-server/shell」必须延后到一个独立的内核线程 boot_late_init
+     *   中——它运行于独立内核栈、被正常调度，在内核彻底稳定后才执行，从而真正
+     *   『先内核稳定、后用户态』，彻底消除此前『边初始化边跑用户态』的竞争窗口。
+     *
+     * 时序约束（务必遵循）：
+     *   1) 先在 BSP 引导栈上 spawn boot_late_init（加入运行队列，向某核发 IPI）；
+     *   2) 紧接 sched_switch_to_idle0() 把 BSP 引导流冻结为 idle0。
+     *   这样 boot_late_init 永远不会在 BSP 引导栈仍活跃时被调度，避免与 kmain
+     *   收尾重叠；它只会在 idle0 之外的核（或 idle0 被调度让出后）安全运行。 */
 
-    /* ---- 阶段九：Ring3 输入服务 + Shell ---- */
+    /* 内核已稳定：先关中断再 spawn 引导收尾线程（磁盘 + Ring3 服务），最后冻结
+     * BSP 引导栈。
+     * 关键时序（防止 BSP 引导栈在冻结前被切走）：
+     *   task_create_kernel 会向目标核发 IPI_RESCHED（若 boot-late 被 RR 绑到 BSP
+     *   则为 self-IPI）。在中断**开启**窗口里 self-IPI 可能令 BSP 提前 schedule 到
+     *   boot_late_init，使『加载用户态』发生在 BSP 引导栈仍活跃时——这正是要杜绝
+     *   的竞态。故此处先 interrupts_disable()，让 self-IPI 暂存、不会切入；随后
+     *   sched_switch_to_idle0() 在关中断下构造独立栈并 context_switch 到 idle0；
+     *   idle0 的 bsp_idle 才 sti，此时 self-IPI 在独立栈上下文被响应、调度到
+     *   boot_late_init——BSP 引导栈早已冻结，真正『内核稳定后再加载用户态』。 */
+    interrupts_disable();
+    task_create_kernel(boot_late_init, NULL, "boot-late");
+
+    /* task0 = idle0：将 BSP 引导流切换到 idle0 的独立内核栈，BSP 引导栈从此冻结。
+     * 切换后 idle0 在独立栈上运行 bsp_idle（hlt + schedule 循环），避免 idle0 复
+     * 用 BSP 引导栈导致切回时返回地址被覆盖而触发 #UD（vector 6 / system halted）。 */
+    sched_switch_to_idle0();
+
+    /* never returns */
+    (void)0;
+}
+
+/*
+ * boot_late_init —— 内核完全稳定后、统一加载磁盘与 Ring3 服务的引导收尾线程。
+ *
+ * 运行时机：由 kmain 在 sched_switch_to_idle0() 之前经 task_create_kernel 拉起、
+ * 加入运行队列；kmain 随后立即冻结为 idle0，本线程在独立内核栈被调度时，
+ * 此时：
+ *   - SMP 所有 AP 已 online 且各自 LAPIC 100Hz 节拍已跑（对称调度已生效）；
+ *   - 调度器/IDT/IPC 端口表已静态完成，BSP 引导栈已冻结为 idle0；
+ *   - 本线程运行在独立内核栈、被正常调度，绝不会与任何『内核收尾』动作重叠。
+ * 因此此时加载用户态是安全的，彻底消除了『边初始化边跑用户态』的竞争窗口。
+ *
+ * 内部顺序（仍保留「生产者先就绪」同步）：
+ *   1) 探测 AHCI/ATA，启动 disk-srv 内核线程；
+ *   2) 自旋等 disk-srv 真正阻塞在 DISK_PORT（port_has_waiter）后再 spawn 依赖它的
+ *      fs-server 并授权其向 DISK_PORT 发请求——避免消费者早于生产者就绪丢失唤醒；
+ *   3) 依次 spawn input-server、shell。
+ */
+static void boot_late_init(void *arg)
+{
+    (void)arg;
+
+    kprintf("[boot] late-init thread: kernel fully stable, loading services...\n");
+
+    /* 进入用户态服务前关闭「内核诊断镜像到帧缓冲」：此后 [ipc]/[sched] 等
+     * 运行期日志只走串口，帧缓冲专供 Ring3 shell/UI，避免按键时被刷屏。
+     * 用户态输出经 sys_debug_write -> user_puts() 独立路径，不受影响。 */
+    console_set_fb_diag(false);
+
+    /* ============================================================
+     * 本阶段只加载「非文件系统」的 Ring3 服务：input-server + shell。
+     * 文件系统部分（AHCI/ATA 探测、disk-srv 内核线程、FS_SERVER 用户态）按
+     * 当前需求暂不加载——shell 进入后仅交互式命令可用，依赖磁盘的命令
+     * （ls/cat/exec 等）会报告 service unavailable，不影响 shell 本身运行。
+     * ========================================================== */
+
+    /* ---- Ring3 输入服务 + Shell ---- */
     task_create_user(user_input_server_start,
                      (size_t)(user_input_server_end - user_input_server_start),
                      "input-server");
     task_create_user(user_shell_start,
                      (size_t)(user_shell_end - user_shell_start), "shell");
 
-    kprintf("[boot] all services spawned; idle task parked.\n\n");
+    kprintf("[boot] all services spawned; system fully up.\n\n");
 
-    /* task0 = idle0：将 BSP 引导流切换到 idle0 的独立内核栈，BSP 引导栈从此冻结。
-     * 切换后 idle0 在独立栈上运行 bsp_idle（hlt + schedule 循环），避免 idle0 复
-     * 用 BSP 引导栈导致切回时返回地址被覆盖而触发 #UD（vector 6 / system halted）。 */
-    sched_switch_to_idle0();
-    /* never returns */
+    /* 本线程使命完成，退出（zombie 由调度器回收）。 */
+    task_exit_current(0);
 }

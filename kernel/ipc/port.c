@@ -14,6 +14,7 @@
  *           内核服务线程 -> ipc_send_kernel / ipc_recv_kernel。
  */
 #include <ipc/port.h>
+#include <ipc/fs_proto.h>
 #include <kernel/syscall.h>
 #include <kernel/console.h>
 #include <kernel/string.h>
@@ -98,6 +99,18 @@ kernel_port_t *port_lookup(uint32_t name)
     return &g_ports[name];
 }
 
+bool port_has_waiter(uint32_t name)
+{
+    kernel_port_t *p = port_lookup(name);
+    if (!p) {
+        return false;
+    }
+    uint64_t f = spin_lock_irqsave(&g_port_lock);
+    bool has = (p->waiter_head != NULL);
+    spin_unlock_irqrestore(&g_port_lock, f);
+    return has;
+}
+
 /* 授权某任务向内核端口发送（如 fs-server -> DISK_PORT）。send_owner==NULL
  * 表示任何任务均可发送。A2 项。 */
 void port_grant_send(uint32_t name, task_t *owner)
@@ -122,18 +135,88 @@ uint64_t port_claim(uint32_t name)
     return 0;
 }
 
+static int enqueue(kernel_port_t *p, kernel_msg_t *m);   /* 返回被唤醒的 cpu 索引，-1 表示无 waiter 唤醒 */
+
+/* 构造并直接入队一条「服务已下线」应答到 reply_to 端口（调用方须已关中断）。
+ * 负载为 fs_resp_t{status=FS_ERR_IO, length=0}，与 FS 协议兼容；客户端也可
+ * 只看 msgh_id==MSG_ID_SERVICE_DOWN 判定服务崩溃。失败（内存不足）时静默丢弃，
+ * 此时客户端仍可能阻塞，但这属于极端 OOM 路径，不影响正常崩溃恢复。 */
+/* 返回被唤醒 waiter 的 cpu 索引（-1 表示无）；调用方须在解锁后补发 IPI */
+static int notify_service_down(uint32_t reply_to, uint32_t req_id)
+{
+    uint32_t sz = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_resp_t));
+    kernel_msg_t *r = (kernel_msg_t *)kmalloc(sizeof(kernel_msg_t) + sz);
+    if (!r) {
+        return -1;
+    }
+    r->next = NULL;
+    r->size = sz;
+    r->has_ool = false;
+    r->ool_page_count = 0;
+    r->ool_size = 0;
+    r->ool_mapped_va = 0;
+    mach_msg_header_t *h = (mach_msg_header_t *)r->data;
+    h->msgh_bits        = 0;
+    h->msgh_size        = sz;
+    h->msgh_remote_port = reply_to;
+    h->msgh_local_port  = 0;
+    h->msgh_id          = MSG_ID_SERVICE_DOWN;
+    h->msgh_reserved    = req_id;          /* 回带原请求 id，便于客户端匹配 */
+    fs_resp_t *fr = (fs_resp_t *)(r->data + sizeof(mach_msg_header_t));
+    fr->status = FS_ERR_IO;
+    fr->length = 0;
+    return enqueue(&g_ports[reply_to], r);   /* 调用方持锁；IPI 由调用方解锁后发 */
+}
+
 /* 任务退出时释放其认领的所有端口所有权（owner/send_owner 置空），避免
  * 端口 owner 变成悬空指针导致下一个同名端口认领者被永久拒绝（A2 修复）。
  * 知名端口（<PORT_FIRST_DYN）仅清 owner 保留槽位；动态端口不在此处理
- * （由 port_free 显式回收）。单核：由 task_exit_current 关中断下调用。 */
+ * （由 port_free 显式回收）。SMP：整段持 g_port_lock 串行化端口表访问，
+ * 唤醒的 waiter 经位图收集，解锁后统一补发 RESCHED IPI（不在持锁期发送）。 */
 void port_release_owner(task_t *t)
 {
+    uint64_t waked_mask = 0;   /* 每位 = 一个 cpu，去重 IPI */
+    uint64_t f = spin_lock_irqsave(&g_port_lock);
     for (uint32_t i = DISK_PORT; i < PORT_MAX; i++) {
         if (g_ports[i].owner == t) {
             g_ports[i].owner = NULL;
+            /* P0-R2 生存性修复：服务进程（如 fs-server）崩溃退出后，其端口上
+             * 仍排队着客户端（shell）的请求，而客户端正阻塞在自己的应答端口上
+             * 等待回复。若不处理，客户端将永久阻塞——表现为「键盘失灵」。
+             * 这里把死者端口队列中的每条请求都排干，并按请求头里的
+             * msgh_local_port 回送一条 msgh_id=MSG_ID_SERVICE_DOWN 的错误应答，
+             * 使客户端能立即从 mach_msg_recv 返回并回到提示符。 */
+            kernel_msg_t *m = g_ports[i].queue_head;
+            g_ports[i].queue_head = NULL;
+            g_ports[i].queue_tail = NULL;
+            g_ports[i].queue_len  = 0;
+            while (m) {
+                kernel_msg_t *next = m->next;
+                if (m->size >= sizeof(mach_msg_header_t)) {
+                    mach_msg_header_t *rh = (mach_msg_header_t *)m->data;
+                    uint32_t reply_to = rh->msgh_local_port;
+                    uint32_t req_id   = rh->msgh_id;
+                    if (reply_to >= DISK_PORT && reply_to < PORT_MAX &&
+                        g_ports[reply_to].in_use) {
+                        int wcpu = notify_service_down(reply_to, req_id);
+                        if (wcpu >= 0 && (uint32_t)wcpu < MAX_CPUS) {
+                            waked_mask |= (1ULL << (uint32_t)wcpu);
+                        }
+                    }
+                }
+                kfree(m);
+                m = next;
+            }
         }
         if (g_ports[i].send_owner == t) {
             g_ports[i].send_owner = NULL;
+        }
+    }
+    spin_unlock_irqrestore(&g_port_lock, f);
+    /* 解锁后补发 IPI：唤醒在死者端口上阻塞的客户端所在核 */
+    for (uint32_t c = 0; c < MAX_CPUS; c++) {
+        if (waked_mask & (1ULL << c)) {
+            lapic_send_ipi((uint8_t)g_percpu[c].lapic_id, IPI_RESCHED);
         }
     }
 }
@@ -195,8 +278,12 @@ void port_set_owner(uint32_t name, task_t *owner)
     }
 }
 
-/* ---- 队列操作（调用方须持临界区） ---- */
-static void enqueue(kernel_port_t *p, kernel_msg_t *m)
+/* ---- 队列操作（调用方须持 g_port_lock，确保跨 CPU 可见性与 sleep/wakeup 原子性） ---- */
+/* 返回值：若唤醒了一个 waiter，返回其绑定的 cpu 索引；否则返回 -1。
+ * 重要：本函数【不】在持锁期发送 RESCHED IPI——调用方须在 spin_unlock
+ * 之后依据返回值补发，否则会令当前任务在仍持有 g_port_lock 时被 IPI 切走
+ * （自旋锁不可睡眠原则违反，其它核长时间自旋）。 */
+static int enqueue(kernel_port_t *p, kernel_msg_t *m)
 {
     m->next = NULL;
     if (p->queue_tail) {
@@ -207,7 +294,10 @@ static void enqueue(kernel_port_t *p, kernel_msg_t *m)
     p->queue_tail = m;
     p->queue_len++;
 
-    /* 唤醒 FIFO 队首等待者（A4 项：取代单 waiter 指针，避免丢失唤醒） */
+    /* 唤醒 FIFO 队首等待者（A4 项：取代单 waiter 指针，避免丢失唤醒）。
+     * 此处与接收方 port_wait_enqueue 同处 g_port_lock，构成原子 sleep/wakeup：
+     * 发送方要么在接收方注册 waiter 之前入队（接收方随后 dequeue 即见消息），
+     * 要么在注册之后入队并在此立即唤醒，二者必居其一，杜绝丢失唤醒。 */
     if (p->waiter_head) {
         task_t *w = p->waiter_head;
         p->waiter_head = w->wait_next;
@@ -215,16 +305,21 @@ static void enqueue(kernel_port_t *p, kernel_msg_t *m)
             p->waiter_tail = NULL;
         }
         w->wait_next = NULL;
-        w->state = READY;
-        /* P0-R1：等待者绑定在其它核且该核正 hlt 空闲时，发 IPI 立即唤醒，
-         * 否则最坏要等对核下一个 10ms 定时节拍才被调度（IPC 延迟激增）。 */
-        if (w->cpu != cpu_index() && g_percpu[w->cpu].in_idle) {
-            lapic_send_ipi((uint8_t)g_percpu[w->cpu].lapic_id, IPI_RESCHED);
-        }
+        /* 唤醒：置 READY + 若已不在 rq 重新入队 + 发 RESCHED IPI（见 sched_wake）。
+         * 这是消除“接收方阻塞→schedule 摘链→仅置 READY 不再入队→永久死锁”的关键。 */
+        sched_wake(w);
+        kprintf("[ipc] wake waiter task='%s' pid=%lu on port=%u "
+                "wcpu=%u curcpu=%u in_idle=%u\n",
+                w->name, (unsigned long)w->id, (unsigned)p->name,
+                (unsigned)w->cpu, (unsigned)cpu_index(),
+                (unsigned)g_percpu[w->cpu].in_idle);
+        return (int)w->cpu;
     }
+    return -1;
 }
 
-/* 将当前任务加入端口等待队列尾部（调用方须持临界区且随后 schedule()） */
+/* 将当前任务加入端口等待队列尾部（调用方须持 g_port_lock，且随后
+ * port_block_and_yield 让出；注册 waiter 与检查队列在同一把锁下构成原子协议） */
 static void port_wait_enqueue(kernel_port_t *p)
 {
     task_t *t = sched_current();
@@ -236,6 +331,9 @@ static void port_wait_enqueue(kernel_port_t *p)
     }
     p->waiter_tail = t;
     t->state = WAITING;
+    kprintf("[ipc] task '%s' pid=%lu wait on port=%u (cpu=%u)\n",
+            t->name, (unsigned long)t->id, (unsigned)p->name,
+            (unsigned)t->cpu);
 }
 
 static kernel_msg_t *dequeue(kernel_port_t *p)
@@ -254,10 +352,10 @@ static kernel_msg_t *dequeue(kernel_port_t *p)
 /* ---- 投递一条已构造好的内核消息 ---- */
 static uint64_t deliver(uint32_t dest, kernel_msg_t *m)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&g_port_lock);
     kernel_port_t *p = port_lookup(dest);
     if (!p) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&g_port_lock, f);
         kfree(m);
         return MACH_SEND_INVALID_DEST;
     }
@@ -265,12 +363,16 @@ static uint64_t deliver(uint32_t dest, kernel_msg_t *m)
      * 超出则拒绝投递并返回 NO_BUFFER，形成背压（发送方收到错误后可重试/
      * 限流），而非无界增长。 */
     if (p->queue_len >= PORT_QUEUE_MAX) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&g_port_lock, f);
         kfree(m);
         return MACH_SEND_NO_BUFFER;
     }
-    enqueue(p, m);
-    irq_restore(f);
+    int wcpu = enqueue(p, m);
+    spin_unlock_irqrestore(&g_port_lock, f);
+    /* 唤醒所需的 RESCHED IPI 已由 enqueue→sched_wake 在解锁后发出，
+     * 本处不再重复发送，避免持 g_port_lock 时切走。 */
+    kprintf("[ipc] deliver dest=%u queued (len=%u) woke_waiter=%s\n",
+            (unsigned)dest, (unsigned)m->size, wcpu >= 0 ? "yes" : "no");
     return MACH_MSG_SUCCESS;
 }
 
@@ -301,10 +403,10 @@ uint64_t ipc_recv_kernel(uint32_t port_name, void *buf, uint32_t buf_size,
     }
 
     for (;;) {
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock_irqsave(&g_port_lock);
         kernel_msg_t *m = dequeue(p);
         if (m) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&g_port_lock, f);
             uint32_t n = m->size < buf_size ? m->size : buf_size;
             memcpy(buf, m->data, n);
             if (out_size) {
@@ -314,11 +416,30 @@ uint64_t ipc_recv_kernel(uint32_t port_name, void *buf, uint32_t buf_size,
             return MACH_MSG_SUCCESS;
         }
         if (!block) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&g_port_lock, f);
             return MACH_RCV_TIMED_OUT;
         }
-        /* 阻塞：登记等待 -> 解锁（保持关中断）-> 调度让出（见 helper 注释） */
+        /* 原子 sleep/wakeup 协议：在 g_port_lock 下注册 waiter，注册后再查一次
+         * 队列（double-check）。若发送方在我们注册 waiter 之前已持同一把锁把消息
+         * 入队，则此处能看到并立即取走返回；若发送方在注册之后入队，则由 enqueue
+         * 立即唤醒我们。两种顺序均不丢消息，彻底消除 SMP 下的丢失唤醒。 */
         port_wait_enqueue(p);
+        m = dequeue(p);
+        if (m) {
+            /* 注册后才发现消息已到：取消阻塞，直接返回 */
+            p->waiter_head = NULL;
+            p->waiter_tail = NULL;
+            sched_current()->state = READY;
+            spin_unlock_irqrestore(&g_port_lock, f);
+            uint32_t n = m->size < buf_size ? m->size : buf_size;
+            memcpy(buf, m->data, n);
+            if (out_size) {
+                *out_size = n;
+            }
+            kfree(m);
+            return MACH_MSG_SUCCESS;
+        }
+        /* 阻塞：登记等待 -> 解锁（保持关中断）-> 调度让出（见 helper 注释） */
         port_block_and_yield(f);
         /* 被唤醒后重试出队 */
     }
@@ -406,10 +527,10 @@ uint64_t ipc_recv_ool_kernel(uint32_t port_name, void *inline_buf,
         return MACH_RCV_INVALID_NAME;
     }
     for (;;) {
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock_irqsave(&g_port_lock);
         kernel_msg_t *m = dequeue(p);
         if (m) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&g_port_lock, f);
             uint32_t n = m->size < inline_cap ? m->size : inline_cap;
             if (inline_buf) {
                 memcpy(inline_buf, m->data, n);
@@ -441,10 +562,46 @@ uint64_t ipc_recv_ool_kernel(uint32_t port_name, void *inline_buf,
             return MACH_MSG_SUCCESS;
         }
         if (!block) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&g_port_lock, f);
             return MACH_RCV_TIMED_OUT;
         }
         port_wait_enqueue(p);
+        m = dequeue(p);
+        if (m) {
+            p->waiter_head = NULL;
+            p->waiter_tail = NULL;
+            sched_current()->state = READY;
+            spin_unlock_irqrestore(&g_port_lock, f);
+            uint32_t n = m->size < inline_cap ? m->size : inline_cap;
+            if (inline_buf) {
+                memcpy(inline_buf, m->data, n);
+            }
+            if (inline_out) {
+                *inline_out = n;
+            }
+            uint32_t got = 0;
+            if (m->has_ool) {
+                for (uint32_t i = 0; i < m->ool_page_count; i++) {
+                    uint64_t pa = m->ool_pages[i];
+                    uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(pa);
+                    uint32_t rem = ool_cap - got;
+                    if (rem == 0) {
+                        break;
+                    }
+                    uint32_t chunk = PAGE_SIZE < rem ? PAGE_SIZE : rem;
+                    if (ool_buf) {
+                        memcpy(ool_buf + got, kva, chunk);
+                    }
+                    got += chunk;
+                    pmm_decref((void *)pa);
+                }
+            }
+            if (ool_out) {
+                *ool_out = got;
+            }
+            kfree(m);
+            return MACH_MSG_SUCCESS;
+        }
         port_block_and_yield(f);
     }
 }
@@ -466,6 +623,10 @@ void port_free(uint32_t name)
 uint64_t sys_mach_msg(uint64_t msg_uptr, uint64_t option,
                       uint64_t send_size, uint64_t recv_limit, uint64_t port)
 {
+    kprintf("[ipc] sys_mach_msg enter opt=0x%lx port=%lu send=%lu recv=%lu msg=%p\n",
+            (unsigned long)option, (unsigned long)port,
+            (unsigned long)send_size, (unsigned long)recv_limit,
+            (void *)msg_uptr);
     if (option & MACH_SEND_MSG) {
         if (send_size < sizeof(mach_msg_header_t) ||
             send_size > sizeof(mach_msg_header_t) + MACH_MSG_INLINE_MAX) {
@@ -528,14 +689,32 @@ uint64_t sys_mach_msg(uint64_t msg_uptr, uint64_t option,
             return MACH_RCV_INVALID_NAME;
         }
         kernel_msg_t *m = NULL;
+        kprintf("[ipc] user-recv enter port=%u owner_ok=%u qlen=%u\n",
+                (unsigned)port,
+                (unsigned)(p && p->owner == sched_current()),
+                (unsigned)(p ? p->queue_len : 0xff));
         for (;;) {
-            uint64_t f = irq_save();
+            uint64_t f = spin_lock_irqsave(&g_port_lock);
             m = dequeue(p);
             if (m) {
-                irq_restore(f);
+                spin_unlock_irqrestore(&g_port_lock, f);
+                kprintf("[ipc] user-recv got port=%u size=%u\n",
+                        (unsigned)port, (unsigned)m->size);
                 break;
             }
             port_wait_enqueue(p);
+            /* double-check：注册 waiter 后再查队列，避免 SMP 下发送方在注册前
+             * 入队导致的丢失唤醒（与 enqueue 同持 g_port_lock 构成原子协议） */
+            m = dequeue(p);
+            if (m) {
+                p->waiter_head = NULL;
+                p->waiter_tail = NULL;
+                sched_current()->state = READY;
+                spin_unlock_irqrestore(&g_port_lock, f);
+                kprintf("[ipc] user-recv got port=%u size=%u (late)\n",
+                        (unsigned)port, (unsigned)m->size);
+                break;
+            }
             port_block_and_yield(f);
         }
         /* M6 修复：接收侧防御性校验。

@@ -62,6 +62,10 @@ static void fs_wait_and_print(uint32_t expect_id, bool raw)
         if (h->msgh_id == MSG_ID_KEYCHAR) {
             continue;                        /* 等待期间丢弃按键 */
         }
+        if (h->msgh_id == MSG_ID_SERVICE_DOWN) {
+            u_print("fs: service unavailable (fs-server down)\n");
+            return;                          /* 立即回提示符，不再永久等待 */
+        }
         if (h->msgh_id != expect_id) {
             continue;
         }
@@ -123,6 +127,10 @@ static void fs_wait_status(uint32_t expect_id)
         mach_msg_header_t *h = (mach_msg_header_t *)g_rx;
         if (h->msgh_id == MSG_ID_KEYCHAR) {
             continue;
+        }
+        if (h->msgh_id == MSG_ID_SERVICE_DOWN) {
+            u_print("fs: service unavailable (fs-server down)\n");
+            return;
         }
         if (h->msgh_id != expect_id) {
             continue;

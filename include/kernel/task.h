@@ -71,6 +71,7 @@ typedef struct task {
     struct task *all_next;          /* 全局任务链表（g_all_tasks），供 pid 查找 */
 
     struct task *next;              /* 就绪队列（循环链表） */
+    bool     in_rq;                  /* 是否已在某 CPU 运行队列中（sched_wake 判断是否需重新入队） */
 } task_t;
 
 /* FPU/SSE 状态保存与恢复原语（实现见 sched/switch.S） */
@@ -93,6 +94,12 @@ task_t *task_create_user_args(const void *blob, size_t size,
                               const char *name);
 task_t *sched_current(void);
 void   schedule(void);              /* 主动触发一次调度 */
+
+/* 唤醒一个阻塞任务（IPC/等待协议用）：置 READY，若已被 schedule 移出运行
+ * 队列则重新入队到其绑定 CPU，并向其所在核发 RESCHED IPI。
+ * 必须在关中断/持适当锁的上下文调用；本函数内部持 g_sched_lock（irqsave），
+ * 故不会在持锁期被 IPI 嵌套（interrupt gate 自动 CLI）。 */
+void   sched_wake(task_t *t);
 task_t *sched_create_idle(uint32_t cpu);  /* 为某 CPU 建 idle 任务（P0-R1） */
 
 /* sys_wait 核心：等待子任务退出（SMP 安全，g_sched_lock 保护，P0-R1）。

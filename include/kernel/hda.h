@@ -3,8 +3,12 @@
  * -----------------------------------------------------------------------------
  * Intel High Definition Audio (HDA) 控制器 + 编解码器驱动接口。
  *
- * 参考：Intel HDA Specification Rev 1.0a（high-definition-audio-specification.pdf）
+ * 参考：Intel HDA Specification Rev 1.0a（high-definition-audio-specification.pdf，
+ *       CORB/RIRB §4.4.1，流描述符/BDL §3.3.35+，verb §7.3.3/§7.3.4）
  *       与 osdev wiki（wiki.osdev.org/Intel_High_Definition_Audio）。
+ * 注：寄存器布局遵循 QEMU intel-hda / osdev 简化模型（流描述符每项 0x20 字节，
+ *     0x5A=RINTCNT 等），与严格 1.0a 的 SDnCTL 位布局略有差异；驱动以 QEMU
+ *     验证为准，verb 编码数值与规范完全一致。
  *
  * 驱动模型（与 ATA 相同的"内核态特例"）：控制器 MMIO / CORB / RIRB /
  * 流 DMA 全部驻留 Ring0；Ring3 播放器通过 SYS_AUDIO_* 系统调用把 PCM

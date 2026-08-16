@@ -79,4 +79,8 @@ typedef struct boot_info {
 /* 解析物理地址处的 Multiboot2 info，填充 out。返回 true 成功。 */
 bool multiboot2_parse(uint64_t mbi_phys, boot_info_t *out);
 
+/* 统一引导信息入口：magic==MULTIBOOT2_MAGIC 走 multiboot2，否则走 PVH
+ * （QEMU -kernel 直接加载，GRUB 不可用时）。返回 true 成功。 */
+bool bootinfo_prepare(uint64_t magic, uint64_t info_phys, boot_info_t *out);
+
 #endif /* _SUKI_KERNEL_MULTIBOOT2_H */

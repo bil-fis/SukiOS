@@ -32,6 +32,15 @@ SECTIONS
         *(.boot.bss)
     }
 
+    /* ---- Xen PVH ELF Note（独立 SHT_NOTE 段，供 QEMU -kernel 识别）----
+     * QEMU 的 PVH 加载器遍历 SHT_NOTE 段寻找 name="Xen" type=18 的 note，
+     * 故本段必须保持独立（不可并入 .boot/.text 等 PROGBITS 段），否则
+     * QEMU 无法识别 PVH 入口。该段不分配（不进入任何 PT_LOAD）。 */
+    .note.pvh ALIGN(4) :
+    {
+        KEEP(*(.note.pvh))
+    }
+
     /* ---- 切换到高半区：VMA 加上 KERNEL_BASE，LMA 由 AT() 保持连续 ---- */
     . += KERNEL_VMA;
 
@@ -83,7 +92,8 @@ SECTIONS
     {
         *(.eh_frame)
         *(.eh_frame_hdr)
-        *(.note .note.*)
+        /* 注意：(.note.pvh) 已在 .boot 段 KEEP，不会被此处丢弃 */
+        *(.note.gnu*)
         *(.comment)
     }
 }

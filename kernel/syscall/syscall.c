@@ -15,6 +15,7 @@
 #include <kernel/string.h>
 #include <kernel/keyboard.h>
 #include <kernel/io.h>
+#include <kernel/serial.h>
 #include <mm/vmm.h>
 #include <mm/vma.h>
 #include <mm/kmalloc.h>
@@ -177,7 +178,10 @@ static uint64_t sys_debug_write(uint64_t buf_uptr, uint64_t len)
             return done ? done : (uint64_t)-1;
         }
         kbuf[chunk] = '\0';
-        kprintf("%s", kbuf);
+        /* 用户态输出走独立的 user_puts() 后端（直接写帧缓冲+串口），
+         * 不掺入内核诊断的 g_kernel_fb_diag 开关——即使内核诊断已退出
+         * 帧缓冲，shell/UI 文本仍稳定显示。 */
+        user_puts(kbuf);
         done += chunk;
     }
     return done;
@@ -188,6 +192,15 @@ static uint64_t sys_input_read(void)
 {
     int sc = keyboard_get_scancode();
     return (sc < 0) ? (uint64_t)-1 : (uint64_t)sc;
+}
+
+/* 16: sys_serial_read —— 非阻塞读 COM1 控制台输入；无数据返回 (uint64_t)-1，
+ * 否则返回 0..255 的 ASCII 字节。供 Ring3 INPUT_SERVER 把串口作为控制台
+ * 输入源（headless QEMU 经 -serial 注入、物理部署经 COM1 控制台）。 */
+static uint64_t sys_serial_read(void)
+{
+    int ch = serial_read();
+    return (ch < 0) ? (uint64_t)-1 : (uint64_t)(uint8_t)ch;
 }
 
 /* 6: sys_reboot —— mode=0: 经 8042 键盘控制器脉冲 CPU RESET 线重启；
@@ -660,6 +673,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_AUDIO_STOP:  return sys_audio_stop();
     case SYS_MMAP:        return sys_mmap(a1, a2);
     case SYS_MUNMAP:      return sys_munmap(a1, a2);
+    case SYS_SERIAL_READ: return sys_serial_read();
     default:
         kprintf("[syscall] unknown syscall %lu from pid=%lu (user_rip=%p)\n",
                 (unsigned long)num, (unsigned long)sched_current()->id,

@@ -31,6 +31,12 @@
 /* 单条写请求内联数据上限：<= DISK_MAX_SECTORS*512(3584)，且必须 < MACH_MSG_INLINE_MAX(3968) */
 #define FS_WRITE_MAX     3584
 
+/* 服务下线通知：当某服务进程（fs-server 等）崩溃/退出时，内核会把其端口上
+ * 排队的请求排干，并向每个请求的 msgh_local_port 回送一条本 id 的应答，
+ * 负载为 fs_resp_t{status=FS_ERR_IO, length=0}，msgh_reserved 回带原请求 id。
+ * 客户端收到后应立即放弃等待并回到可交互状态（防止永久阻塞 / 键盘失灵）。 */
+#define MSG_ID_SERVICE_DOWN 101   /* 避开 FS_MSG_*(1..10) 与 MSG_ID_KEYCHAR(100) */
+
 #define FS_OK         0
 #define FS_ERR_IO     1
 #define FS_ERR_NOENT  2

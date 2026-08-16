@@ -128,12 +128,24 @@ static bool disk_read(uint32_t lba, uint32_t count, void *out)
     disk_read_req_t *r = (disk_read_req_t *)(req + sizeof(mach_msg_header_t));
     r->lba = lba; r->count = count; r->pad = 0;
 
-    if (mach_msg_send(req, h->msgh_size) != 0) return false;
+    if (mach_msg_send(req, h->msgh_size) != 0) { return false; }
 
-    uint8_t resp[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t) +
-                 DISK_MAX_SECTORS * SECTOR];
-    uint32_t got = (uint32_t)mach_msg_recv(resp, sizeof(resp), FS_REPLY_PORT);
-    if (got < sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t)) return false;
+    static uint8_t s_resp[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t) +
+                          DISK_MAX_SECTORS * SECTOR];
+    uint8_t *resp = s_resp;
+    /* 注意：sys_mach_msg 接收分支返回的是状态码（MACH_MSG_SUCCESS=0），
+     * 不是字节数。实际长度必须从应答头部的 msgh_size 读取。
+     * 关键修复：recv_limit 必须传缓冲区真实容量 sizeof(s_resp)，而非
+     * sizeof(resp)（resp 是指针，sizeof=8，会导致 sys_mach_msg 因
+     * recv_limit<消息头大小而误报 MACH_RCV_INVALID_NAME，使 mount 失败）。 */
+    long rc = mach_msg_recv(resp, (uint32_t)sizeof(s_resp), FS_REPLY_PORT);
+    if (rc != MACH_MSG_SUCCESS) {
+        return false;
+    }
+    mach_msg_header_t *rh = (mach_msg_header_t *)resp;
+    uint32_t need = (uint32_t)(sizeof(mach_msg_header_t) +
+                               sizeof(disk_read_resp_t) + count * SECTOR);
+    if (rh->msgh_size < need || rh->msgh_size > (uint32_t)sizeof(s_resp)) return false;
     disk_read_resp_t *pr = (disk_read_resp_t *)(resp + sizeof(mach_msg_header_t));
     if (pr->status != 0) return false;
     u_memcpy(out, (uint8_t *)(pr + 1), count * SECTOR);
@@ -156,13 +168,28 @@ static bool disk_write(uint32_t lba, uint32_t count, const void *in)
     r->lba = lba; r->count = count; r->pad = 0;
     u_memcpy((uint8_t *)(r + 1), in, count * SECTOR);
 
-    if (mach_msg_send(req, h->msgh_size) != 0) return false;
+    if (mach_msg_send(req, h->msgh_size) != 0) { return false; }
 
     uint8_t resp[sizeof(mach_msg_header_t) + sizeof(disk_write_resp_t)];
-    uint32_t got = (uint32_t)mach_msg_recv(resp, sizeof(resp), FS_REPLY_PORT);
-    if (got < sizeof(mach_msg_header_t) + sizeof(disk_write_resp_t)) return false;
+    int rrc = mach_msg_recv(resp, sizeof(resp), FS_REPLY_PORT);
+    if (rrc != MACH_MSG_SUCCESS) {
+        return false;
+    }
+    mach_msg_header_t *rh = (mach_msg_header_t *)resp;
+    if (rh->msgh_size < sizeof(mach_msg_header_t) + sizeof(disk_write_resp_t)) {
+        return false;
+    }
     disk_write_resp_t *pr = (disk_write_resp_t *)(resp + sizeof(mach_msg_header_t));
-    return pr->status == 0;
+    bool ok = (pr->status == 0);
+    /* 写后使读缓存 g_blk 失效：本次写入可能覆盖 g_blk 当前缓存窗口内的
+     * 扇区（例如先读目录/FAT 顺带缓存了某数据簇，随后该簇被改写）。若不清
+     * 缓存，后续 block_read 同 LBA 会命中陈旧数据，导致 readback mismatch /
+     * 目录项读到未更新内容。直写磁盘不会自动刷新 g_blk 视图，故此处显式失效。 */
+    if (ok) {
+        g_blk_lba = 0xFFFFFFFFu;
+        g_blk_secs = 0;
+    }
+    return ok;
 }
 
 /* 顺序块读（带缓存）：从 lba 起读 count 扇区到 out。
@@ -208,6 +235,22 @@ static uint32_t fat_next(uint32_t clus)
     return v;
 }
 
+/* 读 FAT 项原始值（低 28 位，不做空闲/非法归一化）。
+ * 供分配器区分“空闲簇(=0)”与“EOF/坏簇”，因为 fat_next 把 0 归一为 FAT_LAST。 */
+static uint32_t fat_entry_raw(uint32_t clus)
+{
+    if (clus < CLUSTER_MIN || clus >= g_max_cluster) return FAT_LAST;
+    uint32_t fat_off = clus * FAT_ENTRY_SIZE;
+    uint32_t lba     = g_rsvd_secs + fat_off / SECTOR;
+    uint32_t off     = fat_off % SECTOR;
+    if (!g_fat_cache_ok || lba != g_fat_cache_lba) {
+        if (!disk_read(lba, 1, g_fat_cache)) return FAT_LAST;
+        g_fat_cache_lba = lba;
+        g_fat_cache_ok  = true;
+    }
+    return rd32(g_fat_cache + off) & 0x0FFFFFFFu;
+}
+
 /* 写 FAT 项（低 28 位）。同时更新所有 FAT 副本与缓存。 */
 static bool fat_set(uint32_t clus, uint32_t val)
 {
@@ -239,7 +282,7 @@ static uint32_t fat_alloc_free(uint32_t hint)
     for (uint32_t i = 0; i < g_total_clusters; i++) {
         uint32_t c = CLUSTER_MIN + ((start - CLUSTER_MIN + i) % g_total_clusters);
         if (c < CLUSTER_MIN || c >= g_max_cluster) continue;
-        uint32_t v = fat_next(c);
+        uint32_t v = fat_entry_raw(c);
         if (v == FAT_FREE) return c;
     }
     return 0;
@@ -280,7 +323,10 @@ static uint32_t chain_write(uint32_t clus, uint32_t bytes, const void *in)
     uint32_t total = 0;
     uint32_t cur = clus;
     uint32_t prev = 0;
-    while (total < bytes) {
+    /* 防御性上限：单次写入最多覆盖 (g_total_clusters + 16) 个簇，防止 FAT 链
+     * 因损坏陷入无限分配/写入导致系统假死（生产环境绝不无限循环）。 */
+    uint32_t guard = g_total_clusters + 16;
+    while (total < bytes && guard--) {
         if (cur < CLUSTER_MIN || cur >= g_max_cluster) {
             /* 需要新簇：链接到 prev（若存在），否则调用方已处理首簇 */
             uint32_t nc = fat_alloc_free(prev ? prev : g_root_cluster);
@@ -840,10 +886,17 @@ static uint32_t fs_write(const char *path, uint32_t offset, const void *data, ui
     }
     uint32_t done = chain_write(first, new_size, buf);
     if (done == new_size) {
-        /* 更新目录项大小 */
+        /* 更新目录项大小。
+         * 注意：上面的 chain_write() 内部使用全局缓冲 g_rbuf 写入数据簇，
+         * 已经把 g_rbuf 覆盖为数据簇内容。此处必须重新读回目录扇区，
+         * 否则会把数据簇垃圾写回目录项 LBA，破坏目录项（首簇/大小字段），
+         * 导致后续 path_lookup 失败（lookup after write FAIL）。 */
+        if (!disk_read(f.dir_lba, 1, g_rbuf)) return 0;
+        u_memcpy(de, g_rbuf + f.dir_off, DIR_ENTRY_SIZE);
         wr32(de + 28, new_size);
         u_memcpy(g_rbuf + f.dir_off, de, DIR_ENTRY_SIZE);
-        if (!disk_write(f.dir_lba, 1, g_rbuf)) return 0;
+        bool dwr = disk_write(f.dir_lba, 1, g_rbuf);
+        if (!dwr) return 0;
         return len;
     }
     return 0;
@@ -950,7 +1003,11 @@ static bool fat32_mount(void)
     if (g_bpb[510] != 0x55 || g_bpb[511] != 0xAA) return false;
 
     g_bytes_per_sec = rd16(g_bpb + 11);
-    if (g_bytes_per_sec != SECTOR) return false; /* 本驱动仅支持 512 字节扇区 */
+    /* FAT32 规范（osdev_wiki/FAT32）允许 BPB_BytsPerSec 为 512/1024/2048/4096。
+     * 本驱动设计为固定 512 字节扇区（与底层 DISK_PORT 的 512B 扇区语义、
+     * 全局 SECTOR=512 假设一致），覆盖 QEMU 等最常见场景。非 512 配置属已知
+     * 限制（拒绝挂载而非错误实现），后续如需支持需同步调整块读/簇映射层。 */
+    if (g_bytes_per_sec != SECTOR) return false;
     g_sec_per_clus  = g_bpb[13];
     if (g_sec_per_clus == 0 || (g_sec_per_clus & (g_sec_per_clus - 1)) != 0) return false;
     g_rsvd_secs     = rd16(g_bpb + 14);
@@ -1038,10 +1095,16 @@ static void service_loop(void)
 {
     u_print("[fs] service loop entered\n");
     for (;;) {
-        uint8_t reqbuf[sizeof(mach_msg_header_t) + sizeof(fs_write_req_t) + 96 + FS_WRITE_MAX];
-        uint32_t got = (uint32_t)mach_msg_recv(reqbuf, sizeof(reqbuf), FS_PORT);
-        if (got < sizeof(mach_msg_header_t)) { continue; }
+        static uint8_t s_reqbuf[sizeof(mach_msg_header_t) + sizeof(fs_write_req_t) + 96 + FS_WRITE_MAX];
+        uint8_t *reqbuf = s_reqbuf;
+        if (mach_msg_recv(reqbuf, sizeof(s_reqbuf), FS_PORT) != MACH_MSG_SUCCESS) {
+            continue;
+        }
         mach_msg_header_t *h = (mach_msg_header_t *)reqbuf;
+        if (h->msgh_size < sizeof(mach_msg_header_t) ||
+            h->msgh_size > sizeof(reqbuf)) {
+            continue;                        /* 畸形消息，丢弃 */
+        }
         uint32_t local = h->msgh_local_port;
         uint32_t id = h->msgh_id;
         uint8_t *payload = reqbuf + sizeof(mach_msg_header_t);
@@ -1157,10 +1220,13 @@ static void self_test(void)
     const char *tf = "SELFTEST.TXT";
     bool ok = true;
 
+    u_print("[fs] st: create\n");
     if (!fs_create(tf, false)) { u_print("[fs] self-test: create FAIL\n"); ok = false; }
     const char *msg = "HELLO_SUKI_FAT32_WRITE_PATH_OK";
     uint32_t len = (uint32_t)u_strlen(msg);
-    if (fs_write(tf, 0, msg, len) != len) { u_print("[fs] self-test: write FAIL\n"); ok = false; }
+    u_print("[fs] st: write\n");
+    uint32_t wrote = fs_write(tf, 0, msg, len);
+    if (wrote != len) { u_print("[fs] self-test: write FAIL\n"); ok = false; }
 
     /* readback */
     char rb[64];

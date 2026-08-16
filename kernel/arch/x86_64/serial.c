@@ -9,8 +9,13 @@
 #include <kernel/serial.h>
 #include <kernel/io.h>
 #include <kernel/klog.h>     /* P0-R3a：所有串口输出镜像进内存环缓冲 */
+#include <kernel/spinlock.h>  /* P0-R3b：多核串行化串口输出，避免 SMP 下字符交错/行丢失 */
 
 #define COM1_BASE   0x3F8
+
+/* SMP 下多核并发写 COM1 会导致字符交错甚至整行丢失（诊断噪音掩盖真实
+ * 卡死点），故用自旋锁串行化整个 serial_write。中断上下文亦安全。 */
+static spinlock_t g_serial_lock = SPINLOCK_INIT("serial");
 
 /* 16550 寄存器偏移 */
 #define UART_DATA        0   /* DLAB=0: 数据寄存器 / DLAB=1: 除数低字节 */
@@ -21,6 +26,20 @@
 #define UART_LSR         5   /* 线路状态 */
 
 #define LSR_THR_EMPTY    0x20  /* 发送保持寄存器空 */
+#define LSR_DATA_READY   0x01  /* 接收数据就绪（DR） */
+
+bool serial_read_ready(void)
+{
+    return (inb(COM1_BASE + UART_LSR) & LSR_DATA_READY) != 0;
+}
+
+int serial_read(void)
+{
+    if (!(inb(COM1_BASE + UART_LSR) & LSR_DATA_READY)) {
+        return -1;
+    }
+    return (int)(inb(COM1_BASE + UART_DATA) & 0xFF);
+}
 
 void serial_init(void)
 {
@@ -38,18 +57,34 @@ static int serial_tx_ready(void)
     return inb(COM1_BASE + UART_LSR) & LSR_THR_EMPTY;
 }
 
+/* 等待发送保持寄存器空：带轮询上限，避免设备异常（THR 永久不空）时
+ * 无终止自旋冻结整个系统（OSDev 红线的「无条件等待设备」反模式）。
+ * 超时返回 false，调用方据此决定是否放弃本字符。 */
+static bool serial_tx_wait(void)
+{
+    for (int i = 0; i < 100000; i++) {
+        if (serial_tx_ready()) {
+            return true;
+        }
+        cpu_relax();
+    }
+    return false;   /* 设备疑似卡死，放弃等待 */
+}
+
 void serial_write(char c)
 {
+    uint64_t f = spin_lock_irqsave(&g_serial_lock);
     /* P0-R3a：先镜像进 klog 环缓冲（含 serial_init 之前的调用也能留痕；
      * klog_dump 重放期间该函数内部抑制递归记录）。CR 转换不入环——环内
      * 保存规范化 '\n' 文本。 */
     klog_putc(c);
     if (c == '\n') {
-        while (!serial_tx_ready()) { }
+        serial_tx_wait();
         outb(COM1_BASE + UART_DATA, '\r');   /* CRLF 换行 */
     }
-    while (!serial_tx_ready()) { }
+    serial_tx_wait();
     outb(COM1_BASE + UART_DATA, (uint8_t)c);
+    spin_unlock_irqrestore(&g_serial_lock, f);
 }
 
 void serial_writestr(const char *s)

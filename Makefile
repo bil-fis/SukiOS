@@ -45,8 +45,10 @@ LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 \
            -Wl,--build-id=none -T boot/linker.ld
 
 # ---- 源文件 ----
-C_SRCS := $(shell find kernel -name '*.c' 2>/dev/null)
-S_SRCS := boot/boot.S boot/multiboot2_header.S $(shell find kernel -name '*.S' 2>/dev/null)
+# 注意：kernel/abilities/ 下是用户态能力库（如 miniz 压缩库，依赖 libc），
+# 绝不能编进 freestanding 内核（链接会缺 stat/fopen 等符号）。显式排除该目录。
+C_SRCS := $(shell find kernel -name '*.c' 2>/dev/null | grep -v '/abilities/')
+S_SRCS := boot/boot.S boot/multiboot2_header.S boot/pvh.S $(shell find kernel -name '*.S' 2>/dev/null)
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
 USER_PROGS   := fs_server input_server shell
@@ -123,7 +125,7 @@ QEMU_AUDIODRV ?= pa
 QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
                -device intel-hda -device hda-duplex,audiodev=snd0
 
-.PHONY: all iso run run-headless run-ahci run-ahci-headless run-uefi run-uefi-headless debug clean info disk
+.PHONY: all iso run run-headless run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk
 
 all: $(KERNEL)
 
@@ -296,6 +298,19 @@ run-uefi-headless: $(ISO) $(DISK) $(OVMF_VARS)
 # ---- GDB 调试 (配合 .gdbinit) ----
 debug: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK) -s -S
+
+# ---- PVH 直启 (GRUB 不可用时)：qemu -kernel 走 PVH 协议加载同一 kernel.elf ----
+# 不经 ISO/GRUB；-kernel 扫描 ELF SHT_NOTE 段的 Xen PVH note 取得入口。
+# -append "pvh" 仅作标识（PVH 下 EAX!=MULTIBOOT2_MAGIC，内核据此分派）。
+run-q: $(KERNEL) $(DISK)
+	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) \
+		-kernel $(KERNEL) -append "pvh" $(QEMU_DISK)
+
+# PVH 直启 + 异常日志（qemu -d int 捕获 #GP/#PF 精确 RIP/error code 到 qemu.int.log）
+run-q-debug: $(KERNEL) $(DISK)
+	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) \
+		-kernel $(KERNEL) -append "pvh" $(QEMU_DISK) \
+		-d int -D qemu.int.log -no-reboot
 
 clean:
 	rm -rf $(BUILD)

@@ -11,6 +11,25 @@
 #include <kernel/multiboot2.h>
 #include <kernel/serial.h>
 
+/* 前向声明：PVH 引导信息解析（GRUB 不可用时 QEMU -kernel 走此路径） */
+void pvh_parse(uint64_t hvm_phys, boot_info_t *out);
+
+/*
+ * bootinfo_prepare: 引导信息统一入口。
+ *   magic == MULTIBOOT2_MAGIC -> GRUB multiboot2 路径
+ *   否则                      -> 假定 PVH（QEMU -kernel 直接加载）
+ * 返回 true 表示成功解析；false 表示无法识别的引导协议。
+ */
+bool bootinfo_prepare(uint64_t magic, uint64_t info_phys, boot_info_t *out)
+{
+    if (magic == MULTIBOOT2_MAGIC) {
+        return multiboot2_parse(info_phys, out);
+    }
+    /* PVH：info_phys 为 hvm_start_info 物理地址，EAX 非 multiboot2 magic */
+    pvh_parse(info_phys, out);
+    return true;
+}
+
 bool multiboot2_parse(uint64_t mbi_phys, boot_info_t *out)
 {
     for (size_t i = 0; i < sizeof(boot_info_t); i++) {

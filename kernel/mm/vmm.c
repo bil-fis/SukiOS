@@ -304,6 +304,7 @@ uint64_t vmm_create_address_space(void)
     if (g_kpti_enabled) {
         void *pair = pmm_alloc_pages_aligned(2, 2);
         if (!pair) {
+            kprintf("[vmm] create_as: pmm_alloc_pages_aligned(2,2) FAILED\n");
             return 0;
         }
         new_pml4 = (uint64_t)pair;

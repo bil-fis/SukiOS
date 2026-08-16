@@ -114,6 +114,11 @@ uint64_t  port_claim(uint32_t name);                    /* 用户态认领端口
 void      port_release_owner(task_t *t);                /* 任务退出：释放其认领的端口所有权 */
 void      port_reap_ool(task_t *t);                     /* 回收任务持有的 OOL 映射 */
 kernel_port_t *port_lookup(uint32_t name);
+/* 查询某端口当前是否有任务已阻塞在 recv（waiter 队列非空）。
+ * 用于内核启动阶段同步：确认某个内核服务（如 disk-srv）已真正就绪、能接收请求后，
+ * 再启动依赖它的用户态服务（如 fs-server），消除「消费者过早挂载、请求先于服务就绪
+ * 到达」的时序竞态（表现为消费者永久阻塞、系统挂起）。 */
+bool port_has_waiter(uint32_t name);
 
 /* 内核侧收发（供内核服务线程使用；msg 为内核缓冲） */
 uint64_t  ipc_send_kernel(uint32_t dest, const void *msg, uint32_t size);

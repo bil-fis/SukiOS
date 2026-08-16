@@ -30,6 +30,7 @@
 #define SYS_AUDIO_STOP    13
 #define SYS_MMAP          14
 #define SYS_MUNMAP        15
+#define SYS_SERIAL_READ   16   /* 非阻塞读 COM1 控制台，返回 0..255，无数据-1 */
 
 /* ---- mach_msg ABI（与 include/ipc/port.h 一致） ---- */
 #define MACH_SEND_MSG   0x1
@@ -173,6 +174,13 @@ static inline void *sys_mmap(uint64_t len, uint64_t prot)
 static inline int sys_munmap(void *addr, uint64_t len)
 {
     return (int)suki_syscall5(SYS_MUNMAP, (uint64_t)addr, len, 0, 0, 0);
+}
+
+/* 非阻塞读 COM1 控制台输入：返回 0..255 的 ASCII 字节；无数据时返回 -1。
+ * 供 INPUT_SERVER 把串口作为控制台输入源（headless QEMU 经 -serial 注入）。 */
+static inline long sys_serial_read(void)
+{
+    return (long)suki_syscall5(SYS_SERIAL_READ, 0, 0, 0, 0, 0);
 }
 
 static inline uint64_t mach_msg_send(void *msg, uint32_t size)

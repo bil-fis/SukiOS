@@ -8,6 +8,15 @@
  *   - 否则          -> VGA 文本模式 vga
  *
  * 调用关系：全内核 -> kprintf()/panic() -> serial_write + fbcon/vga。
+ *
+ * 重要：内核诊断日志与用户态 shell 输出共用帧缓冲会导致按键时屏幕被
+ * [ipc]/[sched] 等运行期调试日志刷屏。为此引入 g_kernel_fb_diag 开关：
+ *   - 启动阶段（kmain 早期）保持 true，内核初始化日志同时显示到帧缓冲
+ *     （用户可见的漂亮启动画面）；
+ *   - 进入用户态服务前由 kmain 调 console_set_fb_diag(false) 关闭，
+ *     此后内核运行期诊断【只走串口】，帧缓冲专供 Ring3 shell/UI，
+ *     按键不再污染图形终端。用户态输出经 sys_debug_write -> user_puts()
+ *     独立路径写帧缓冲，完全不经过本开关。
  */
 #include <kernel/console.h>
 #include <kernel/serial.h>
@@ -24,6 +33,8 @@
 static spinlock_t g_kp_lock = SPINLOCK_INIT("kprintf");
 
 static bool g_use_fb = false;
+/* 内核诊断是否镜像到帧缓冲（默认开；进入用户态服务前由 kmain 关闭）。 */
+static bool g_kernel_fb_diag = true;
 /* M18 修复：kprintf 重入深度计数。单核下 irq_save 已保证一条消息原子输出，
  * 但若在输出途中触发 #PF 等异常二次进入 kprintf（如 panic 路径），会递归
  * 打印导致栈耗尽。超过阈值即放弃本次输出，既保证普通场景正常又防致命递归。
@@ -38,20 +49,38 @@ void console_init(void)
     }
 }
 
+/* 单条 kprintf 已输出字符计数（kprintf 持锁串行化，单核/多核均安全）。
+ * kputc 递增它，kprintf 据此对超长消息截断，防止 fmt/%s/宽度损坏导致
+ * 的无限输出冻结系统。 */
+static volatile size_t g_kprintf_nout = 0;
+
 void kputc(char c)
 {
+    g_kprintf_nout++;
     serial_write(c);
-    if (g_use_fb) {
+    /* 内核诊断是否镜像到帧缓冲：进入用户态后由 console_set_fb_diag(false)
+     * 关闭，避免 [ipc]/[sched] 等运行期日志刷屏图形终端（shell 专用）。 */
+    if (g_use_fb && g_kernel_fb_diag) {
         fbcon_putc(c);
     } else {
         vga_putc(c);
     }
 }
 
+/* 受限字符串输出：防御 fmt 指向无 NULL 终止的损坏内存时陷入无限循环
+ * （会永久持有 g_kp_lock / 端口锁导致系统冻结）。超限即截断并告警。 */
 void kputs(const char *s)
 {
+    size_t n = 0;
     while (*s) {
         kputc(*s++);
+        if (++n >= 2048) {
+            /* 字符串异常长：极可能是被踩坏的指针。绕过 kprintf 锁直接告警。 */
+            serial_writestr("\n[console] kputs OVERFLOW (bad %s pointer?) ptr=");
+            serial_write_hex((uint64_t)(uintptr_t)s);
+            serial_writestr("\n");
+            break;
+        }
     }
 }
 
@@ -67,6 +96,11 @@ static void print_uint(uint64_t val, unsigned base, bool upper, int min_width, c
     while (val > 0) {
         buf[i++] = digs[val % base];
         val /= base;
+    }
+    /* 防御：min_width 必须为合理小值（格式串损坏时可能解析出巨大值，
+     * 导致 below 的填充循环输出数百万字符使系统看似冻结）。截断到 64。 */
+    if (min_width > 64) {
+        min_width = 64;
     }
     while (i < min_width) {
         buf[i++] = pad;
@@ -86,6 +120,26 @@ static void print_int(int64_t val)
     }
 }
 
+/* 用户态控制台输出（sys_debug_write -> 此处）。直接写帧缓冲 + 串口，
+ * 不经由 kprintf 的 g_kernel_fb_diag 开关，确保 Ring3 shell/UI 文本恒定
+ * 显示在图形终端，与内核诊断日志互不污染。 */
+void user_puts(const char *s)
+{
+    if (g_use_fb) {
+        fbcon_write(s);
+    } else {
+        vga_write(s);
+    }
+    serial_writestr(s);
+}
+
+/* 进入用户态服务前由 kmain 调用：关闭后内核运行期诊断只走串口，
+ * 帧缓冲留给 shell。 */
+void console_set_fb_diag(bool on)
+{
+    g_kernel_fb_diag = on;
+}
+
 void kprintf(const char *fmt, ...)
 {
     uint64_t irqf = spin_lock_irqsave(&g_kp_lock);  /* 整条消息跨 CPU 原子输出 */
@@ -96,8 +150,28 @@ void kprintf(const char *fmt, ...)
     g_kp_depth++;
     va_list ap;
     va_start(ap, fmt);
+    /* 单条消息输出字符硬上限：若某条 kprintf 异常地想输出海量字符
+     * （fmt 无终止符 / %s 指向损坏内存 / print_* 宽度溢出），超过此上限
+     * 即强制截断并告警。避免持有 g_kp_lock 期间无限循环冻结整个系统。 */
+    g_kprintf_nout = 0;
+    const size_t KPRINTF_MAX = 1024;
 
     for (const char *p = fmt; *p; p++) {
+        if (g_kprintf_nout >= KPRINTF_MAX) {
+            /* 超限：打印诊断（含调用者返回地址，定位是哪条 kprintf），截断返回 */
+            serial_writestr("\n[console] kprintf TRUNCATED caller=");
+            serial_write_hex((uint64_t)(uintptr_t)__builtin_return_address(0));
+            serial_writestr(" fmt=");
+            for (int i = 0; i < 24 && fmt[i]; i++) {
+                char c = fmt[i];
+                serial_write(c >= 0x20 && c < 0x7f ? c : '.');
+            }
+            serial_writestr("\n");
+            va_end(ap);
+            g_kp_depth--;
+            spin_unlock_irqrestore(&g_kp_lock, irqf);
+            return;
+        }
         if (*p != '%') {
             kputc(*p);
             continue;
@@ -191,6 +265,10 @@ __attribute__((noreturn)) void panic(const char *fmt, ...)
     __asm__ volatile("cli" ::: "memory");
     spinlock_init(&g_kp_lock, "kprintf");
     g_kp_depth = 0;
+
+    /* panic 归路：强制在帧缓冲也输出诊断（即便此前已进入用户态关闭了
+     * 内核 fb 镜像），确保致命错误在图形终端可见。 */
+    g_kernel_fb_diag = true;
 
     va_list ap;
     kprintf("\n[PANIC] ");

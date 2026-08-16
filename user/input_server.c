@@ -14,6 +14,26 @@
 
 #define MSG_ID_KEYCHAR 100   /* 避免与 FS_MSG_*(1/2) 冲突 */
 
+static void send_char(char c);   /* 前向声明：poll_serial_input 复用 */
+
+/*
+ * 串口控制台输入源（headless QEMU 经 -serial 注入，物理部署经 COM1 控制台）。
+ * 串口侧已直接给出 ASCII 字符，无需扫描码解析：经内核 SYS_SERIAL_READ 系统
+ * 调用读取（用户态不能直访问 IO 端口），把字符当作与键盘同等的输入事件发给
+ * shell（回车 \r 规范为 \n）。真实 PS/2 键盘路径完全保留，二者并存。
+ */
+static void poll_serial_input(void)
+{
+    long ch;
+    while ((ch = sys_serial_read()) >= 0) {
+        char c = (char)(unsigned char)ch;
+        if (c == '\r') {
+            c = '\n';
+        }
+        send_char(c);
+    }
+}
+
 static const char t_norm[128] = {
     0,   27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
     '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
@@ -56,6 +76,7 @@ int main(int argc, char **argv)
     sys_port_claim(INPUT_PORT);    /* A2 项：认领输入接收端口 */
 
     for (;;) {
+        poll_serial_input();           /* 串口控制台输入（headless 测试通道） */
         uint64_t v = suki_syscall5(SYS_INPUT_READ, 0, 0, 0, 0, 0);
         if (v == (uint64_t)-1) {
             sys_yield();               /* 无输入：让出 CPU */

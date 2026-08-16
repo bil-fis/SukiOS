@@ -149,18 +149,49 @@ static void page_fault_handler(registers_t *r)
                 r);
 }
 
+/* 软件可触发异常处理器（#BP=3 / #OF=4 / #UD=6）：
+ * 这些向量可由用户态指令（int3 / into / ud2）经「软件中断门」合法进入，
+ * 故其 IDT 门被设置为 DPL3（见 idt_init）。OSDev《IDT》明确：
+ *   #BP、#OF 设计为允许 Ring3 软件中断触发，门 DPL 必须为 3（0xEE 而非 0x8E），
+ *   否则用户态 int3/into 会因门 DPL0 被拦下、转成 #GP(13)。
+ * 闭环策略（与 #PF 用户态隔离一致，避免用户非法指令拖垮内核）：
+ *   - 用户态（cs&3）：视为该用户任务自身错误，杀掉当前任务并返回（隔离）。
+ *   - 内核态：属内核 bug/断言失败，打印后 kernel_oops（保留调试栈帧）。
+ * 三者硬件上均无错误码（isr.S 用 ISR_NOERR 压哑值 0），帧结构一致。 */
+static void sw_breakpoint_handler(registers_t *r)
+{
+    bool user = (r->cs & 0x3) != 0;
+    int  vec  = (int)r->int_no;
+    const char *name = (vec < 32) ? g_exc_names[vec] : "?";
+
+    if (user) {
+        task_t *t = sched_current();
+        kprintf("[exc] user %s(#%d): pid=%lu '%s' rip=%p -> killing task\n",
+                name, vec, (unsigned long)t->id, t->name, (void *)r->rip);
+        task_exit_current(139);          /* noreturn：隔离故障任务（139≈SIGSEGV） */
+    }
+    kprintf("\n[KEXC] KERNEL %s(#%d) at rip=%p cs=0x%lx rflags=0x%lx\n",
+            name, vec, (void *)r->rip,
+            (unsigned long)r->cs, (unsigned long)r->rflags);
+    kernel_oops("Kernel software-triggered exception", r);
+}
+
 void idt_init(void)
 {
     for (int i = 0; i < 256; i++) {
         g_handlers[i] = NULL;
     }
-    /* 0x8E = present, DPL0, 中断门（自动关中断）。异常 8/双故障走 IST1。 */
+    /* 0x8E = present, DPL0, 中断门（自动关中断）。异常 8/双故障走 IST1。
+     * 例外：#BP(3)/#OF(4)/#UD(6) 为软件可触发异常，门必须 DPL3（0xEE）以
+     * 允许用户态 int3/into/ud2 合法进入（OSDev IDT 规范），其余保持 DPL0。 */
     for (int i = 0; i < 48; i++) {
         /* P0-8：双重错误(8)=IST1，NMI(2)=IST2——两者都可能在「当前栈
          * 不可信」时到来（栈溢出触发 #DF；NMI 可打断任意瞬间含栈切换
          * 中途），必须走独立已知良好栈。 */
         uint8_t ist = (i == 8) ? 1 : ((i == 2) ? 2 : 0);
-        idt_set_gate(i, (uint64_t)g_stubs[i], ist, 0x8E);
+        /* 软件可触发异常：DPL3（用户态指令可门进入），其余 DPL0。 */
+        uint8_t ta = (i == 3 || i == 4 || i == 6) ? 0xEE : 0x8E;
+        idt_set_gate(i, (uint64_t)g_stubs[i], ist, ta);
     }
 
     /* IPI 向量（P0-3）：0xF0 重调度 / 0xF1 TLB 刷新 / 0xF2 停机
@@ -176,12 +207,17 @@ void idt_init(void)
     }
 
     register_interrupt_handler(14, page_fault_handler);   /* #PF 隔离处理器 */
+    /* 软件可触发异常：用户态 int3/into/ud2 闭环（杀用户任务/内核 oops）。 */
+    register_interrupt_handler(3, sw_breakpoint_handler);
+    register_interrupt_handler(4, sw_breakpoint_handler);
+    register_interrupt_handler(6, sw_breakpoint_handler);
 
     g_idtr.limit = sizeof(g_idt) - 1;
     g_idtr.base  = (uint64_t)&g_idt;
     idt_load(&g_idtr);
 
-    kprintf("[idt] IDT loaded (48+80(MSI)+IPI vectors installed, #PF handler)\n");
+    kprintf("[idt] IDT loaded (48+80(MSI)+IPI vectors, #PF/#BP/#OF/#UD handlers)\n"
+            "      #BP/#OF/#UD gates DPL3 (user int3/into/ud2 allowed)\n");
 }
 
 /* P0-3：AP 加载与 BSP 相同的 IDT（handler 表共享，per-CPU 行为由向量决定） */

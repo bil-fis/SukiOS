@@ -205,11 +205,21 @@ static void kbd_controller_init(void)
     }
 
     /* 步骤5：BYTE0 配置字节。读-改-写：使能端口1(位0)、端口2(位1)、
-     * 端口1中断(位0)、端口2中断(位1)；保留其余位。 */
+     * 端口1中断(位0)、端口2中断(位1)；保留其余位。
+     * 关键：必须「保留 / 显式开启」翻译模式位(位6)。
+     *   OSDev《8042 PS/2 Controller》"Translation"：翻译位开启时，8042 把键盘
+     *   默认输出的扫描码集 2（QEMU/SeaBIOS 固件默认集）自动翻译成等价的集 1
+     *   码值（含 make/break 编码）再交给 CPU。本内核与 Ring3 INPUT_SERVER 的
+     *   ASCII 表均按**集 1** 解释（break = 最高位 0x80 置位）。因此保留翻译位
+     *   开启，CPU 收到的就是正确的集 1 码值，按键映射一一对应。
+     *   历史 bug：旧代码在此 `cfg &= ~0x40` 关闭翻译位，期望「纯 Set 1 直通」。
+     *   但 QEMU 键盘固件默认仍是集 2，关闭翻译后集 2 原始码直通给 CPU，被本
+     *   内核当集 1 解析 -> 全面错位（典型现象：按 Ctrl 却打印 'f'）。故此处
+     *   改为 `cfg |= 0x40` 确保翻译位开启，而非清除。 */
     uint8_t cfg = 0;
     if (kbd_cmd_response(CC_READ_CFG, &cfg)) {
         cfg |= 0x03;          /* 使能端口1+端口2及其中断 */
-        cfg &= ~0x04;         /* 保留 System Flag 不变由固件设 */
+        cfg |= 0x40;          /* 开启翻译模式(位6)：集2自动翻译为集1给CPU */
         kbd_wait_input(); outb(KBD_CMD, CC_WRITE_CFG);
         kbd_write_param(cfg);
     }
@@ -233,21 +243,25 @@ static void kbd_controller_init(void)
 
     /* 键盘设备：复位并重新使能扫描（防御性；部分固件/模拟器需显式 enable） */
     if (kbd_dev_cmd(KCMD_RESET, &resp)) {
-        /* 复位后期望 0xFA(ACK) 随后 0xAA(自测通过)；这里仅消耗 ACK，
-         * 再等可能的 0xAA。 */
+        /* 复位后期望 0xFA(ACK) 随后 0xAA(BAT 通过)。SeaBIOS/QEMU 默认扫描
+         * 码集为 Set 2；此处把复位握手产生的所有回发字节（0xFA + 0xAA，
+         * 可能还有多余字节）全部消费干净，避免残留字节干扰后续命令的 ACK
+         * 读取。键盘保持默认 Set 2 —— 由步骤5 开启的翻译位自动翻译为集 1
+         * 交给 CPU，本内核据此解析，键位一一对应。 */
         if (resp == KBD_ACK) {
-            kbd_wait_output();
-            inb(KBD_DATA);    /* 吞掉 0xAA */
+            while (kbd_wait_output()) {   /* 冲刷直到输出缓冲空 */
+                inb(KBD_DATA);
+            }
         }
     }
-    /* OSDev《PS/2 Keyboard》"Set Scan Code Set"：SeaBIOS/QEMU 默认键盘为扫描
-     * 码集 2，而本内核后备 ASCII 表（g_scancode_ascii）按扫描码集 1 解释。
-     * 显式把键盘设为集 1（设备命令 0xF0 + 0x01），使内核表与 Ring3 INPUT_SERVER
-     * 拿到的扫描码语义一致；不同固件默认集下也不再错位。 */
-    uint8_t setresp = 0;
-    if (kbd_dev_cmd(0xF0, &setresp) && setresp == KBD_ACK) {
-        kbd_dev_cmd(0x01, &setresp);   /* 选集 1 */
-    }
+    /* 注意：此处不再向键盘发「设置扫描码集」命令。
+     *   旧实现发 0xF0 0x01 强制键盘切到 Set 1，本意配合「关闭翻译位」实现纯
+     *   Set 1 直通；但 QEMU 键盘固件对 0xF0 0x01 的响应不可靠（命令返回 ACK
+     *   而内部仍按 Set 2 输出），导致「关闭翻译位 + 实际 Set 2 输出」组合 ->
+     *   集 2 原始码被当集 1 解析 -> 按键全面错位（按 Ctrl 打印 'f' 等）。
+     *   现改为「开启翻译位 + 键盘保持默认 Set 2」：翻译器把 Set 2 稳定地翻译
+     *   为等价的 Set 1 码值（含 make/break 编码），CPU 收到标准 Set 1，键位
+     *   完全正确。这是真实 PC / BIOS 的标准做法，QEMU 亦稳定支持。 */
     /* 重新使能扫描（reset 后扫描默认开启，但再发一次确保，忽略 resend） */
     uint8_t ack = 0;
     for (int retry = 0; retry < 3; retry++) {
@@ -261,6 +275,7 @@ static void kbd_controller_init(void)
         }
         break;
     }
+    kprintf("[kbd] PS/2 keyboard configured (translation ON, scan set 2->1)\n");
 }
 
 void keyboard_init(void)

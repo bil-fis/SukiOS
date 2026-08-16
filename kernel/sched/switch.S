@@ -8,6 +8,12 @@
  *   -> 切换到 new_rsp -> 恢复被调用者保存寄存器 -> ret。
  * 被切走的任务"停泊"在本函数内；再次被调度时从此处继续返回。
  *
+ * 统一 ret 模型：无论被切走时处于 syscall/isr 的 C 调用链多深，切回时 ret 的
+ * 目标恒为切走时紧邻的返回地址（即 schedule 调用 context_switch 的下一条指令）。
+ * 随后原 C 调用链继续，最终由 syscall_entry/isr_common 自身的 iretq 序列回 Ring3。
+ * 该模型对任意调用深度自洽，不依赖固定 GPR/iret 偏移——旧 iretq 分支方案因
+ * "切走点在任意 C 调用深度、固定偏移无法对齐 IRET 帧"而在 KVM 下必崩，已废弃。
+ *
  * task_trampoline: 新任务首次被切入时的落地点。初始栈将 r12=entry、
  *   r13=arg 预置好，跳板据此调用 entry(arg)；若返回则调用 task_exit_current。
  */
@@ -32,6 +38,13 @@ context_switch:
     popq  %r12
     popq  %rbp
     popq  %rbx
+    /* 统一 ret 模型：切回后 ret 到切走时紧邻的返回地址（即 schedule 调用
+     * context_switch 的下一条指令）。无论被抢占时处于 syscall/isr 的 C 调用
+     * 链多深，ret 目标恒为切走时的精确返回地址，随后原调用链继续、最终由
+     * syscall_entry/isr_common 自身的 iretq 序列回 Ring3。此模型对任意调用
+     * 深度自洽，不依赖固定 GPR/iret 偏移（旧 iretq 分支方案因"切走点在任意
+     * C 调用深度、rd 固定偏移无法对齐 IRET 帧"而在 KVM 下必崩）。
+     * 第三参数 rdx (next_ret_type) 当前保留，供诊断。 */
     ret
 
 .global task_trampoline

@@ -24,6 +24,7 @@
 #define _SUKI_KERNEL_SPINLOCK_H
 
 #include <kernel/types.h>
+#include <kernel/serial.h>   /* 死锁诊断用 serial_writestr/dec（绕过 kprintf 锁） */
 
 typedef struct spinlock {
     volatile uint32_t tickets;   /* [31:16]=next, [15:0]=owner */
@@ -50,9 +51,32 @@ static inline void spin_lock(spinlock_t *l)
     uint32_t ticket = __atomic_fetch_add(&l->tickets, 1u << 16,
                                          __ATOMIC_ACQUIRE);
     uint16_t my = (uint16_t)(ticket >> 16);
-    /* 等待 owner == 本票号 */
+    /* 等待 owner == 本票号。带自旋上限诊断：若长时间拿不到，说明该锁被
+     * 某路径持锁未释放（死锁）。严格 ticket 协议不容许"强制改写 owner"——
+     * 那样会让两个 CPU 同时认为自己持锁，引入内核数据损坏。故超上限后只
+     * 打印死锁诊断（绕过 kprintf 锁，直接 serial 输出）并 panic 停机，
+     * 既保留可观测性，又不破坏锁协议。单核下 spin_lock 必然立即成功，
+     * 该上限分支在正常的单核生产场景永不触发。 */
+    uint64_t spins = 0;
     while ((uint16_t)__atomic_load_n(&l->tickets, __ATOMIC_ACQUIRE) != my) {
         cpu_relax();
+        if (++spins > 50000000ULL) {
+            uint64_t cur = __atomic_load_n(&l->tickets, __ATOMIC_RELAXED);
+            uint16_t owner = (uint16_t)cur;
+            uint16_t next  = (uint16_t)(cur >> 16);
+            serial_writestr("[spinlock] DEADLOCK detected lock='");
+            serial_writestr(l->name ? l->name : "?");
+            serial_writestr("' owner=");
+            serial_write_dec((uint64_t)owner);
+            serial_writestr(" next=");
+            serial_write_dec((uint64_t)next);
+            serial_writestr(" my=");
+            serial_write_dec((uint64_t)my);
+            serial_writestr("\n");
+            panic("[spinlock] deadlock on '%s' (owner=%u next=%u my=%u)",
+                  l->name ? l->name : "?", (unsigned)owner, (unsigned)next,
+                  (unsigned)my);
+        }
     }
 }
 

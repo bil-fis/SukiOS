@@ -11,19 +11,28 @@
 #include <kernel/apic.h>
 #include <kernel/acpi.h>
 #include <kernel/console.h>
+#include <mm/vmm.h>
 
-/* LAPIC 寄存器 MMIO 基址（运行时取自 g_acpi.lapic_phys，默认 0xFEE00000） */
+/* LAPIC 寄存器 MMIO 物理基址（运行时取自 g_acpi.lapic_phys，默认 0xFEE00000） */
 static uint64_t g_lapic_base = 0xFEE00000ULL;
+
+/* LAPIC 访问用的 UC（不可缓存）虚拟地址。OSDev APIC 文档明确要求 LAPIC
+ * 寄存器窗口必须以 UC（PCD+PWT 置位，即 strong uncacheable）映射访问：
+ * 引导期恒等映射是 WB，直接经 PHYS_TO_VIRT 访问在真机会产生错误的行为
+ * （如写入合并、读合并导致 ESR/SVR 位采样失真）；QEMU 容错但不可依赖。
+ * 故 lapic_init 用 vmm_map_page 把它重映射到本虚拟地址（PCD+PWT），此后
+ * 所有 lapic_read/write 只经此 UC 窗口访问，与 OSDev 规范一致。 */
+static void *g_lapic_va = NULL;
 
 static inline uint32_t lapic_read(uint32_t reg)
 {
     /* LAPIC 寄存器为 MP 安全的纯 MMIO 读，无副作用，不需 cli */
-    return *(volatile uint32_t *)((uint8_t *)PHYS_TO_VIRT(g_lapic_base) + reg);
+    return *(volatile uint32_t *)((uint8_t *)g_lapic_va + reg);
 }
 
 static inline void lapic_write(uint32_t reg, uint32_t val)
 {
-    *(volatile uint32_t *)((uint8_t *)PHYS_TO_VIRT(g_lapic_base) + reg) = val;
+    *(volatile uint32_t *)((uint8_t *)g_lapic_va + reg) = val;
 }
 
 /* 读取 TSC（避免严格别名问题，单独封装） */
@@ -53,6 +62,19 @@ static __attribute__((noinline)) void msr_write(uint32_t msr, uint64_t val)
 uint8_t lapic_init(void)
 {
     g_lapic_base = g_acpi.lapic_phys ? g_acpi.lapic_phys : 0xFEE00000ULL;
+
+    /* 0) 将 LAPIC 页以 UC（PCD+PWT）重映射到专用虚拟窗口。OSDev APIC 文档
+     * 要求 LAPIC MMIO 必须是 strong uncacheable；引导期恒等映射为 WB，故
+     * 在此建立独立的 UC 映射（选内核高半区空洞地址，避开已用区域）。
+     * 失败（极端 PMM 不足）时退回 WB 恒等映射，QEMU 仍可工作但打印告警。 */
+    const uint64_t LAPIC_UC_VA = 0xFFFF8000000FE000ULL;  /* 固定的内核高半区空洞 */
+    if (vmm_map_page(vmm_kernel_pml4(), LAPIC_UC_VA, g_lapic_base,
+                     PTE_PRESENT | PTE_WRITE | PTE_PCD | PTE_PWT)) {
+        g_lapic_va = (void *)LAPIC_UC_VA;
+    } else {
+        kprintf("[lapic] WARN: UC remap failed, fallback to WB identity map\n");
+        g_lapic_va = (void *)PHYS_TO_VIRT(g_lapic_base);
+    }
 
     /* 1) MSR 0x1B：设置 APIC 基址并使能（保留原基址高位，仅置 EN 位） */
     uint64_t apic_base = msr_read(MSR_APIC_BASE);
@@ -98,8 +120,10 @@ uint64_t lapic_timer_calibrate(uint64_t tsc_hz)
     if (tsc_hz == 0) {
         return 0;
     }
-    /* 除数：除以 1（0xB）。QEMU 下 LAPIC 总线频率与 TSC 同源，稳定可测。 */
-    lapic_write(LAPIC_DIV, 0xB);
+    /* 除数：除以 1（DIV 寄存器值 0b1011=11 即 divide-by-1，但 bit3 为保留位
+     * 须为 0，故合法值应为 0b0001=0x1）。OSDev APIC 文档：DIV 值 0..15 对应
+     * 除以 1,2,4,...；仅最低 4 位有效，bit3 必须写 0。修正为 0x1。 */
+    lapic_write(LAPIC_DIV, 0x1);
 
     /* 一次性模式，初始计数拉满，等待其下降固定步长，期间用 TSC 测真实时长 */
     const uint64_t window = 0x20000000ULL;   /* 测量窗口（计时单位） */
@@ -197,7 +221,7 @@ void lapic_timer_start(uint8_t vector, uint32_t hz)
     if (initial == 0) {
         initial = 1;
     }
-    lapic_write(LAPIC_DIV, 0xB);              /* 除以 1 */
+    lapic_write(LAPIC_DIV, 0x1);              /* 除以 1（bit3 保留位必须为 0） */
     lapic_write(LAPIC_INIT_COUNT, initial);
     /* 周期模式 + 指定向量（不再屏蔽） */
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_PERIODIC | (uint32_t)vector);

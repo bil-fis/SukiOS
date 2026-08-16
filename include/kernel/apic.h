@@ -7,9 +7,9 @@
  * 多核（P0-3）时每 CPU 一个 LAPIC，但当前为单 BSP 阶段，仅启用 BSP 的 LAPIC。
  *
  * 寄存器访问：LAPIC 是 MMIO，基址来自 MSR 0x1B（默认 0xFEE00000，ACPI MADT
- * 也给出）。经 PHYS_TO_VIRT 高半区恒等映射访问（0..4GB 已由引导页表覆盖）。
- * 注意：真机要求该区域为 UC（不可缓存，PCD/PWT 置位）；QEMU 下 WB 亦可工作，
- * 故此处暂不强加 UC 属性（后续 KPTI/内存类型重构时统一处理）。
+ * 也给出）。OSDev APIC 文档要求该窗口必须是 strong uncacheable（PCD+PWT）。
+ * lapic_init 经 vmm_map_page 把物理页重映射到专用 UC 虚拟窗口（0xFFFF8000000FE000）
+ * 后，所有寄存器访问只走该 UC 窗口；引导期 WB 恒等映射不再用于 LAPIC。
  */
 #ifndef _SUKI_KERNEL_APIC_H
 #define _SUKI_KERNEL_APIC_H

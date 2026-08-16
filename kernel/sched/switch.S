@@ -67,13 +67,15 @@ fpu_fninit:
     fninit
     ret
 
-/* 启用 FPU：置 CR0.MP=1（监视协处理器），确保 fxsave/fxrstor 合法 */
+/* 启用 FPU：置 CR0.MP=1（监视协处理器，bit1）与 CR0.NE=1（numeric error，
+ * bit5）确保 x87 异常以 #MF 而非外部 IRQ13 形式投递，且 fxsave/fxrstor 合法。
+ * OSDev FPU 文档：CR0.NE 必须置位（现代 CPU 强制），否则异常行为未定义。 */
 .global fpu_init
 .type fpu_init, @function
 fpu_init:
     fninit
     movq  %cr0, %rax
-    orl   $0x2, %eax        /* CR0.MP = bit1 */
+    orl   $(0x2 | 0x20), %eax   /* CR0.MP=bit1 | CR0.NE=bit5 */
     movq  %rax, %cr0
     ret
 

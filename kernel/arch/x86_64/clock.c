@@ -102,10 +102,13 @@ bool clock_init(void)
     /* 4) HPET 探测（仅记录基址 + 日志，本阶段不作为节拍源） */
     uint64_t hpet = acpi_find_table("HPET");
     if (hpet) {
-        /* HPET 表头：SDT 头(36B) + 硬件 ID(8B) + 基址(8B, ACPI 地址结构) */
+        /* HPET ACPI 表布局（OSDev HPET 条目）：
+         *   description_table_header 36 字节
+         *   + hardware_rev_id(1) + bitfield(1) + pci_vendor_id(2)  = 4 字节
+         *   + address_structure(GAS, 12 字节)，GAS 内 address 字段在 GAS 偏移 4。
+         * 故 address 绝对偏移 = 36 + 4 + 4 = 44。取 8 字节完整 MMIO 地址。 */
         const uint8_t *p = (const uint8_t *)PHYS_TO_VIRT(hpet);
-        /* 基址位于表内偏移 36+8 = 44，取 4 字节地址基（本机为 32 位 MMIO） */
-        g_hpet_base = *(const uint32_t *)(p + 44);
+        g_hpet_base = *(const uint64_t *)(p + 44);
         kprintf("[clock] HPET detected @ %p\n", (void *)g_hpet_base);
     } else {
         kprintf("[clock] HPET not present\n");

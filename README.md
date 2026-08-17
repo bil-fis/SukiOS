@@ -6,7 +6,7 @@
 ![sukios](https://img.shields.io/badge/Suki-OS-00a1d6?labelColor=fb7299)
 ![sukios_version](https://img.shields.io/badge/version-0.0.1--beta-yellow
 )
-![sukios_building](https://img.shields.io/badge/build-passing-brightgreen
+![sukios_building](https://img.shields.io/badge/build-locally%20passing-brightgreen
 )
 ![sukios_usablility](https://img.shields.io/badge/usable-obviously%20not-red)
 
@@ -364,6 +364,7 @@ tail -8 /tmp/sukios.log
 - **CodeBuddy Hy3 Model** —— 提供代码生成与调试支持。
 - **DeepSeek V3** —— 提供项目结构、初期选型方面的指导。
 - **Xiaomi MiMo V2 Pro** —— 承担SukiOS早期版本的全部代码编写工作（现已弃用，并从代码提交历史中删除。未参与当前版本编写工作。感谢Xiaomi MiMo对项目的支持）。
+- **永雏塔菲（Ace Taffy）** —— 解决了等待ai执行时无聊的问题。
 
 ---
 

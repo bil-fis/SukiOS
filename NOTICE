@@ -63,13 +63,20 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
 
 
 ------------------------------------------------------------------------------
-3. Newlib
-   路径:      lib/newlib-4.6.0.20260123/
+3. Newlib (仅作本地参考，源码不入库)
    上游:      https://sourceware.org/newlib/
    版本:      newlib 4.6.0 (快照 20260123)
    许可证:    BSD 风格许可证 (每文件可能含各自版权；整体见 COPYING.NEWLIB /
               COPYING.LIBGLOSS / COPYING.LIB)
-   主要版权声明 (节选自 COPYING.NEWLIB):
+   参考说明:
+       本仓库的 Ring3 用户态为 freestanding (无 libc)，其 libc 实现（字符串、
+       部分 stdlib/stdio/ctype 等）由本项目自行编写，仅在实现过程中参考
+       newlib 4.6.0 的对应源文件作为算法/行为参照。
+       为保持仓库精简，newlib 的**源码不纳入版本控制**（磁盘目录
+       lib/newlib-4.6.0.20260123/ 本地保留仅供阅读，且已被 .gitignore 忽略）。
+       若本项目未来摘录 newlib 任何源文件片段入库，将严格保留其原有 BSD 版权
+       头与许可声明。
+   主要版权声明 (节选自 newlib COPYING.NEWLIB，供署名参考):
        The newlib subdirectory is a collection of software from several
        sources. Each file may have its own copyright/license that is embedded
        in the source file. Unless otherwise noted in the body of the source
@@ -85,8 +92,7 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
            (BSD License)
 
        以及来自 FreeBSD、NetBSD、OpenBSD、Cygnus Solutions、Jeff Johnston、
-       Joel Sherrill 等多方贡献者的 BSD 风格版权。具体每文件版权以源文件
-       内嵌声明为准。
+       Joel Sherrill 等多方贡献者的 BSD 风格版权。
 ------------------------------------------------------------------------------
 
 

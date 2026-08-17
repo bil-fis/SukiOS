@@ -23,6 +23,7 @@
 .idea/
 clangd-files/
 compile_commands.json
+.codebuddy/
 
 # ---- 本地环境 ----
 .env
@@ -38,6 +39,11 @@ others_tests/
 
 # ---- minimp3：第三方库，完整纳入版本控制（版权见 NOTICE）----
 # 上游 https://github.com/lieff/minimp3 ，CC0 公共领域。
+
+# ---- newlib：仅作本地参考，不入库源码（见 NOTICE）----
+# 用户态 libc 实现参考 newlib 4.6.0，但源码不纳入仓库（避免数千无关文件
+# 膨胀仓库）。磁盘文件保留供本地阅读，不参与版本控制。
+lib/newlib-4.6.0.20260123/
 
 # ---- 压缩包 ----
 zipres/

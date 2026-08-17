@@ -278,7 +278,7 @@ SukiOS/
 
 ```bash
 # 克隆（若从远程）
-git clone <repository-url> SukiOS && cd SukiOS
+git clone https://github.com/bil-fis/SukiOS SukiOS && cd SukiOS
 
 # 确认工具链与依赖就绪
 make info                 # 打印 CC / 工具链 / 对象列表

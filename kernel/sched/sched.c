@@ -113,7 +113,7 @@ static void verify_switch_target(task_t *next)
      * 导致所有用户态任务（FS_SERVER/INPUT/SHELL 等）无法被调度。故对 is_user
      * 任务跳过“返回地址段”检查——用户栈返回地址本就是合法用户地址；rsp 范围
      * 检查（上方）仍保留，继续防御内核栈被越界覆盖的静默死机。 */
-    if (!next->is_user) {
+    if (!next->is_user && !next->is_idle) {
         if (ret_addr < 0xFFFF800000000000ULL || ret_addr >= 0xFFFFC00000000000ULL) {
             kprintf("[sched] BAD SWITCH: next '%s' pid=%lu ret_addr=%p (heap/stack-seg) rsp=%p kstack=[%p,%p]\n",
                     next->name, (unsigned long)next->id, (void *)ret_addr,

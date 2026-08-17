@@ -58,6 +58,14 @@ USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include
 USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o
+
+# FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接
+# DISK_PORT IPC 做磁盘 IO。ff.c + ffunicode.c 编入 fs_server 的 blob/elf。
+FATFS_SRCS := drivers/FatFs/ff.c drivers/FatFs/ffunicode.c drivers/FatFs/diskio.c
+FATFS_OBJS := $(BUILD)/fatfs/ff.c.o $(BUILD)/fatfs/ffunicode.c.o $(BUILD)/fatfs/diskio.c.o
+# 注意：ffsystem.c 在 FF_USE_LFN!=3 且 FF_FS_REENTRANT==0 时整文件被 #if 屏蔽，
+# 故不编入；ff_memalloc/ff_memfree 由 user/lib/suki.c 的简易堆提供。
+
 USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.blob.o,$(USER_PROGS))
 
 # ---- 独立程序（standalone apps，源码在 user/apps/）----
@@ -144,15 +152,36 @@ $(BUILD)/user/lib/stack_canary.c.o: user/lib/stack_canary.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -fno-stack-protector -c $< -o $@
 
+# FatFs 核心用 freestanding 编译，并包含 drivers/FatFs 头路径（ff.h/ffconf.h）。
+# 注意 -Wno-unused-parameter/-Wno-implicit-fallthrough 屏蔽 FatFs 自身体积较大
+# 的告警（不影响正确性）；仍保留 -Wall -Wextra 其余项做防御性检查。
+$(BUILD)/fatfs/%.c.o: drivers/FatFs/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -I drivers/FatFs -Wno-unused-parameter \
+		-Wno-implicit-fallthrough -c $< -o $@
+
+# fs_server 需要 FatFs 头路径（ff.h/ffconf.h 在 drivers/FatFs/）。
+$(BUILD)/user/fs_server.c.o: user/fs_server.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -I drivers/FatFs -c $< -o $@
+
 $(BUILD)/user/%.c.o: user/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 # 链接为独立 ELF（固定基址 0x400000，由 user/user.ld 决定；PIE 亦可）
+# fs_server 额外链接 FatFs 核心（ff.o + ffunicode.o）。
 $(BUILD)/user/%.elf: $(BUILD)/user/%.c.o $(USER_LIB_OBJS) user/user.ld
 	$(CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--no-warn-rwx-segments -T user/user.ld \
 		-o $@ $< $(USER_LIB_OBJS)
+	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
+
+# fs_server 专用：追加 FatFs 核心对象
+$(BUILD)/user/fs_server.elf: $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS) user/user.ld
+	$(CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS)
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # 把 ELF 文件作为原始字节流嵌入内核镜像（objcopy -I binary 生成

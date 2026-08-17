@@ -201,6 +201,13 @@ int    u_strcmp(const char *a, const char *b);
 int    u_strncmp(const char *a, const char *b, size_t n);
 void  *u_memcpy(void *d, const void *s, size_t n);
 void  *u_memset(void *d, int c, size_t n);
+int     u_memcmp(const void *a, const void *b, size_t n);
+char   *strchr(const char *s, int c);              /* FatFs ff.c 非法字符检查用 */
+
+/* FatFs（drivers/FatFs/ff.c）在 FF_USE_LFN>=1 时申请的 LFN 工作缓冲；
+ * 单线程 FS_SERVER 用简易页粒度堆实现（见 suki.c）。 */
+void   *ff_memalloc(unsigned int msize);
+void    ff_memfree(void *mblock);
 
 /* 标准 C 名字的内存原语（供第三方库如 minimp3 链接；实现见 suki.c）。
  * -ffreestanding 下编译器也可能对结构体/数组拷贝隐式生成 memcpy/memset

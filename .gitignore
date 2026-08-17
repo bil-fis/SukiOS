@@ -36,9 +36,8 @@ high-definition-audio-specification.html
 high-definition-audio-specification.pdf
 others_tests/
 
-# ---- minimp3：外部依赖（内嵌 git 仓库，不入库）----
-# 构建 playaudio 前需自行获取：git clone https://github.com/lieff/minimp3
-minimp3/
+# ---- minimp3：第三方库，完整纳入版本控制（版权见 NOTICE）----
+# 上游 https://github.com/lieff/minimp3 ，CC0 公共领域。
 
 # ---- 压缩包 ----
 zipres/
@@ -49,3 +48,9 @@ node_modules/
 
 # ---- 其他文件 -----
 .gdbinit
+*.mp4
+
+# ---- 私有签名证书 ----
+*rootCA*
+*_sign*
+!*.crt

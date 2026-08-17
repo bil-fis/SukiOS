@@ -1,0 +1,133 @@
+SukiOS
+======
+
+本仓库（SukiOS）的整体源代码以 GNU General Public License Version 3
+（GPL-3.0）发布。完整的许可证文本见仓库根目录的 LICENSE 文件。
+
+GPL-3.0 要求：在分发本仓库的源代码或二进制形式时，必须附带本 NOTICE
+文件以及上述 LICENSE 文件，并保留各第三方组件的原有版权声明与许可
+条款（见下文）。本仓库聚合（aggregate）了以下第三方开源组件，这些组件
+各自保留其原作者/权利人的版权，并以各自的许可证（见下文）授权使用。
+GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）兼容。
+
+
+------------------------------------------------------------------------------
+1. minimp3
+   路径:      minimp3/  (minimp3.h, minimp3_ex.h, minimp3_test.c)
+   上游:      https://github.com/lieff/minimp3
+   许可证:    CC0 1.0 公共领域 (Public Domain)
+   版权声明:
+       https://github.com/lieff/minimp3
+       To the extent possible under law, the author(s) have dedicated all
+       copyright and related and neighboring rights to this software to the
+       public domain worldwide.
+       This software is distributed without any warranty.
+       See <http://creativecommons.org/publicdomain/zero/1.0/>.
+------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------
+2. miniz
+   路径:      kernel/abilities/miniz/  (miniz.c, miniz.h, LICENSE)
+   上游:      https://github.com/richgelowitz/miniz
+   许可证:    zlib 风格许可证 (zlib-style) + 部分公共领域 (Unlicense)
+   版权声明 (miniz.c / LICENSE):
+       Copyright 2013-2014 RAD Game Tools and Valve Software
+       Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+
+       All Rights Reserved.
+
+       Permission is hereby granted, free of charge, to any person obtaining a
+       copy of this software and associated documentation files (the
+       "Software"), to deal in the Software without restriction, including
+       without limitation the rights to use, copy, modify, merge, publish,
+       distribute, sublicense, and/or sell copies of the Software, and to
+       permit persons to whom the Software is furnished to do so, subject to
+       the following conditions:
+
+       The above copyright notice and this permission notice shall be included
+       in all copies or substantial portions of the Software.
+
+       THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+       OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+       MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+       IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+       CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+       TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+       SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+   附加说明:
+       miniz.c 中部分辅助代码（如 tinfl/tdefl 公共域部分及 Simple PNG
+       writer）以公共领域发布，见 http://unlicense.org/ 。
+------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------
+3. Newlib
+   路径:      lib/newlib-4.6.0.20260123/
+   上游:      https://sourceware.org/newlib/
+   版本:      newlib 4.6.0 (快照 20260123)
+   许可证:    BSD 风格许可证 (每文件可能含各自版权；整体见 COPYING.NEWLIB /
+              COPYING.LIBGLOSS / COPYING.LIB)
+   主要版权声明 (节选自 COPYING.NEWLIB):
+       The newlib subdirectory is a collection of software from several
+       sources. Each file may have its own copyright/license that is embedded
+       in the source file. Unless otherwise noted in the body of the source
+       file(s), the following copyright notices will apply:
+
+       (1) Red Hat Incorporated
+           Copyright (c) 1994-2009  Red Hat, Inc. All rights reserved.
+           (BSD License)
+
+       (2) University of California, Berkeley
+           Copyright (c) 1981-2000 The Regents of the University of
+           California. All rights reserved.
+           (BSD License)
+
+       以及来自 FreeBSD、NetBSD、OpenBSD、Cygnus Solutions、Jeff Johnston、
+       Joel Sherrill 等多方贡献者的 BSD 风格版权。具体每文件版权以源文件
+       内嵌声明为准。
+------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------
+4. FatFs - Generic FAT Filesystem Module
+   路径:      drivers/FatFs/  (ff.c, ff.h, ffunicode.c, ffsystem.c, diskio.h,
+              LICENSE.txt 等)
+   上游:      http://elm-chan.org/fsw/ff/00index_e.html
+   作者:      ChaN
+   许可证:    1-clause BSD 风格许可证 (FatFs license)
+   版权声明 (LICENSE.txt):
+       FatFs - Generic FAT Filesystem Module  Rx.xx
+       Copyright (C) 20xx, ChaN, all right reserved.
+
+       FatFs module is an open source software. Redistribution and use of
+       FatFs in source and binary forms, with or without modification, are
+       permitted provided that the following condition is met:
+
+       1. Redistributions of source code must retain the above copyright
+          notice, this condition and the following disclaimer.
+
+       This software is provided by the copyright holder and contributors
+       "AS IS" and any warranties related to this software are DISCLAIMED.
+       The copyright owner or contributors be NOT LIABLE for any damages
+       caused by use of this software.
+
+   附加说明:
+       FatFs 主要用于嵌入式系统；其二进制形式再分发（如内嵌代码、二进制
+       库）无需在文档中提及 FatFs。FatFs 兼容包括 GNU GPL 在内的大多数开源
+       许可证。
+------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------
+本仓库 (SukiOS) 自有代码
+   许可证:    GNU General Public License Version 3 (GPL-3.0)
+   版权:     SukiOS 作者与贡献者
+   说明:     除上文列出的第三方组件按其各自许可证授权外，本仓库中所有其他
+             源代码（内核、用户态服务、构建系统等）均以 GPL-3.0 发布。
+             完整许可证文本见 LICENSE 文件。
+------------------------------------------------------------------------------
+
+
+本 NOTICE 文件应随本仓库的源代码与二进制分发一并提供。

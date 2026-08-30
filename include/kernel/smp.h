@@ -14,6 +14,13 @@
  *     窃取就绪任务（见 sched.c steal_task），实现负载均衡；
  *   - 任务创建时按 smp_online_count() 静态 RR 绑定初始 CPU，后续由窃取迁移。
  *
+ * 【编译选项：SMP 为可选特性，默认关闭】
+ *   CONFIG_SMP=0（默认，单核构建）：smp_init() 只注册 IPI handler 并报告
+ *   单核形态，不探测/唤醒任何 AP；smp_online_count() 恒为 1；TLB shootdown
+ *   与 halt-others 退化为空操作。AP 跳板(ap_boot.S)不编入镜像，MAX_CPUS=1。
+ *   CONFIG_SMP=1（make SMP=1）：上述对称多核能力全部启用，MAX_CPUS=8。
+ *   详见 include/kernel/config.h。
+ *
  * IPI 向量分配（避开 0x20..0x2F 的 IRQ 与 0xFF 伪中断）：
  *   0xF0 IPI_RESCHED   —— 重调度请求（唤醒目标 CPU 的 idle 循环或触发再调度；
  *                          亦用于发布/唤醒任务时通知可能的空闲 AP 来窃取工作）

@@ -21,6 +21,7 @@
 #include <kernel/apic.h>
 #include <kernel/ioapic.h>
 #include <kernel/clock.h>
+#include <kernel/config.h>   /* CONFIG_SMP：构建形态（默认单核） */
 #include <kernel/smp.h>
 #include <kernel/percpu.h>
 #include <kernel/diagnostics.h>
@@ -201,7 +202,13 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     pic_disable();                                 /* 屏蔽遗留 8259，防双投递 */
     clock_init();                                  /* TSC 校准 + LAPIC 100Hz 节拍 + HPET 探测 */
 
-    /* ---- P0-3：SMP —— BSP percpu 安装 + AP 启动（INIT-SIPI-SIPI）---- */
+    /* ---- P0-3：SMP —— BSP percpu 安装 + AP 启动（INIT-SIPI-SIPI）----
+     * SMP 是编译期可选特性（include/kernel/config.h 的 CONFIG_SMP），默认
+     * 关闭（单核构建）：此时 smp_init() 仅注册 IPI handler 并报告单核形态，
+     * 不会唤醒任何 AP，系统全程运行在 BSP 上。开启方式：make SMP=1。 */
+    kprintf("[boot] SMP build config: %s (max_cpus=%u)\n",
+            CONFIG_SMP ? "ENABLED (multi-core)" : "disabled (single-core)",
+            (unsigned)MAX_CPUS);
     percpu_install(0, bsp_lapic);                  /* BSP 的 GS_BASE -> percpu[0] */
     smp_init();                                    /* 依 MADT 唤醒全部 AP */
 

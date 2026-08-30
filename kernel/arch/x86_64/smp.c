@@ -10,9 +10,18 @@
  *      第二次 SIPI；轮询 percpu.online 握手（超时 100ms 判失败）；
  *   4) 串行逐个启动（共享一个邮箱），全部完成后打印在线拓扑。
  *
+ * 编译选项（P0-3 后续调整：SMP 改为可选特性，默认关闭）：
+ *   CONFIG_SMP=0（默认，单核构建）：本文件只保留 IPI 向量 handler 注册与
+ *     单核语义的查询接口；AP 跳板拷贝 / INIT-SIPI-SIPI / ap_main / IPI 自检
+ *     全部不编入镜像。IPI_RESCHED handler 仍保留——单核下它以 self-IPI 形式
+ *     承担「新建任务、唤醒 waiter 时立即发生一次调度」的生存性职责
+ *     （见 sched.c task_publish/sched_wake），不可裁剪。
+ *   CONFIG_SMP=1（make SMP=1）：以下全部多核路径照旧生效。
+ *
  * 调用关系：kmain() -> smp_init()（clock_init 之后，需 TSC 延时）。
  *           isr_dispatch -> ipi_*_handler（向量 0xF0..0xF2）。
  */
+#include <kernel/config.h>   /* CONFIG_SMP */
 #include <kernel/smp.h>
 #include <kernel/percpu.h>
 #include <kernel/apic.h>
@@ -26,19 +35,26 @@
 #include <kernel/console.h>
 #include <kernel/string.h>
 #include <mm/kmalloc.h>
-#include <mm/kstack.h>     /* P0-R5：AP 引导/空闲栈同样使用守卫页栈 */
 #include <mm/vmm.h>
+
+static uint32_t g_online = 1;    /* BSP 永远在线 */
+
+#if CONFIG_SMP
+#include <mm/kstack.h>     /* P0-R5：AP 引导/空闲栈同样使用守卫页栈 */
 
 #define AP_TRAMP_PHYS   0x8000UL
 #define AP_STACK_BYTES  KSTACK_BYTES   /* 16KB，栈底下方带未映射守卫页 */
 
-/* ap_boot.S 导出的跳板边界与邮箱标号（内核 VMA 内的地址，用于算偏移） */
+/* ap_boot.S 导出的跳板边界与邮箱标号（内核 VMA 内的地址，用于算偏移）。
+ * 单核构建(CONFIG_SMP=0)时 ap_boot.S 被 Makefile 从源文件列表剔除，
+ * 这些符号不存在，故连同引用者一并条件编译。 */
 extern char ap_tramp_start[], ap_tramp_end[];
 extern char ap_mb_cr3[], ap_mb_stack[], ap_mb_entry[], ap_mb_idx[];
+#endif /* CONFIG_SMP */
 
-static uint32_t g_online = 1;    /* BSP 永远在线 */
-
-/* ---- TSC 忙等延时（微秒级；clock_init 已校准 TSC）---- */
+#if CONFIG_SMP
+/* ---- TSC 忙等延时（微秒级；clock_init 已校准 TSC）----
+ * 仅多核构建需要：AP 上线的 INIT-SIPI-SIPI 时序与握手轮询依赖它。 */
 static inline uint64_t rdtsc(void)
 {
     uint32_t lo, hi;
@@ -59,8 +75,12 @@ static void udelay(uint64_t usec)
         __asm__ volatile("pause" ::: "memory");
     }
 }
+#endif /* CONFIG_SMP */
 
-/* ---- IPI 处理器 ---- */
+/* ---- IPI 处理器 ----
+ * 两种构建形态下都注册：单核时 RESCHED 以 self-IPI 触发即时调度，
+ * TLB/HALT 在单核下永不发送（smp_tlb_shootdown/smp_halt_others 见下方
+ * g_online<=1 快速返回），保留 handler 仅为接口一致性。 */
 
 static void ipi_resched_handler(registers_t *r)
 {
@@ -94,6 +114,7 @@ static void ipi_halt_handler(registers_t *r)
     }
 }
 
+#if CONFIG_SMP
 /* ---- AP 的 C 入口（ap_boot.S 长模式段 jmp 至此，rdi=CPU 逻辑索引）---- */
 void ap_main(uint64_t idx)
 {
@@ -129,6 +150,7 @@ void ap_main(uint64_t idx)
         schedule();
     }
 }
+#endif /* CONFIG_SMP */
 
 uint32_t smp_init(void)
 {
@@ -137,6 +159,17 @@ uint32_t smp_init(void)
     register_interrupt_handler(IPI_TLB_FLUSH, ipi_tlb_handler);
     register_interrupt_handler(IPI_HALT,      ipi_halt_handler);
 
+#if !CONFIG_SMP
+    /* ---- 单核构建（默认）：不探测、不唤醒任何 AP ----
+     * 语义仍保持「BSP 在线数为 1」，使调度器/IPC/诊断的 per-CPU 逻辑与多核
+     * 构建完全一致（只是永远只有 cpu0）。这里显式置 g_percpu[0].online 并
+     * 打印构建形态，便于从启动日志一眼确认当前镜像是单核还是多核。 */
+    g_percpu[0].online = 1;
+    g_online = 1;
+    kprintf("[smp] single-core build (CONFIG_SMP=0): AP startup compiled out, "
+            "MADT reports %u LAPIC(s)\n", (unsigned)g_acpi.lapic_count);
+    return 1;
+#else
     if (g_acpi.lapic_count <= 1) {
         kprintf("[smp] single CPU system (MADT lapic_count=%u)\n",
                 (unsigned)g_acpi.lapic_count);
@@ -246,6 +279,7 @@ uint32_t smp_init(void)
                 (unsigned)acked, (unsigned)(g_online - 1));
     }
     return g_online;
+#endif /* CONFIG_SMP */
 }
 
 uint32_t smp_online_count(void)

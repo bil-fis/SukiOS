@@ -25,6 +25,8 @@
 
 #include <kernel/types.h>
 #include <kernel/serial.h>   /* 死锁诊断用 serial_writestr/dec（绕过 kprintf 锁） */
+#include <kernel/console.h>  /* panic() 声明（死锁诊断末尾停机）；console.h 仅
+                              * 依赖 types.h，与 spinlock.h 无循环包含关系 */
 
 typedef struct spinlock {
     volatile uint32_t tickets;   /* [31:16]=next, [15:0]=owner */

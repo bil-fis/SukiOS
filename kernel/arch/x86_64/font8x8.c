@@ -103,3 +103,15 @@ const uint8_t font8x8_basic[128][8] = {
     [0x7D] = {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00}, /* } */
     [0x7E] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, /* ~ */
 };
+
+/*
+ * font_ttf_get —— TTF 矢量字体查找的预留钩子（当前未实现）。
+ * 签名与 font_cjk_get 完全一致，便于将来 TTF 子系统（磁盘加载 .ttf，
+ * 经光栅化器生成字形位图）直接接入 fb_get_glyph 的查找链。
+ * 现阶段恒返回 false，使调用方回退到兜底方框。
+ */
+bool font_ttf_get(uint32_t cp, const uint8_t **bits, int *w, int *h)
+{
+    (void)cp; (void)bits; (void)w; (void)h;
+    return false;
+}

@@ -62,6 +62,13 @@ bool fb_get_glyph(uint32_t cp, glyph_t *g)
         g->scale = 1;
         return true;
     }
+    /* TTF 矢量字体查找（预留钩子：当前 font_ttf_get 恒返回 false，
+     * 故回退到下方兜底方框）。一旦 TTF 子系统实现即可在此优先于兜底命中。 */
+    if (font_ttf_get(cp, &g->bits, &g->w, &g->h)) {
+        g->stride = (g->w + 7) / 8;
+        g->scale = 1;
+        return true;
+    }
     g->bits = g_fallback_box;
     g->w = 16; g->h = 16; g->stride = 2; g->scale = 1;
     return true;
@@ -259,16 +266,33 @@ void fbcon_putc(char c)
     case '\r': g_con.cx = 0; return;
     case '\t': for (int i = 0; i < 4; i++) fbcon_putc(' '); return;
     case '\b':
-        if (g_con.cx > 0) {
+        /* 退格删除：左移一个字符并清除该格。支持跨行回退。 */
+        if (g_con.cx == 0) {
+            if (g_con.cy > 0) {           /* 回退到上一行末尾 */
+                g_con.cy--;
+                g_con.cx = g_con.cols - 1;
+            } else {
+                return;                   /* 已在左上角，无法再退 */
+            }
+        } else {
             g_con.cx--;
+        }
+        {
             uint32_t px = CON_MARGIN + g_con.cx * g_con.cw;
             uint32_t py = CON_MARGIN + g_con.cy * g_con.ch;
-            fb_fill_rect(px, py, g_con.cw, g_con.ch, g_con.bg);
+            fb_fill_rect(px, py, g_con.cw, g_con.ch, g_con.bg);  /* 清掉被删字符 */
         }
         return;
     }
 
-    /* 其它字节喂入 UTF-8 解码器，得到完整 Unicode 码点后再渲染 */
+    /* 过滤其它不可打印字符：C0 控制符（<0x20，除已处理的 \n\r\t\b）与 DEL(0x7F)
+     * 直接丢弃，既不渲染也不进 UTF-8 解码器（避免污染解码状态产生乱码）。
+     * 其余（含 0x20 空格与 UTF-8 续字节 >=0x80）才送解码器。 */
+    if (c < 0x20 || c == 0x7F) {
+        return;
+    }
+
+    /* 可打印字节喂入 UTF-8 解码器，得到完整 Unicode 码点后再渲染 */
     uint32_t cp;
     int r = utf8_feed(&g_utf8, (uint8_t)c, &cp);
     if (r == 0) {

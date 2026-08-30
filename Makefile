@@ -133,7 +133,7 @@ USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.ssvc.blob.o,$(USER_PROGS))
 #   * 可使用浮点 / SSE（minimp3 MP3 解码依赖），故启用 -msse2 且去掉
 #     -mgeneral-regs-only（内核 switch.S 已 fxsave/fxrstor 保存 Ring3 SSE 上下文）。
 #   * -Os 优先缩小体积，以适配内核 execve 单条 OOL(16 页=64KiB) 的加载上限。
-APP_PROGS    := hello playaudio audiotest
+APP_PROGS    := hello playaudio audiotest bmploader
 APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -mno-red-zone -msse -msse2 \
                 -ffunction-sections -fdata-sections \
@@ -388,6 +388,12 @@ $(DISK): $(APP_ELFS) others_tests/moonhalo.mp3
 	mcopy -i $@ $(BUILD)/ROADMAP.TXT ::ROADMAP.TXT
 	mmd -i $@ ::SYS
 	mmd -i $@ ::BIN
+	# 图片资源目录：把 images/ 下【全部】.bmp 放入 ::IMAGES/，供 BMP 加载器
+	# 诊断显示用。注意 .gitignore 排除了 CG*.bmp（避免误提交大二进制资源），
+	# 但生成硬盘镜像时仍从本地 working dir 复制全部 bmp（含被忽略的 CG*.bmp），
+	# 故 glob images/*.bmp 会一并带上这些本地存在的图片。
+	mmd -i $@ ::IMAGES
+	mcopy -i $@ images/*.bmp ::IMAGES/
 	# 独立程序（用户态二进制应用）按官方后缀体系使用 .ska：
 	# 磁盘文件名 BIN/<NAME>.SKA，shell 的 exec 在找不到原路径时会自动补 .ska，
 	# 故 `exec BIN/playaudio` 与 `exec BIN/playaudio.ska` 均可装载。

@@ -811,6 +811,77 @@ static uint64_t sys_console_read(uint64_t a1, uint64_t a2)
     return (uint64_t)n;
 }
 
+/*
+ * sys_display_blit —— SYS_DISPLAY_BLIT 实现。
+ * ---------------------------------------------------------------------------
+ * 供 Ring3 显示诊断程序（如 BMP 加载器）把一块像素（xRGB32）写入帧缓冲。内核
+ * 拥有帧缓冲的内核线性映射（g_fb.base），直接逐像素写入，无需用户态映射。
+ * 像素格式：每个 uint32_t 为 (r<<16)|(g<<8)|b（小端内存布局即 [B][G][R][X]，
+ * 与帧缓冲期望的 xRGB32 字节序一致，见 user/display_server.c 的 put_px）。
+ *
+ *   参数 a1 = 用户态像素缓冲指针（uint32_t*），a2 = 宽，a3 = 高，
+ *        a4 = 目标 x，a5 = 目标 y。
+ *   返回 0 成功；非法参数/指针返回 (uint64_t)-1。单次 blit 上限 4MiB 像素字节。
+ *
+ * 安全性：
+ *   - 用户像素缓冲经 user_access_ok 校验可读，再经 copy_from_user 整块拷入内核
+ *     临时缓冲（内核绝不直解引用用户指针，否则用户缺页会 panic 整机）；
+ *   - 目标矩形超出帧缓冲的部分被裁剪（clamp），不越界写屏；
+ *   - 尺寸上限防护：w*h*4 超过 BLIT_MAX_BYTES 直接拒绝，避免 kmalloc 过大失败。
+ */
+#define BLIT_MAX_BYTES  (4u * 1024u * 1024u)
+static uint64_t sys_display_blit(uint64_t a1, uint64_t a2, uint64_t a3,
+                                 uint64_t a4, uint64_t a5)
+{
+    if (!g_fb.ready) {
+        return (uint64_t)-1;
+    }
+    const uint32_t *usrc = (const uint32_t *)(uintptr_t)a1;
+    uint32_t w = (uint32_t)a2;
+    uint32_t h = (uint32_t)a3;
+    int32_t  dx = (int32_t)a4;
+    int32_t  dy = (int32_t)a5;
+
+    if (w == 0 || h == 0 || w > g_fb.width || h > g_fb.height) {
+        return (uint64_t)-1;
+    }
+    uint64_t bytes = (uint64_t)w * h * 4;
+    if (bytes > BLIT_MAX_BYTES) {
+        return (uint64_t)-1;
+    }
+    if (!user_access_ok((void *)usrc, (size_t)bytes, false)) {
+        return (uint64_t)-1;
+    }
+
+    /* 整块拷入内核缓冲（copy_from_user 已处理缺页/越界） */
+    uint32_t *kbuf = kmalloc((size_t)bytes);
+    if (!kbuf) {
+        return (uint64_t)-1;
+    }
+    if (!copy_from_user(kbuf, usrc, (size_t)bytes)) {
+        kfree(kbuf);
+        return (uint64_t)-1;
+    }
+
+    uint32_t pitch_px = g_fb.pitch / 4;
+    volatile uint32_t *fb = (volatile uint32_t *)g_fb.base;
+    for (uint32_t j = 0; j < h; j++) {
+        int32_t fy = dy + (int32_t)j;
+        if (fy < 0 || fy >= (int32_t)g_fb.height) {
+            continue;
+        }
+        for (uint32_t i = 0; i < w; i++) {
+            int32_t fx = dx + (int32_t)i;
+            if (fx < 0 || fx >= (int32_t)g_fb.width) {
+                continue;
+            }
+            fb[fy * pitch_px + fx] = kbuf[j * w + i];
+        }
+    }
+    kfree(kbuf);
+    return 0;
+}
+
 
 /*
  * C 分发器。
@@ -863,6 +934,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_FRAMEBUFFER_MAP: return sys_framebuffer_map(a1);
     case SYS_DISPLAY_READY:   display_set_active(); return 0;
     case SYS_CONSOLE_READ:    return sys_console_read(a1, a2);
+    case SYS_DISPLAY_BLIT:    return sys_display_blit(a1, a2, a3, a4, a5);
     default: {
         /* 其余全部交给 POSIX 层（进程/文件/内存/时间/系统/网络号区） */
         int64_t r = 0;

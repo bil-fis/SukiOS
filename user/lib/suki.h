@@ -276,6 +276,20 @@ void  *memset(void *d, int c, size_t n);
 void  *memmove(void *d, const void *s, size_t n);
 void   u_print(const char *s);                  /* debug_write 便捷版 */
 void   u_printn(const char *s, size_t n);
+
+/*
+ * udbg_printf —— 用户态调试输出，受编译期 CONFIG_DEBUG_SERIAL 控制：
+ *   - make run（DBG=0）：CONFIG_DEBUG_SERIAL=0，展开为空，零开销/零刷屏；
+ *   - make run-dbg（DBG=1）：CONFIG_DEBUG_SERIAL=1，等价于 u_print。
+ * 仅用于「逐次/详细」诊断；显示服务等组件的关键状态（如视频模式开/关、
+ * 桌面合成完成）应改用无条件 u_print，确保默认 run 下用户也能看到服务就绪。
+ * 需 USER_CFLAGS 含 -include build/config.h（本 Makefile 已加）。
+ */
+#if defined(CONFIG_DEBUG_SERIAL) && CONFIG_DEBUG_SERIAL
+  #define udbg_printf(...) u_print(__VA_ARGS__)
+#else
+  #define udbg_printf(...) ((void)0)
+#endif
 char  *u_utoa_s(uint64_t v, char *buf, size_t size); /* 十进制，长度安全：
                                                  * 至多写 size-1 字符 + NUL，
                                                  * size>=21 永不截断 */

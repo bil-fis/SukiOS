@@ -23,6 +23,8 @@
 #include <kernel/elf.h>
 #include <ipc/fs_proto.h>
 #include <kernel/hda.h>
+#include <kernel/framebuffer.h>   /* g_fb, fb_map_result_t：SYS_FRAMEBUFFER_MAP */
+#include <kernel/display_cfg.h>  /* g_display.video_mode：显示配置开关 */
 #include <kernel/acpi.h>   /* acpi_poweroff：SYS_REBOOT(mode!=0) 经 ACPI S5 软关机 */
 #include <kernel/percpu.h>   /* cpu_index()/MAX_CPUS：H8 per-CPU syscall 缓冲 */
 #include <kernel/posix.h>    /* posix_dispatch()：完整 POSIX 系统调用层 */
@@ -710,6 +712,67 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len)
 }
 
 /*
+ * SYS_FRAMEBUFFER_MAP (200) —— 显示服务(Ring3)请求帧缓冲用户态映射。
+ *
+ * 参数 a1 = 用户态 fb_map_result_t*（内核填好后经 copy_to_user 写回）。
+ * 行为：
+ *   - 若 video_mode=off（配置文件关闭视频模式）或帧缓冲未就绪
+ *     （g_fb.ready==false，例如纯文本回退）：enabled=0，不映射，返回 -1，
+ *     显示服务应降级为纯文本转发（sys_debug_write）。
+ *   - 否则：在进程页表（sched_current()->cr3）中把帧缓冲物理页逐页映射到一个
+ *     固定的用户态虚拟地址（FB_USER_VA，位于用户空间且不与 mmap/栈冲突），
+ *     权限 PTE_USER|PTE_WRITE|PTE_NX|PTE_PRESENT。填写实际 FB 参数与配置文件
+ *     声明的逻辑分辨率（g_display.width/height）后 copy_to_user 返回，返回 0。
+ *
+ * 安全性：用户指针 a1 经 user_access_ok 校验（写权限、不越界、页存在），
+ * 绝不直解引用用户指针；映射的是显存物理帧，用户态写入即写显存，不影响内核。
+ */
+#define FB_USER_VA 0x00007F0000000000ULL
+static uint64_t sys_framebuffer_map(uint64_t a1)
+{
+    fb_map_result_t res;
+    memset(&res, 0, sizeof(res));
+
+    task_t *t = sched_current();
+
+    if (!g_display.video_mode || !g_fb.ready) {
+        res.enabled = 0;
+        if (!copy_to_user((void *)a1, &res, sizeof(res)))
+            return (uint64_t)-1;
+        return (uint64_t)-1;   /* 纯文本模式：无 FB 映射 */
+    }
+
+    /* 帧缓冲物理地址：g_fb.base 是内核线性映射虚拟地址，还原物理地址 */
+    uint64_t fb_phys = (uint64_t)g_fb.base - 0xFFFF800000000000ULL;
+    uint64_t fb_bytes = (uint64_t)g_fb.pitch * (uint64_t)g_fb.height;
+    uint64_t npages = (fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    uint64_t va = FB_USER_VA;
+    uint64_t flags = PTE_PRESENT | PTE_WRITE | PTE_USER | PTE_NX;
+    for (uint64_t i = 0; i < npages; i++) {
+        if (!vmm_map_page(t->cr3, va + i * PAGE_SIZE,
+                          fb_phys + i * PAGE_SIZE, flags)) {
+            return (uint64_t)-1;   /* 映射失败：不暴露部分映射 */
+        }
+    }
+
+    res.enabled    = 1;
+    res.fb_user_va = va;
+    res.fb_phys    = fb_phys;
+    res.pitch      = g_fb.pitch;
+    res.width      = g_fb.width;
+    res.height     = g_fb.height;
+    res.bpp        = g_fb.bpp;
+    res.cfg_width  = g_display.width;
+    res.cfg_height = g_display.height;
+
+    if (!copy_to_user((void *)a1, &res, sizeof(res)))
+        return (uint64_t)-1;
+    return 0;
+}
+
+
+/*
  * C 分发器。
  *
  * 参数：num=调用号；a1..a6 对应用户态 rdi/rsi/rdx/r10/r8/r9（第 4 参走 r10，
@@ -757,6 +820,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_MMAP_LEGACY:   return sys_mmap(a1, a2);
     case SYS_MUNMAP_LEGACY: return sys_munmap(a1, a2);
     case SYS_SERIAL_READ: return sys_serial_read();
+    case SYS_FRAMEBUFFER_MAP: return sys_framebuffer_map(a1);
     default: {
         /* 其余全部交给 POSIX 层（进程/文件/内存/时间/系统/网络号区） */
         int64_t r = 0;

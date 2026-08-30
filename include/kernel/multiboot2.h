@@ -14,6 +14,7 @@
 #define MULTIBOOT_TAG_TYPE_END        0
 #define MULTIBOOT_TAG_TYPE_MMAP       6
 #define MULTIBOOT_TAG_TYPE_FRAMEBUFFER 8
+#define MULTIBOOT_TAG_TYPE_MODULE     3    /* 引导模块（如 /boot/display.cfg） */
 /* P0-6：UEFI 启动路径新增标签 */
 #define MULTIBOOT_TAG_TYPE_EFI64      12   /* EFI 64 位系统表指针（UEFI 启动标识） */
 #define MULTIBOOT_TAG_TYPE_ACPI_OLD   14   /* ACPI 1.0 RSDP 副本（20 字节） */
@@ -54,6 +55,17 @@ struct mb2_tag_mmap {
     struct mb2_mmap_entry entries[0];
 } __attribute__((packed));
 
+/* type = 3: 引导模块（GRUB module2 加载的配置/资源文件）。
+ * mod_start/mod_end 为物理地址区间 [start, end)，其后紧跟以 NUL 结尾的模块名。
+ * 首个模块约定为 display.cfg（显示服务配置）。 */
+struct mb2_tag_module {
+    uint32_t type;
+    uint32_t size;
+    uint32_t mod_start;           /* 模块数据物理地址 */
+    uint32_t mod_end;             /* 模块数据结束（不含） */
+    char     cmdline[0];          /* 模块名（含 NUL，可变长） */
+} __attribute__((packed));
+
 /* 解析结果：供 kmain 及后续 PMM/framebuffer 使用 */
 typedef struct boot_info {
     /* 帧缓冲 */
@@ -74,6 +86,12 @@ typedef struct boot_info {
      * 必须优先使用这里的副本地址。 */
     bool     efi_boot;            /* MBI 含 EFI64 系统表标签 => UEFI 启动 */
     uint64_t rsdp_copy_phys;      /* MBI 内 RSDP 副本的物理地址（0=无） */
+    /* ---- 引导配置模块 ----
+     * GRUB 经 module2 加载的配置文件（约定首个模块为 configs/display.cfg）。
+     * 内核在 fb_init 前解析之，决定显示模式与分辨率。物理地址区间
+     * [cfg_phys, cfg_phys + cfg_size)，内容为以 NUL 结尾的纯文本。 */
+    uint64_t cfg_phys;            /* 配置模块物理地址（0=无） */
+    uint32_t cfg_size;            /* 配置模块字节数（含 NUL，0=无） */
 } boot_info_t;
 
 /* 解析物理地址处的 Multiboot2 info，填充 out。返回 true 成功。 */

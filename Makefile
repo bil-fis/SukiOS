@@ -102,11 +102,12 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server shell posixtest
+USER_PROGS   := fs_server input_server display_server shell posixtest
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
-                -fno-asynchronous-unwind-tables -MMD -MP -I user -I include
+                -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
+                -include $(CONFIG_H)
 USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/errno.c.o $(BUILD)/user/lib/string.c.o \
                   $(BUILD)/user/lib/stdlib.c.o $(BUILD)/user/lib/stdio.c.o \
@@ -363,6 +364,8 @@ $(ISO): $(KERNEL) grub/grub.cfg
 	@mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.ski
 	cp grub/grub.cfg $(ISODIR)/boot/grub/grub.cfg
+	# 显示服务配置文件：经 GRUB module2 加载，内核在 fb_init 前解析。
+	-cp configs/display.cfg $(ISODIR)/boot/display.cfg
 	grub-mkrescue -o $(ISO) $(ISODIR) 2>/dev/null
 	@echo "==> Built $(ISO)"
 

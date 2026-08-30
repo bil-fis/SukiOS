@@ -591,7 +591,11 @@ typedef struct suki_fd_set {
 #define SYS_GETSOCKNAME     143
 #define SYS_SOCKETPAIR      144
 
-#define SYSCALL_MAX         150
+/* 内核扩展：Ring3 显示服务经此系统调用获得帧缓冲用户态映射与显示配置。
+ * 放在原生区之外的独立扩展号，避免与 POSIX 区（20+）混淆。 */
+#define SYS_FRAMEBUFFER_MAP 200
+
+#define SYSCALL_MAX         200
 
 /* ========================================================================== */
 /*  六、每进程资源上限（内核 fd 表规模等）                                     */

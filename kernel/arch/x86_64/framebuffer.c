@@ -12,18 +12,13 @@
 #include <kernel/framebuffer.h>
 #include <kernel/font.h>
 #include <kernel/utf8.h>
+#include <kernel/display_cfg.h>   /* g_display.video_mode：配置文件开关 */
+#include <kernel/serial.h>
 
 #define CON_SCALE  2   /* 字形放大倍数：8x8 -> 16x16 */
 #define CON_MARGIN 4   /* 边距像素 */
 
-static struct {
-    volatile uint8_t *base;   /* 显存虚拟基址 */
-    uint32_t pitch;           /* 每行字节数 */
-    uint32_t width;
-    uint32_t height;
-    uint8_t  bpp;
-    bool     ready;
-} g_fb;
+fb_info_t g_fb;
 
 /* 控制台状态 */
 static struct {
@@ -66,6 +61,15 @@ bool fb_get_glyph(uint32_t cp, glyph_t *g)
 
 bool fb_init(const boot_info_t *bi)
 {
+    /* 显示配置文件可强制关闭视频模式（video_mode = off）：
+     * 此时不初始化帧缓冲，内核回退到 VGA 文本模式（纯文本输出），
+     * 由 console.c 的 user_puts() 据 fb_available() 自动切换。 */
+    if (!g_display.video_mode) {
+        serial_writestr("[fb] video_mode=off from config; staying in "
+                        "VGA text mode (framebuffer not initialized)\n");
+        g_fb.ready = false;
+        return false;
+    }
     if (!bi->fb_present || bi->fb_bpp != 32 || bi->fb_addr == 0) {
         g_fb.ready = false;
         return false;

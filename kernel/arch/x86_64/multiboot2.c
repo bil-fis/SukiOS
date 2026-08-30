@@ -104,6 +104,18 @@ bool multiboot2_parse(uint64_t mbi_phys, boot_info_t *out)
             }
             break;
         }
+        case MULTIBOOT_TAG_TYPE_MODULE: {
+            /* 引导模块（configs/display.cfg）。仅采纳首个模块作为显示配置，
+             * 后续模块（若有）暂忽略。mod_start/mod_end 为物理地址区间。 */
+            if (out->cfg_phys == 0) {
+                const struct mb2_tag_module *mod =
+                    (const struct mb2_tag_module *)tag;
+                out->cfg_phys = (uint64_t)mod->mod_start;
+                out->cfg_size = mod->mod_end - mod->mod_start;
+                if (out->cfg_size > 65536) out->cfg_size = 65536;
+            }
+            break;
+        }
         default:
             break;
         }

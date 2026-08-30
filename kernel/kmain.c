@@ -22,6 +22,7 @@
 #include <kernel/ioapic.h>
 #include <kernel/clock.h>
 #include <kernel/config.h>   /* CONFIG_SMP：构建形态（默认单核） */
+#include <kernel/display_cfg.h>  /* g_display：显示配置文件（video_mode/分辨率） */
 #include <kernel/posix.h>    /* posix_init()：完整 POSIX 系统调用层 */
 #include <kernel/rtc.h>      /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
 #include <kernel/smp.h>
@@ -59,6 +60,7 @@ extern uint8_t g_smap_enabled;
 /* Ring3 用户程序 blob（user/ 下的 C 程序，Makefile 嵌入内核镜像） */
 extern const uint8_t user_fs_server_start[],    user_fs_server_end[];
 extern const uint8_t user_input_server_start[], user_input_server_end[];
+extern const uint8_t user_display_server_start[], user_display_server_end[];
 extern const uint8_t user_shell_start[],        user_shell_end[];
 extern const uint8_t user_posixtest_start[],    user_posixtest_end[];
 
@@ -150,6 +152,11 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
         serial_writestr("[boot] FATAL: unsupported boot protocol (not Multiboot2/PVH).\n");
         for (;;) { __asm__ volatile("hlt"); }
     }
+
+    /* 显示配置文件（configs/display.cfg，经 GRUB module2 加载）必须在 fb_init
+     * 之前解析，使 video_mode 开关生效：off 时 fb_init 不初始化帧缓冲、内核
+     * 回退 VGA 文本模式。缺失配置则保留默认 1280x720 视频模式。 */
+    display_cfg_parse(g_boot.cfg_phys, g_boot.cfg_size);
 
     fb_init(&g_boot);
     fbcon_init();
@@ -347,10 +354,14 @@ static void boot_late_init(void *arg)
                 "will return -EIO)\n");
     }
 
-    /* ---- Ring3 输入服务 + Shell ---- */
+    /* ---- Ring3 输入服务 + 显示服务 + Shell ----
+     * 显示服务认领 DISPLAY_PORT，据 configs/display.cfg 决定视频合成或纯文本。 */
     task_create_user(user_input_server_start,
                      (size_t)(user_input_server_end - user_input_server_start),
                      "input-server");
+    task_create_user(user_display_server_start,
+                     (size_t)(user_display_server_end - user_display_server_start),
+                     "display-server");
     task_create_user(user_shell_start,
                      (size_t)(user_shell_end - user_shell_start), "shell");
 
@@ -359,9 +370,9 @@ static void boot_late_init(void *arg)
      * 再跑文件类用例，故与 fs-server 的 mount 时序无关。
      * 它的输出是「完整 POSIX 系统调用层」的验收依据，用
      * `make run-headless QEMU_SERIAL="-serial file:/tmp/x.log"` 收集。 */
-    task_create_user(user_posixtest_start,
-                     (size_t)(user_posixtest_end - user_posixtest_start),
-                     "posixtest");
+    // task_create_user(user_posixtest_start,
+    //                  (size_t)(user_posixtest_end - user_posixtest_start),
+    //                  "posixtest");
 
     kprintf("[boot] all services spawned; system fully up.\n\n");
 

@@ -41,6 +41,7 @@ static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
     r->offset = 0;
     r->length = FS_DATA_MAX;
     for (uint64_t i = 0; i < pathlen; i++) req[sizeof(fs_read_at_req_t) + i] = path[i];
+    req[sizeof(fs_read_at_req_t) + pathlen] = '\0';   /* 文件名必须以 NUL 结尾（FS 协议要求） */
 
     uint64_t got = 0;
     uint64_t off = 0;
@@ -50,7 +51,7 @@ static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
 
         /* 发送 READ_AT 请求到 FS_PORT（目标端口填在 msgh_remote_port） */
         mach_msg_header_t *h = (mach_msg_header_t *)req;
-        h->msgh_size       = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_read_at_req_t) + (uint32_t)pathlen);
+        h->msgh_size       = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_read_at_req_t) + (uint32_t)pathlen + 1);
         h->msgh_remote_port = FS_PORT;
         h->msgh_local_port  = MY_PORT;
         h->msgh_id         = FS_MSG_READ_AT;

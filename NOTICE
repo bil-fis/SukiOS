@@ -136,4 +136,81 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
 ------------------------------------------------------------------------------
 
 
+------------------------------------------------------------------------------
+5. Resource Han Rounded（资源圆体）/ ResourceHanRoundedCN-Medium.ttf
+   路径:      resources/ResourceHanRoundedCN-Medium.ttf
+   上游:      https://github.com/CyanoHao/Resource-Han-Rounded
+   作者:      Cyano Hao（基于 Source Han Sans / 思源黑体 改造）
+   许可证:    SIL Open Font License 1.1（OFL-1.1）
+   版权声明:
+       Copyright (c) 2021 Cyano Hao.
+       Resource Han Rounded is derived from Source Han Sans (Copyright
+       2014-2017 Adobe Systems Incorporated / Google Inc.), licensed
+       under the SIL Open Font License 1.1.
+
+       This Font Software is licensed under the SIL Open Font License,
+       Version 1.1. This license is copied below, and is also available
+       with a FAQ at: http://scripts.sil.org/OFL
+
+       -----------------------------------------------------------
+       SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+       -----------------------------------------------------------
+       PREAMBLE
+       The goals of the Open Font License (OFL) are to stimulate
+       worldwide development of collaborative font projects, to support
+       the font creation efforts of academic and linguistic communities,
+       and to provide a free and open framework in which fonts may be
+       shared and improved in partnership with others.
+
+       PERMISSION & CONDITIONS
+       Permission is hereby granted, free of charge, to any person
+       obtaining a copy of the Font Software, to use, study, copy,
+       merge, embed, modify, redistribute, and sell modified and
+       unmodified copies of the Font Software, subject to the following
+       conditions:
+
+       1) Neither the Font Software nor any of its individual components,
+          in Original or Modified Versions, may be sold by itself.
+       2) Original or Modified Versions of the Font Software may be
+          bundled, redistributed and/or sold with any software, provided
+          that each copy contains the above copyright notice and this
+          license. (The Font Software may be included in a larger
+          software distribution without being redistributed alone.)
+       3) No Modified Version of the Font Software may use the Reserved
+          Font Name(s) unless explicit written permission is granted by
+          the Copyright Holder.
+       4) The Font Software, modified or unmodified, in part or in whole,
+          must be distributed entirely under this license, and must not
+          be distributed under any other license.
+       5) The Font Software may be embedded in documents and may be
+          embedded in applications and hardware devices, provided that
+          embedding does not allow easy extraction and/or redistribution
+          of the Font Software for use outside of the embedding context.
+       6) The copyright notices within the Font Software and this license
+          are retained in all copies, including Modified Versions.
+
+       TERMINATION
+       This license becomes null and void if any of the above conditions
+       are not met.
+
+       DISCLAIMER
+       THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+       KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY
+       WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE
+       AND NONINFRINGEMENT OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER
+       RIGHT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
+       CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL,
+       INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN
+       ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE
+       USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS
+       IN THE FONT SOFTWARE.
+
+   附加说明:
+       本字体将作为 SukiOS 图形用户界面的界面字体（UI 字形）。OFL-1.1
+       与 GPL-3.0 兼容，可随本仓库的二进制形式一并再分发；再分发时须
+       保留本版权声明与 OFL-1.1 许可条款，且不得使用保留字体名（"Resource
+       Han Rounded" 等）命名任何修改版本，除非取得版权人书面许可。
+------------------------------------------------------------------------------
+
+
 本 NOTICE 文件应随本仓库的源代码与二进制分发一并提供。

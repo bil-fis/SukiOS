@@ -30,32 +30,42 @@ static void upcase_path(char *s)
 }
 
 /* 经 FS_SERVER 读取整个文件到 out（out 由调用方分配，cap 为容量）。
- * 返回实际读取字节数，失败返回 0。 */
+ * 返回实际读取字节数，失败返回 0。
+ *
+ * 消息布局必须严格为：mach_msg_header_t(24B) + fs_read_at_req_t(8B) + NUL 结尾文件名。
+ * FS_SERVER 端以 payload = reqbuf + sizeof(mach_msg_header_t) 解析，故请求结构体的
+ * 第一个成员必须是 mach_msg_header_t（与 playaudio.c 一致）。早期版本把
+ * fs_read_at_req_t 直接放在缓冲开头，导致 FS 端 fname 偏移错位读到空串
+ * （f_open("0:") -> FR_INVALID_NAME），是 BMPLOADER 一直 FS error 的根因。 */
+typedef struct {
+    mach_msg_header_t  h;
+    fs_read_at_req_t   r;
+    char               name[FS_PATH_MAX];
+} fs_read_at_msg_t;
+
 static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
 {
-    char req[FS_PATH_MAX + sizeof(fs_read_at_req_t)];
     uint64_t pathlen = 0;
     while (path[pathlen]) pathlen++;
 
-    fs_read_at_req_t *r = (fs_read_at_req_t *)req;
-    r->offset = 0;
-    r->length = FS_DATA_MAX;
-    for (uint64_t i = 0; i < pathlen; i++) req[sizeof(fs_read_at_req_t) + i] = path[i];
-    req[sizeof(fs_read_at_req_t) + pathlen] = '\0';   /* 文件名必须以 NUL 结尾（FS 协议要求） */
+    static fs_read_at_msg_t req;   /* 静态缓冲，避免大栈；结构体内存布局正确 */
+    for (uint64_t i = 0; i < pathlen; i++) req.name[i] = path[i];
+    req.name[pathlen] = '\0';      /* 文件名必须 NUL 结尾（FS 协议要求） */
 
     uint64_t got = 0;
     uint64_t off = 0;
     for (;;) {
-        r->offset = off;
-        if (r->length > FS_DATA_MAX) r->length = FS_DATA_MAX;
+        req.r.offset = (uint32_t)off;
+        req.r.length = FS_DATA_MAX;
 
         /* 发送 READ_AT 请求到 FS_PORT（目标端口填在 msgh_remote_port） */
-        mach_msg_header_t *h = (mach_msg_header_t *)req;
-        h->msgh_size       = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_read_at_req_t) + (uint32_t)pathlen + 1);
-        h->msgh_remote_port = FS_PORT;
-        h->msgh_local_port  = MY_PORT;
-        h->msgh_id         = FS_MSG_READ_AT;
-        if (mach_msg_send(req, h->msgh_size) != 0) {
+        req.h.msgh_bits        = 0;
+        req.h.msgh_size        = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_read_at_req_t) + (uint32_t)pathlen + 1);
+        req.h.msgh_remote_port = FS_PORT;
+        req.h.msgh_local_port  = MY_PORT;
+        req.h.msgh_id          = FS_MSG_READ_AT;
+        req.h.msgh_reserved    = 0;
+        if (mach_msg_send(&req, req.h.msgh_size) != 0) {
             u_print("bmploader: FS send failed\n");
             return 0;
         }

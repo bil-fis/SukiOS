@@ -91,6 +91,10 @@ USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include
 USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
+                  $(BUILD)/user/lib/errno.c.o $(BUILD)/user/lib/string.c.o \
+                  $(BUILD)/user/lib/stdlib.c.o $(BUILD)/user/lib/stdio.c.o \
+                  $(BUILD)/user/lib/unistd.c.o $(BUILD)/user/lib/time.c.o \
+                  $(BUILD)/user/lib/syscalls.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o
 
 # FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接

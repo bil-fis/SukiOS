@@ -388,12 +388,19 @@ static int64_t sys_brk(uint64_t addr)
         /* 扩展：VMA 已覆盖整块堆区，按需补页由 #PF 完成，此处只需移动断点 */
         t->brk = addr;
     } else if (addr < t->brk) {
-        /* 收缩：释放 [页对齐上界(addr), 页对齐上界(brk)) 之间的页 */
-        uint64_t new_end = (addr + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
-        uint64_t old_end = (t->brk + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
-        if (old_end > new_end) {
-            vma_unmap_range(t, new_end, old_end);
-        }
+        /* 收缩：仅移动断点，不裁剪 VMA、不回收物理页。
+         *
+         * 原实现会对 [页对齐上界(addr), 页对齐上界(brk)) 调用 vma_unmap_range
+         * 把这段区间从 VMA 链表永久裁掉。但 sys_brk 增长分支只更新 t->brk、
+         * 并不重建被裁掉的 VMA 子区间，于是「先缩回、再增长到已裁区间」后，
+         * 该区间已脱离 VMA，用户态任何访问都触 #PF 杀进程（即使地址仍在
+         * 登记过的 [brk_start, brk_start+MAX) 大区间内）。
+         *
+         * POSIX 仅要求 brk 断点可移动，是否立即回收物理页是实现细节；本系统
+         * 选择「惰性保留」：VMA 在首次 sys_brk(0) 时已一次性登记整块堆区，
+         * 其后收缩只动断点、增长只动断点，VMA 始终完整覆盖 [base, base+MAX)，
+         * 用户态补页（demand zero-fill）始终有效。物理页在进程退出时由
+         * vma_destroy_all 统一回收，无泄漏。 */
         t->brk = addr;
     }
     return (int64_t)t->brk;

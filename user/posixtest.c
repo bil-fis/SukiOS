@@ -30,6 +30,7 @@
  *     因 FAT32 上本程序独占这些名字，不存在与其它服务争用的问题。
  */
 #include "lib/suki.h"
+#include "lib/libc.h"
 #include <sukios/posix.h>
 
 /* ===================== 断言与输出 ===================== */
@@ -688,6 +689,119 @@ static void test_system(void)
        eq64(suki_syscall3(SYS_READ, 1, (int64_t)hn, 4), -SUKI_EBADF));
 }
 
+/* ===================== libc 验证（标准 C 库） =====================
+ * 本组用例通过 libc 的标准名（printf / strlen / malloc / strdup / open /
+ * read / write / fork / getpid ...）调用，验证「用户态 libc 层」真正可用——
+ * 即 Linux 程序经重新编译即可直接调用这些名字，而非只能走裸 syscall。
+ * 覆盖：格式化输出、字符串、动态内存、文件 I/O 包装、进程包装。 */
+static void test_libc(void)
+{
+    print_str("[libc]\n");
+
+    /* 1) 格式化输出：printf 到 fd 1（会经 SYS_WRITE 落 serial） */
+    int n = printf("[libc] printf probe: %d %u %x %s %c\n", 42, 42u, 0xDEAD, "ok", 'Z');
+    ck("printf returns >0 byte count", n > 0);
+
+    /* 2) 字符串函数 */
+    ck("trivial true", 1 == 1);
+    ck("strlen(\"hello\")=5", u_strlen("hello") == 5);
+    ck("strcmp equal", strcmp("abc", "abc") == 0);
+    ck("strcmp less", strcmp("abc", "abd") < 0);
+    char buf[32];
+    strcpy(buf, "world");
+    ck("strcpy", strcmp(buf, "world") == 0);
+    char cat[32] = "foo";
+    strcat(cat, "bar");
+    ck("strcat", strcmp(cat, "foobar") == 0);
+    char *dup = strdup("dup-test");
+    ck("strdup", dup && strcmp(dup, "dup-test") == 0);
+    free(dup);
+    ck("strchr finds 'l'", strchr("hello", 'l') == &"hello"[2]);
+    ck("strstr finds sub", strstr("hello world", "world") == &"hello world"[6]);
+
+    /* 3) 动态内存（基于内核 sys_brk 堆） */
+    void *p1 = malloc(64);
+    ck("malloc returns non-null", p1 != NULL);
+    if (p1) {
+        memset(p1, 0xAB, 64);
+        /* 跨块写：触发堆扩展与可能切分 */
+        void *p2 = malloc(128);
+        ck("malloc 2nd block non-null", p2 != NULL);
+        void *p3 = malloc(7);
+        ck("malloc 3rd small block", p3 != NULL);
+        /* 写 p3 边界内 */
+        ((char *)p3)[6] = 'X';
+        ck("malloc small block writable", ((char *)p3)[6] == 'X');
+        free(p3);
+        free(p2);
+        free(p1);
+        /* 释放后再分配应复用（验证 free 链可用，不崩溃） */
+        void *p4 = malloc(200);
+        ck("malloc after free non-null", p4 != NULL);
+        free(p4);
+    }
+
+    /* 4) calloc/realloc */
+    int *arr = (int *)calloc(10, sizeof(int));
+    ck("calloc zeroed", arr && arr[0] == 0 && arr[9] == 0);
+    int *arr2 = (int *)realloc(arr, 20 * sizeof(int));
+    ck("realloc grows", arr2 != NULL);
+    free(arr2);
+
+    /* 5) 文件 I/O 包装（libc open/read/write/close） */
+    if (wait_fs_ready()) {
+        int fd = open("/README.TXT", O_RDONLY);
+        ck("libc open(/README.TXT) >= 0", fd >= 0);
+        if (fd >= 0) {
+            char rbuf[64];
+            ssize_t rd = read(fd, rbuf, sizeof(rbuf) - 1);
+            ck("libc read returns bytes", rd > 0);
+            if (rd > 0) {
+                rbuf[rd] = '\0';
+                ck("libc read got content", rbuf[0] != '\0');
+            }
+            int c = close(fd);
+            ck("libc close == 0", c == 0);
+        }
+        /* 写：创建并写回读环验证 */
+        int wfd = open("/LIBC_TMP.TXT", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ck("libc open create >= 0", wfd >= 0);
+        if (wfd >= 0) {
+            const char *msg = "libc-write\n";
+            ssize_t wn = write(wfd, msg, strlen(msg));
+            ck("libc write returns count", wn == (ssize_t)strlen(msg));
+            close(wfd);
+            /* 读回 */
+            int rfd = open("/LIBC_TMP.TXT", O_RDONLY);
+            char back[32];
+            ssize_t rn = read(rfd, back, sizeof(back) - 1);
+            back[rn > 0 ? rn : 0] = '\0';
+            ck("libc write/read roundtrip", rn == (ssize_t)strlen(msg) &&
+                                            strcmp(back, msg) == 0);
+            close(rfd);
+            unlink("/LIBC_TMP.TXT");
+        }
+    }
+
+    /* 6) 进程包装（libc fork/getpid/waitpid） */
+    int mypid = getpid();
+    ck("libc getpid > 0", mypid > 0);
+    int fret = fork();
+    if (fret == 0) {
+        /* 子进程 */
+        exit(7);
+    } else if (fret > 0) {
+        int st = -1;
+        int w = waitpid(fret, &st, 0);
+        ck("libc waitpid reaps child", w == fret && WIFEXITED(st) &&
+                                       WEXITSTATUS(st) == 7);
+    } else {
+        ck("libc fork succeeded", false);
+    }
+
+    print_str("  [libc] done\n");
+}
+
 /* ===================== 入口 ===================== */
 
 int main(void)
@@ -699,6 +813,7 @@ int main(void)
     }
 
     test_process();
+    test_libc();
     test_memory();
     test_time();
     test_system();

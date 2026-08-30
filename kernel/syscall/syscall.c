@@ -29,6 +29,7 @@
 #include <kernel/percpu.h>   /* cpu_index()/MAX_CPUS：H8 per-CPU syscall 缓冲 */
 #include <kernel/posix.h>    /* posix_dispatch()：完整 POSIX 系统调用层 */
 #include <kernel/fd.h>       /* fd_exit_task()：任务退出时释放其 fd 表 */
+#include <kernel/mouse.h>    /* mouse_get_packet()：SYS_MOUSE_READ 内核采集层 */
 
 /* ---- 用户指针校验（A1 项）----
  * 合法用户区间：[0, USER_SPACE_TOP]，且 [ptr, ptr+n) 不得回绕/越界；
@@ -242,6 +243,22 @@ static uint64_t sys_input_read(void)
 {
     int sc = keyboard_get_scancode();
     return (sc < 0) ? (uint64_t)-1 : (uint64_t)sc;
+}
+
+/* 204: sys_mouse_read —— 非阻塞取一个解析后的鼠标事件；无数据返回 (uint64_t)-1。
+ *   a1 = 用户态 mouse_packet_t*（内核填 dx/dy/buttons/wheel 后 copy_to_user 写回）。
+ *   成功返回 0，指针非法返回 (uint64_t)-1。事件由内核 IRQ12 采集、syscall 派发，
+ *   用户态鼠标驱动（Ring3 .kdr）经此拉包，绝不直接访问 0x60（红线：Ring3 无 IO 权限）。 */
+static uint64_t sys_mouse_read(uint64_t a1)
+{
+    mouse_packet_t pkt;
+    if (!mouse_get_packet(&pkt)) {
+        return (uint64_t)-1;          /* 无事件 */
+    }
+    if (!copy_to_user((void *)a1, &pkt, sizeof(pkt))) {
+        return (uint64_t)-1;          /* 用户指针非法 */
+    }
+    return 0;
 }
 
 /* 16: sys_serial_read —— 非阻塞读 COM1 控制台输入；无数据返回 (uint64_t)-1，
@@ -918,6 +935,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_YIELD:       return sys_yield();
     case SYS_DEBUG_WRITE: return sys_debug_write(a1, a2);
     case SYS_INPUT_READ:  return sys_input_read();
+    case SYS_MOUSE_READ:  return sys_mouse_read(a1);
     case SYS_REBOOT:      return sys_reboot(a1);
     case SYS_PORT_CLAIM:  return sys_port_claim(a1);
     case SYS_EXECVE:      return sys_execve(a1, a2, a3);

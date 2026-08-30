@@ -29,6 +29,7 @@ typedef struct registers {
 #define IRQ_BASE   32
 #define IRQ0       32   /* PIT 定时器 */
 #define IRQ1       33   /* PS/2 键盘 */
+#define IRQ12      44   /* PS/2 鼠标（辅助设备，GSI12 -> 向量 44） */
 
 typedef void (*isr_handler_t)(registers_t *);
 

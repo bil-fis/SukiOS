@@ -26,6 +26,14 @@
  * 此处集中定义，避免与内核侧漂移。 */
 #define DISP_MSG_TEXT 1
 
+/* 鼠标事件消息 id（与 user/mouse_server.c 中定义保持一致；鼠标驱动经
+ * DISPLAY_PORT 把光标事件发给显示服务，由本服务统一渲染）。 */
+#define MOUSE_MSG_MOVE   1
+#define MOUSE_MSG_BUTTON 2
+#define MOUSE_MSG_WHEEL  3
+#define MOUSE_CURSOR_W 12
+#define MOUSE_CURSOR_H 18
+
 /*
  * fb_map_result_t —— 必须与内核 include/kernel/framebuffer.h 的 fb_map_result_t
  * **逐字节布局一致**（结构体 ABI 跨特权边界传递，错位会导致 width/height/pitch
@@ -312,6 +320,85 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r
     }
 }
 
+/*
+ * 鼠标光标（Ring3 绘制，来自 mouse_server 经 DISPLAY_PORT 发的 MOUSE_MSG_*）。
+ * 采用像素快照法：保存光标覆盖区域的背景，绘制前先恢复旧位置背景再画新位置，
+ * 避免擦除破坏桌面/终端像素。光标为 12x18 简易箭头（xRGB32）。
+ */
+static int32_t  g_cur_x = -MOUSE_CURSOR_W;   /* 当前光标左上角（初始隐藏） */
+static int32_t  g_cur_y = -MOUSE_CURSOR_H;
+static bool     g_cur_visible = false;
+static uint32_t g_cur_bg[MOUSE_CURSOR_W * MOUSE_CURSOR_H];
+
+/* 12x18 光标位图：1=前景(白)，0=透明(取背景) */
+static const uint8_t g_cursor_mask[MOUSE_CURSOR_H][MOUSE_CURSOR_W] = {
+    {1,0,0,0,0,0,0,0,0,0,0,0},
+    {1,1,0,0,0,0,0,0,0,0,0,0},
+    {1,1,1,0,0,0,0,0,0,0,0,0},
+    {1,1,1,1,0,0,0,0,0,0,0,0},
+    {1,1,1,1,1,0,0,0,0,0,0,0},
+    {1,1,1,1,1,1,0,0,0,0,0,0},
+    {1,1,1,1,1,1,1,0,0,0,0,0},
+    {1,1,1,1,1,1,1,1,0,0,0,0},
+    {1,1,1,1,1,1,1,1,1,0,0,0},
+    {1,1,1,1,1,1,1,1,1,1,0,0},
+    {1,1,1,1,1,1,1,1,1,1,1,0},
+    {1,1,1,1,1,1,1,1,1,1,1,1},
+    {1,1,1,1,1,1,1,1,1,1,0,0},
+    {1,1,1,1,1,1,1,1,0,0,0,0},
+    {1,1,1,1,1,1,0,0,0,0,0,0},
+    {1,1,1,1,1,0,0,0,0,0,0,0},
+    {1,1,1,0,0,0,0,0,0,0,0,0},
+    {1,1,0,0,0,0,0,0,0,0,0,0},
+};
+
+static void cursor_restore_bg(void)
+{
+    if (!g_cur_visible) {
+        return;
+    }
+    for (int32_t j = 0; j < MOUSE_CURSOR_H; j++) {
+        for (int32_t i = 0; i < MOUSE_CURSOR_W; i++) {
+            int32_t x = g_cur_x + i;
+            int32_t y = g_cur_y + j;
+            if (x < 0 || y < 0 || (uint32_t)x >= g_fb_width || (uint32_t)y >= g_fb_height)
+                continue;
+            put_px((uint32_t)x, (uint32_t)y, g_cur_bg[j * MOUSE_CURSOR_W + i]);
+        }
+    }
+    g_cur_visible = false;
+}
+
+static void cursor_draw(int32_t nx, int32_t ny)
+{
+    /* 越界保护：clamp 到屏幕内 */
+    if (nx < 0) nx = 0;
+    if (ny < 0) ny = 0;
+    if (nx + MOUSE_CURSOR_W > (int32_t)g_fb_width)
+        nx = (int32_t)g_fb_width - MOUSE_CURSOR_W;
+    if (ny + MOUSE_CURSOR_H > (int32_t)g_fb_height)
+        ny = (int32_t)g_fb_height - MOUSE_CURSOR_H;
+
+    cursor_restore_bg();   /* 先恢复旧位置背景 */
+
+    /* 快照新位置背景并绘制前景 */
+    for (int32_t j = 0; j < MOUSE_CURSOR_H; j++) {
+        for (int32_t i = 0; i < MOUSE_CURSOR_W; i++) {
+            int32_t x = nx + i;
+            int32_t y = ny + j;
+            if ((uint32_t)x >= g_fb_width || (uint32_t)y >= g_fb_height)
+                continue;
+            g_cur_bg[j * MOUSE_CURSOR_W + i] = g_fb[y * (g_fb_pitch / 4) + x];
+            if (g_cursor_mask[j][i]) {
+                put_px((uint32_t)x, (uint32_t)y, 0x00FFFFFF); /* 白色箭头 */
+            }
+        }
+    }
+    g_cur_x = nx;
+    g_cur_y = ny;
+    g_cur_visible = true;
+}
+
 /* 画一个 8x8 字形的 2x 放大版本（左上角 ox,oy） */
 static void draw_glyph(uint32_t ox, uint32_t oy, uint8_t ch, uint32_t fg)
 {
@@ -456,8 +543,17 @@ int main(void)
     /* 5) 刷内核启动日志到桌面终端窗口 */
     drain_console_pipe();
 
-    /* 6) 进入消息循环：接收经 DISPLAY_PORT 转发的文本并渲染 */
+    /* 6) 进入消息循环：接收经 DISPLAY_PORT 转发的文本与鼠标事件并渲染 */
     static uint8_t msgbuf[512];
+    /* 鼠标事件消息布局（与 user/mouse_server.c 的 mouse_event_msg_t 一致） */
+    typedef struct {
+        mach_msg_header_t h;
+        int32_t  x;
+        int32_t  y;
+        uint8_t  buttons;
+        int8_t   wheel;
+        uint8_t  _pad[3];
+    } mouse_event_msg_t;
     for (;;) {
         uint64_t r = mach_msg_recv(msgbuf, sizeof(msgbuf), DISPLAY_PORT);
         if (r == 0) {
@@ -465,6 +561,17 @@ int main(void)
             if (h->msgh_id == DISP_MSG_TEXT) {
                 char *text = (char *)msgbuf + sizeof(mach_msg_header_t);
                 term_puts(text);
+            } else if (h->msgh_id == MOUSE_MSG_MOVE ||
+                       h->msgh_id == MOUSE_MSG_BUTTON ||
+                       h->msgh_id == MOUSE_MSG_WHEEL) {
+                mouse_event_msg_t *m = (mouse_event_msg_t *)msgbuf;
+                /* 按钮状态：左键按下时画红色光标提示，否则白色（视觉反馈） */
+                cursor_draw(m->x, m->y);
+                if (m->buttons & 1) {
+                    /* 左键按下：在光标尖端画一小红点（简单反馈） */
+                    if ((uint32_t)m->x < g_fb_width && (uint32_t)m->y < g_fb_height)
+                        put_px((uint32_t)m->x, (uint32_t)m->y, 0x00FF3030);
+                }
             }
         }
         sys_yield();

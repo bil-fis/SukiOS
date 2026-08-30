@@ -614,8 +614,12 @@ typedef struct suki_fd_set {
  *        a2 = 宽（像素），a3 = 高（像素），a4 = 目标 x，a5 = 目标 y；
  *   返回 0 成功，非法参数/指针返回 (uint64_t)-1。单次 blit 上限 4MiB 像素字节。 */
 #define SYS_DISPLAY_BLIT    203
+/* 204: sys_mouse_read —— 非阻塞取一个解析后的鼠标事件；无数据返回 (uint64_t)-1。
+ *    a1 = 用户态 mouse_packet_t*（内核填 dx/dy/buttons/wheel 后 copy_to_user 写回）；
+ *    成功返回 0，失败（指针非法）返回 (uint64_t)-1。事件语义见 kernel/mouse.h。 */
+#define SYS_MOUSE_READ      204
 
-#define SYSCALL_MAX         203
+#define SYSCALL_MAX         204
 
 /* ========================================================================== */
 /*  六、每进程资源上限（内核 fd 表规模等）                                     */

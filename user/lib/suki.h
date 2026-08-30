@@ -34,6 +34,7 @@
 #define SHELL_PORT      6
 #define FS_REPLY_PORT   7
 #define APP_PORT        8               /* 独立 app 可认领的通用应答端口 */
+#define MOUSE_PORT      9               /* Ring3 鼠标驱动 -> 显示服务 的光标事件端口 */
 
 typedef struct mach_msg_header {
     uint32_t msgh_bits;
@@ -240,6 +241,16 @@ static inline int sys_munmap_posix(void *addr, uint64_t len)
 static inline long sys_serial_read(void)
 {
     return (long)suki_syscall5(SYS_SERIAL_READ, 0, 0, 0, 0, 0);
+}
+
+/*
+ * 非阻塞读鼠标事件：成功返回 0 并把事件填入 *pkt（dx/dy/buttons/wheel），
+ * 无事件返回 -1，指针非法返回 -1。供 Ring3 鼠标驱动（.kdr 形态）拉取内核
+ * 经 IRQ12 采集的鼠标包。事件语义见 <kernel/mouse.h> 的 mouse_packet_t。
+ */
+static inline long sys_mouse_read(void *pkt)
+{
+    return (long)suki_syscall5(SYS_MOUSE_READ, (uint64_t)pkt, 0, 0, 0, 0);
 }
 
 static inline uint64_t mach_msg_send(void *msg, uint32_t size)

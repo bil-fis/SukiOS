@@ -63,6 +63,7 @@ extern const uint8_t user_input_server_start[], user_input_server_end[];
 extern const uint8_t user_display_server_start[], user_display_server_end[];
 extern const uint8_t user_shell_start[], user_shell_end[];
 extern const uint8_t user_posixtest_start[], user_posixtest_end[];
+extern const uint8_t user_mouse_server_start[], user_mouse_server_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -237,6 +238,9 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     sched_init();
 
     keyboard_init(); /* 经 I/O APIC GSI1 -> IRQ1 */
+    /* P0 鼠标驱动（Ring3 .kdr 形态，内核态采集经 IRQ12 经 sys_mouse_read 派发） */
+    extern bool mouse_init(void);
+    mouse_init();    /* 经 I/O APIC GSI12 -> IRQ12 */
     interrupts_enable();
 
     /* ---- 阶段六：syscall + Ring3 ---- */
@@ -390,6 +394,12 @@ static void boot_late_init(void *arg)
     task_create_user(user_display_server_start,
                      (size_t)(user_display_server_end - user_display_server_start),
                      "display-server");
+    /* Ring3 鼠标驱动（.kdr 形态，待 kdr 加载器就绪后改由加载器动态装载）。
+     * 经 SYS_MOUSE_READ 拉取内核 IRQ12 采集的鼠标包，把光标事件经 DISPLAY_PORT
+     * 发给 display-server 渲染。 */
+    task_create_user(user_mouse_server_start,
+                     (size_t)(user_mouse_server_end - user_mouse_server_start),
+                     "mouse-server");
     /* TODO(P0 后续里程碑)：显示层就绪后，再 spawn shell；届时 shell 可经
      * SYS_CONSOLE_READ 取回内核启动日志并渲染到显示服务的终端窗口。*/
     task_create_user(user_shell_start,

@@ -21,7 +21,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "lib/suki.h"
-#include "kernel/font.h"
 
 /* 显示服务消息 id（内核 console.c 的 user_puts 转发文本时须用同一值）。
  * 此处集中定义，避免与内核侧漂移。 */
@@ -345,6 +344,13 @@ static void term_putc(char c)
     else if (c == '\b') {
         if (g_term_x > 0) g_term_x--;
         else if (g_term_y > 0) { g_term_y--; g_term_x = g_term_cols - 1; }
+        else return;   /* 已在左上角，无法再退 */
+        /* 退格除了移动光标，还要清除被删位置的像素，否则旧字符会残留在屏幕上。
+         * 即使上层发送 "\b \b" 序列（空格负责清除），此处主动清格也无害且更健壮
+         * （单发 \b 时也能正确清屏）。 */
+        uint32_t px = CON_MARGIN + g_term_x * CHAR_W;
+        uint32_t py = TITLE_H + CON_MARGIN + g_term_y * CHAR_H;
+        fill_rect(px, py, CHAR_W, CHAR_H, COL_WINBG);
         return;
     }
     else {

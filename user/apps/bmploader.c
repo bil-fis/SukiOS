@@ -29,8 +29,8 @@ static void upcase_path(char *s)
     }
 }
 
-/* 经 FS_SERVER 读取整个文件到 out（out 由调用方分配，cap 为容量）。
- * 返回实际读取字节数，失败返回 0。
+/* 从文件指定 offset 读取 len 字节到 out（流式逐段读取，不要求一次性缓冲）。
+ * 返回实际读取字节数，失败或不满 len 返回已读量（EOF 时 < len）。
  *
  * 消息布局必须严格为：mach_msg_header_t(24B) + fs_read_at_req_t(8B) + NUL 结尾文件名。
  * FS_SERVER 端以 payload = reqbuf + sizeof(mach_msg_header_t) 解析，故请求结构体的
@@ -43,7 +43,7 @@ typedef struct {
     char               name[FS_PATH_MAX];
 } fs_read_at_msg_t;
 
-static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
+static uint64_t fs_read_range(const char *path, uint64_t off, uint8_t *out, uint64_t want)
 {
     uint64_t pathlen = 0;
     while (path[pathlen]) pathlen++;
@@ -53,16 +53,10 @@ static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
     req.name[pathlen] = '\0';      /* 文件名必须 NUL 结尾（FS 协议要求） */
 
     uint64_t got = 0;
-    uint64_t off = 0;
-    for (;;) {
-        req.r.offset = (uint32_t)off;
-        req.r.length = FS_DATA_MAX;
-
-        if (off == 0 || (off % (FS_DATA_MAX * 100)) == 0) {
-            u_print("bmploader: req off=");
-            { char d[24]; u_print(u_utoa_s(off, d, sizeof(d))); }
-            u_print("\n");
-        }
+    while (got < want) {
+        uint32_t chunk = (uint32_t)((want - got > FS_DATA_MAX) ? FS_DATA_MAX : (want - got));
+        req.r.offset = (uint32_t)(off + got);
+        req.r.length = chunk;
 
         /* 发送 READ_AT 请求到 FS_PORT（目标端口填在 msgh_remote_port） */
         req.h.msgh_bits        = 0;
@@ -73,57 +67,56 @@ static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
         req.h.msgh_reserved    = 0;
         if (mach_msg_send(&req, req.h.msgh_size) != 0) {
             u_print("bmploader: FS send failed\n");
-            return 0;
+            return got;
         }
 
         /* 接收应答 */
         uint8_t resp[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + FS_DATA_MAX];
         if (mach_msg_recv(resp, sizeof(resp), MY_PORT) != 0) {
             u_print("bmploader: FS recv failed\n");
-            return 0;
+            return got;
         }
         fs_resp_t *fr = (fs_resp_t *)(resp + sizeof(mach_msg_header_t));
         if (fr->status != 0) {
             u_print("bmploader: FS error status=");
             { char d[16]; u_print(u_utoa_s((uint64_t)fr->status, d, sizeof(d))); }
             u_print("\n");
-            return 0;
+            return got;
         }
         uint8_t *data = resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t);
-        {
-            char d1[24], d2[24];
-            u_print("bmploader: got ");
-            u_print(u_utoa_s((uint64_t)fr->length, d1, sizeof(d1)));
-            u_print(" total=");
-            u_print(u_utoa_s(got, d2, sizeof(d2)));
-            u_print("\n");
-        }
         if (fr->length == 0) break;                 /* EOF */
-        if (got + fr->length > cap) {               /* 超出容量 */
-            u_print("bmploader: file too large for buffer\n");
-            return 0;
-        }
         for (uint32_t i = 0; i < fr->length; i++) out[got + i] = data[i];
         got += fr->length;
-        off += fr->length;
-        if (fr->length < FS_DATA_MAX) break;        /* 最后一包 */
+        if (fr->length < chunk) break;              /* 实际读到的少于请求（EOF） */
     }
     return got;
 }
 
-/* BMP 解析与显示。返回 0 成功。 */
-static int show_bmp(const uint8_t *buf, uint64_t size)
+/* 预先读取文件头 54 字节以解析 BMP 尺寸；然后再逐行流式读取像素并即时 blit，
+ * 避免一次性把数 MB 文件读入内存（支持任意大图、进度可见、内存恒定一行）。 */
+
+/* BMP 流式解析与显示：先读 54 字节头，再逐行流式读取像素并即时 blit 到屏幕。
+ * 内存占用恒定（仅一行像素缓冲），支持任意大图，图像逐行出现（进度可见）。
+ * 返回 0 成功。 */
+static int show_bmp(const char *path)
 {
-    if (size < 54) { u_print("bmploader: file too small\n"); return -1; }
-    if (buf[0] != 'B' || buf[1] != 'M') { u_print("bmploader: not a BMP\n"); return -1; }
+    uint8_t hdr[54];
+    if (fs_read_range(path, 0, hdr, 54) < 54) {
+        u_print("bmploader: cannot read BMP header\n");
+        return -1;
+    }
+    if (hdr[0] != 'B' || hdr[1] != 'M') {
+        u_print("bmploader: not a BMP\n");
+        return -1;
+    }
 
     /* BITMAPFILEHEADER: data offset at 0x0A (4B) */
-    uint32_t data_off = *(const uint32_t *)(buf + 10);
+    uint32_t data_off = *(const uint32_t *)(hdr + 10);
     /* BITMAPINFOHEADER: width @0x12, height @0x16, bpp @0x1C, compression @0x1E */
-    int32_t w = *(const int32_t *)(buf + 18);
-    int32_t h = *(const int32_t *)(buf + 22);
-    uint16_t bpp = *(const uint16_t *)(buf + 28);
-    uint32_t compression = *(const uint32_t *)(buf + 30);
+    int32_t w = *(const int32_t *)(hdr + 18);
+    int32_t h = *(const int32_t *)(hdr + 22);
+    uint16_t bpp = *(const uint16_t *)(hdr + 28);
+    uint32_t compression = *(const uint32_t *)(hdr + 30);
 
     u_print("bmploader: BMP w=");
     { char d[16]; u_print(u_utoa_s(w, d, sizeof(d))); }
@@ -137,56 +130,72 @@ static int show_bmp(const uint8_t *buf, uint64_t size)
         u_print("bmploader: unsupported BMP format\n");
         return -1;
     }
-    if ((uint64_t)data_off + (uint64_t)w * h * (bpp / 8) > size) {
-        u_print("bmploader: truncated pixel data\n");
+    if (data_off < 54) {
+        u_print("bmploader: bad data offset\n");
         return -1;
     }
 
     uint32_t bw = (uint32_t)w;
     uint32_t bh = (uint32_t)h;
-    /* 每行字节数（4 字节对齐） */
-    uint32_t row_bytes = ((bw * (bpp / 8) + 3) / 4) * 4;
-
-    /* 分配像素缓冲（xRGB32, 每像素 4B） */
-    uint32_t *pixels = (uint32_t *)sys_mmap((uint64_t)bw * bh * 4, SUKI_PROT_WRITE);
-    if (!pixels) { u_print("bmploader: oom\n"); return -1; }
-
-    const uint8_t *px = buf + data_off;
-    for (uint32_t row = 0; row < bh; row++) {
-        /* BMP 自下而上：文件第 row 行对应图像第 (bh-1-row) 行 */
-        const uint8_t *src = px + row * row_bytes;
-        uint32_t *dst = pixels + (bh - 1 - row) * bw;
-        for (uint32_t col = 0; col < bw; col++) {
-            uint8_t b, g, r;
-            if (bpp == 24) {
-                b = src[col * 3 + 0];
-                g = src[col * 3 + 1];
-                r = src[col * 3 + 2];
-            } else { /* 32bpp: BGRA */
-                b = src[col * 4 + 0];
-                g = src[col * 4 + 1];
-                r = src[col * 4 + 2];
-            }
-            /* xRGB32: (r<<16)|(g<<8)|b —— 与帧缓冲 [B][G][R][X] 内存布局一致 */
-            dst[col] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-        }
-    }
+    uint32_t row_bytes = ((bw * (bpp / 8) + 3) / 4) * 4;  /* 4 字节对齐 */
 
     int32_t dx = (int32_t)((SCREEN_W - bw) / 2);
     int32_t dy = (int32_t)((SCREEN_H - bh) / 2);
-    uint64_t rc = suki_syscall5(SYS_DISPLAY_BLIT,
-                                (uint64_t)pixels, bw, bh, (uint64_t)dx, (uint64_t)dy);
-    if (rc != 0) {
-        u_print("bmploader: blit failed\n");
-        sys_munmap(pixels, (uint64_t)bw * bh * 4);
-        return -1;
+
+    /* 一行像素缓冲（xRGB32, 4B/px），恒定大小，逐行复用 */
+    uint32_t *line = (uint32_t *)sys_mmap((uint64_t)bw * 4, SUKI_PROT_WRITE);
+    if (!line) { u_print("bmploader: oom\n"); return -1; }
+
+    uint8_t *raw = (uint8_t *)sys_mmap(row_bytes, SUKI_PROT_WRITE);
+    if (!raw) { u_print("bmploader: oom\n"); sys_munmap(line, (uint64_t)bw * 4); return -1; }
+
+    uint32_t rows_done = 0;
+    for (uint32_t row = 0; row < bh; row++) {
+        /* BMP 自下而上：文件第 row 行对应图像第 (bh-1-row) 行 */
+        uint64_t foff = (uint64_t)data_off + (uint64_t)row * row_bytes;
+        if (fs_read_range(path, foff, raw, row_bytes) < row_bytes) {
+            u_print("bmploader: truncated at row ");
+            { char d[16]; u_print(u_utoa_s(row, d, sizeof(d))); }
+            u_print("\n");
+            break;
+        }
+        for (uint32_t col = 0; col < bw; col++) {
+            uint8_t b, g, r;
+            if (bpp == 24) {
+                b = raw[col * 3 + 0];
+                g = raw[col * 3 + 1];
+                r = raw[col * 3 + 2];
+            } else { /* 32bpp: BGRA */
+                b = raw[col * 4 + 0];
+                g = raw[col * 4 + 1];
+                r = raw[col * 4 + 2];
+            }
+            /* xRGB32: (r<<16)|(g<<8)|b —— 与帧缓冲 [B][G][R][X] 内存布局一致 */
+            line[col] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+        /* 即时 blit 这一行到屏幕（居中）：屏幕目标行 = dy + (bh-1-row) */
+        int32_t ty = dy + (int32_t)(bh - 1 - row);
+        uint64_t rc = suki_syscall5(SYS_DISPLAY_BLIT,
+                                    (uint64_t)line, bw, 1, (uint64_t)dx, (uint64_t)ty);
+        if (rc != 0) {
+            u_print("bmploader: blit row failed\n");
+            break;
+        }
+        rows_done++;
     }
-    u_print("bmploader: displayed BMP at (");
+
+    u_print("bmploader: displayed ");
+    { char d[16]; u_print(u_utoa_s(rows_done, d, sizeof(d))); }
+    u_print("/");
+    { char d[16]; u_print(u_utoa_s(bh, d, sizeof(d))); }
+    u_print(" rows at (");
     { char d[16]; u_print(u_utoa_s(dx, d, sizeof(d))); }
     u_print(",");
     { char d[16]; u_print(u_utoa_s(dy, d, sizeof(d))); }
     u_print(")\n");
-    sys_munmap(pixels, (uint64_t)bw * bh * 4);
+
+    sys_munmap(line, (uint64_t)bw * 4);
+    sys_munmap(raw, row_bytes);
     return 0;
 }
 
@@ -212,25 +221,13 @@ int main(int argc, char **argv)
     upcase_path(path);
     u_print("bmploader: reading ");
     u_print(path);
-    u_print("\n");
+    u_print(" (streaming, row by row)\n");
 
-    /* 分配文件缓冲（BMP 通常较小；上限 8MiB） */
-    uint64_t cap = 8u * 1024u * 1024u;
-    uint8_t *file = (uint8_t *)sys_mmap(cap, SUKI_PROT_WRITE);
-    if (!file) { u_print("bmploader: oom(file)\n"); sys_exit(1); }
-
-    uint64_t n = fs_read_whole(path, file, cap);
-    if (n == 0) {
-        u_print("bmploader: cannot read file (fs/server not ready? path wrong?)\n");
-        sys_munmap(file, cap);
+    /* 流式读取：不一次性分配整文件缓冲，由 show_bmp 逐行读取并即时 blit */
+    if (show_bmp(path) != 0) {
+        u_print("bmploader: failed\n");
         sys_exit(1);
     }
-    u_print("bmploader: read ");
-    { char d[16]; u_print(u_utoa_s(n, d, sizeof(d))); }
-    u_print(" bytes\n");
-
-    show_bmp(file, n);
-    sys_munmap(file, cap);
     sys_exit(0);
     return 0;
 }

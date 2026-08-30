@@ -304,6 +304,7 @@ $(CONFIG_H): FORCE
 	@printf '#define _SUKI_BUILD_CONFIG_H\n'                     >> $@.tmp
 	@printf '#define CONFIG_SMP %s\n' '$(CONFIG_SMP)'            >> $@.tmp
 	@printf '#define CONFIG_DEBUG_SERIAL %s\n' '$(CONFIG_DEBUG_SERIAL)' >> $@.tmp
+	@printf '#define ATA_DEBUG %s\n' '$(CONFIG_DEBUG_SERIAL)'    >> $@.tmp
 	@printf '#endif /* _SUKI_BUILD_CONFIG_H */\n'                >> $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 

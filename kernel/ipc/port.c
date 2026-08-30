@@ -82,6 +82,15 @@ static inline void irq_restore(uint64_t f)
 static void port_block_and_yield(uint64_t f)
 {
     spin_unlock(&g_port_lock);
+    /* 诊断：阻塞前本 CPU 不应再持业务锁（preempt_count 必须=0，否则 schedule 会因
+     * 持锁保护跳过切换，任务无法让出 -> 忙等死循环）。此 WARN 仅在持锁失衡时触发，
+     * 用于捕获类似 ata_read_sectors DMA 成功路径漏解锁的回归。 */
+    extern uint32_t g_preempt_count[MAX_CPUS];
+    if (g_preempt_count[cpu_index()] != 0) {
+        serial_writestr("[ipc] WARN: block with preempt_count=");
+        serial_write_dec((uint64_t)g_preempt_count[cpu_index()]);
+        serial_writestr(" (possible lock leak)\n");
+    }
     schedule();
     if (f & (1UL << 9)) {
         __asm__ volatile("sti" ::: "memory");

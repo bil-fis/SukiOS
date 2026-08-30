@@ -37,6 +37,20 @@
 #include <ipc/port.h>
 #include <kernel/fd.h>       /* fd_exit_task / fd_install_stdio */
 
+/* 供 spinlock 死锁诊断打印持锁任务名（spinlock.h 声明，此处实现）。
+ * 仅返回当前 CPU 运行任务的名字，零副作用。 */
+const char *get_current_task_name(void)
+{
+    struct task *t = cpu_local()->current_task;
+    return t ? t->name : "?";
+}
+
+/* 持锁不可抢占计数（spinlock.h 声明）。
+ * 每个 CPU 独立计数：spin_lock 时 +1、spin_unlock 时 -1。schedule() 入口若本
+ * CPU 计数 >0，说明当前任务正持自旋锁，绝不切换（否则锁永释放导致死锁），仅置
+ * need_resched 推迟到最近一次 unlock 后的调度点。单核 MAX_CPUS=1，退化为单槽。 */
+uint32_t g_preempt_count[MAX_CPUS] = {0};
+
 /* 每任务内核栈大小与栈底哨兵：已上移至 mm/kstack.h（fork 需要同一套常量
  * 装配子进程内核栈，见 sys_posix.c::sys_fork 的说明）。 */
 #define MAX_TASKS       256
@@ -574,7 +588,29 @@ void schedule(void)
 {
     uint64_t f = spin_lock_irqsave(&g_sched_lock);
     uint32_t cpu = cpu_index();
+    /* g_preempt_count 由 spin_lock/spin_unlock 维护，本函数的 spin_lock_irqsave
+     * 已使其 +1（计入 g_sched_lock）。记录进入时总值，并把"本函数自身持锁"贡献
+     * 临时抵消，使下方检查只反映调用方任务切换前持有的【业务自旋锁】（如 ata 锁）。
+     * 若业务锁为 0，则 saved=1（仅 sched_lock），check=0 → 正常切换；
+     * 若业务锁为 1，则 saved=2，check=1 >0 → 跳过切换（置 need_resched）。
+     * 退出前必须将 g_preempt_count 还原为 saved，保持与 spin_unlock 的配平。 */
+    uint32_t saved_preempt = g_preempt_count[cpu];
+    if (saved_preempt) {
+        g_preempt_count[cpu] = saved_preempt - 1;
+    }
     task_t *cur = g_percpu[cpu].current_task;
+
+    /* 持锁不可抢占保护（P0 死锁根因修复）：
+     * 若本 CPU 当前任务仍持有任意业务自旋锁（g_preempt_count>0），绝不切换任务——
+     * 否则会把持锁任务切走、锁永不释放，后续请求者自旋 50M 次 panic（典型：
+     * disk-srv 持 'ata' 锁被 self-IPI 抢占）。此时只置 need_resched 标志，
+     * 推迟到最近一次 spin_unlock 后的调度点再真正切换。 */
+    if (g_preempt_count[cpu] > 0) {
+        g_percpu[cpu].need_resched = 1;
+        g_preempt_count[cpu] = saved_preempt;   /* 还原，保持与 spin_unlock 配平 */
+        spin_unlock_irqrestore(&g_sched_lock, f);
+        return;
+    }
 
     /* M7 修复：内核栈溢出守卫 */
     if (cur && cur->kstack_base) {
@@ -619,12 +655,14 @@ void schedule(void)
         g_percpu[cpu].user_switches++;   /* 负载均衡观测：本核跑了一次 Ring3 任务 */
     }
     g_percpu[cpu].current_task = next;
+    g_percpu[cpu].need_resched = 0;   /* 消费调度请求（持锁期间置位的延迟标志） */
     g_syscall_kstack[cpu] = next->kstack_top;
     g_scratch[cpu]        = &next->scr_rip;
     tss_set_rsp0(next->kstack_top);
 
     bool cr3_switch = (next->cr3 != cur->cr3);
     uint64_t next_cr3 = next->cr3;
+    g_preempt_count[cpu] = saved_preempt;   /* 还原，保持与 spin_unlock 配平 */
     spin_unlock_irqrestore(&g_sched_lock, f);
 
     if (cr3_switch) {

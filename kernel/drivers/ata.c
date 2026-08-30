@@ -22,6 +22,26 @@
 #include <ipc/disk_proto.h>
 #include <mm/kmalloc.h>
 #include <mm/pmm.h>
+#include <kernel/clock.h>     /* clock_monotonic_ns：DMA/PIO 超时的时间基准（问题5） */
+
+/* 前向声明：供 ata_dma_init 在定义前调用，避免隐式声明/重复声明冲突 */
+static bool ata_dma_xfer(uint64_t lba, uint8_t count, bool write);
+static void ata_dma_self_test(void);
+
+/* 无锁诊断输出（仅错误路径使用）：直接操作 COM1 端口，不获取 g_kp_lock /
+ * g_serial_lock 等任何内核自旋锁。原因：ata 驱动全程持 g_ata_lock 并 cli，
+ * 若在持锁期间调用 kprintf/serial_writestr 会顺带获取 console/serial 自旋锁，
+ * 与其他正持有那些锁、反过来又想取 g_ata_lock 的任务形成交叉死锁（单核协作
+ * 式调度下 ticket 自旋锁 owner 停滞 -> PANIC）。故持锁期诊断必须走无锁通道。 */
+static void ata_err(const char *s)
+{
+    for (const char *p = s; *p; p++) {
+        while (!(inb(0x3F8 + 5) & 0x20)) {
+            cpu_relax();
+        }
+        outb(0x3F8, (uint8_t)*p);
+    }
+}
 
 /* Primary 通道寄存器 */
 #define ATA_IO        0x1F0
@@ -162,38 +182,29 @@ static void ata_dma_init(void)
     g_dma_buf_phys = (uint64_t)buf_p;
     g_dma_buf      = (uint8_t *)PHYS_TO_VIRT(buf_p);
 
-    /* 生产稳定性决策（P0 生产就绪）：
-     * 此前 SeaBIOS 为 PIIX3 IDE 分配的 BM 基址在本环境下为 0xc040（非标准 0xc000），
-     * 实测经此基址启动的 BMIDE 总线主控 DMA 在多核（SMP）下偶发永不完成
-     * （BM_ST_ACTIVE 不置位 / IRQ 不触发），轮询无法可靠判定成败，曾导致 disk-srv
-     * 长时间独占 CPU、等待 IPC 的用户态任务得不到调度而表现为系统“卡死”。
-     *
-     * 但 DMA 卡死的根因是「多核并发 + 中断抢占破坏 DMA 相位」，在【单核】构建
-     * （CONFIG_SMP==0，默认 make run）下该竞态根本不存在，且 ata_dma_xfer 已自带
-     * ~30ms 轮询超时 + 失败回退 PIO 双保险。因此策略改为：
-     *   - 单核（CONFIG_SMP==0）：真正启用 BMIDE DMA，获得总线主控批量搬运的速度收益；
-     *   - 多核（CONFIG_SMP==1）：保持禁用，强制走已验证完整的 PIO 路径，避免卡死。
-     * 两种情况下 DMA 失败都会由 ata_read/write_sectors 干净回退 PIO，数据正确性优先。 */
-    if (CONFIG_SMP) {
-        g_bm_base = 0;
-        kprintf("[ata] BMIDE @ I/O 0x%x (PCI %u:%u.%u) DISABLED under SMP; "
-                "forcing PIO path\n",
-                (unsigned)base, (unsigned)ide.bus, (unsigned)ide.dev,
-                (unsigned)ide.func);
-    } else {
-        /* 单核构建（CONFIG_SMP==0，默认 make run）下保持禁用 BMIDE DMA：
-         * 实测本 QEMU/SeaBIOS(PIIX3) 环境的 BM 基址为 0xc040（非标准 0xc000），
-         * 经此基址的总线主控 DMA 在持 ata 自旋锁期间会触发协作式任务切换，
-         * 单核 ticket 自旋锁的 owner 票号停滞 -> 死锁检测 PANIC / 静默冻结，
-         * 表现为系统“卡死”（已复现）。DMA 驱动（ata_dma_xfer/PRDT/UDMA）代码
-         * 完整自洽，此处仅按生产稳定性策略默认关闭，待 BM 基址修正或真实硬件
-         * 验证后通过 ATA_FORCE_DMA 宏启用。失败时始终回退 PIO（数据正确性优先）。 */
-        g_bm_base = 0;
-        kprintf("[ata] BMIDE @ I/O 0x%x (PCI %u:%u.%u) present but DISABLED "
-                "for single-core stability; forcing PIO path\n",
-                (unsigned)base, (unsigned)ide.bus, (unsigned)ide.dev,
-                (unsigned)ide.func);
-    }
+    /* BMIDE 启用策略（P0 生产就绪 + 本步按 OSDev 规范尝试真正启用）：
+     * - 默认（含 CONFIG_SMP==1 与单核）均先设置 g_bm_base=base 并跑启动期
+     *   DMA 自检（ata_dma_self_test）。自检通过则真正启用 DMA，失败回退 PIO。
+     *   此前多核下 BM 基址 0xc040 偶发卡死，根因已定位为「持锁期调用
+     *   kprintf 引入交叉自旋锁死锁」，现已用无锁 ata_err 消除，并补齐
+     *   DMA 停用时 ACTIVE 清零等待，故多核下同样走自检打通（审计清单 #6）。
+     * - 强制宏 ATA_FORCE_DMA：定义时无论单/多核都启用（供真实硬件验证用）。
+     * 任一种情况 DMA 传输失败都会由 ata_read/write_sectors 干净回退 PIO，
+     * 数据正确性始终优先。 */
+    g_bm_base = 0;   /* 默认先关闭，自检通过后再打开 */
+#if defined(ATA_FORCE_DMA)
+    g_bm_base = base;
+    kprintf("[ata] BMIDE @ I/O 0x%x (PCI %u:%u.%u) FORCE-ENABLED (ATA_FORCE_DMA)\n",
+            (unsigned)base, (unsigned)ide.bus, (unsigned)ide.dev,
+            (unsigned)ide.func);
+    ata_dma_self_test();
+#else
+    g_bm_base = base;   /* 先打开，自检决定最终去留（单/多核一致） */
+    kprintf("[ata] BMIDE @ I/O 0x%x (PCI %u:%u.%u) probed; running DMA self-test...\n",
+            (unsigned)base, (unsigned)ide.bus, (unsigned)ide.dev,
+            (unsigned)ide.func);
+    ata_dma_self_test();
+#endif
 }
 
 /* 通道稳定延迟：OSDev《ATA PIO Mode》规定发送命令/选盘后需等待约 400ns
@@ -207,30 +218,42 @@ static void ata_delay400(void)
     }
 }
 
-/* 等待 BSY 清零；超时返回 false */
-static bool ata_wait_not_busy(void)
+/* 时间基准轮询辅助：基于 clock_monotonic_ns()（源自 TSC/HPET，自启动单调）。
+ * 解决「固定循环计数在不同 CPU 速度下超时偏差过大」的问题（审计清单 #5）。
+ * 调用方须保证 clock_init() 已完成（kmain 中 ata_init 在其后执行，安全）。 */
+static bool ata_poll_until_ns(uint64_t timeout_ns, bool (*cond)(void))
 {
-    for (uint32_t i = 0; i < 1000000; i++) {
-        if (!(inb(ATA_STATUS) & ST_BSY)) {
+    uint64_t deadline = clock_monotonic_ns() + timeout_ns;
+    for (;;) {
+        if (cond()) {
             return true;
         }
+        if (clock_monotonic_ns() >= deadline) {
+            return false;
+        }
+        cpu_relax();
     }
-    return false;
+}
+static bool ata_cond_not_busy(void)   { return !(inb(ATA_STATUS) & ST_BSY); }
+static bool ata_cond_drq(void)
+{
+    uint8_t st = inb(ATA_STATUS);
+    if (st & ST_ERR) {
+        return true;     /* 出错也结束轮询，由调用方判 ERR */
+    }
+    return !(st & ST_BSY) && (st & ST_DRQ);
+}
+
+/* 等待 BSY 清零；超时返回 false（超时 1 秒，覆盖最差真机情况） */
+static bool ata_wait_not_busy(void)
+{
+    return ata_poll_until_ns(1000000000ULL, ata_cond_not_busy);
 }
 
 /* 等待 DRQ 置位（数据就绪）；出错/超时返回 false */
 static bool ata_wait_drq(void)
 {
-    for (uint32_t i = 0; i < 1000000; i++) {
-        uint8_t st = inb(ATA_STATUS);
-        if (st & ST_ERR) {
-            return false;
-        }
-        if (!(st & ST_BSY) && (st & ST_DRQ)) {
-            return true;
-        }
-    }
-    return false;
+    return ata_poll_until_ns(1000000000ULL, ata_cond_drq);
 }
 
 bool ata_init(void)
@@ -358,35 +381,49 @@ static void ata_select_lba(uint64_t lba, uint8_t count, bool use48)
  * 调用方须保证 count<=ATA_DMA_MAX_SECTORS 且已做越界校验。
  * 返回 false 时调用方应回退 PIO 或上报错误——本函数保证在任何失败路径上
  * 都已停掉总线主控（Start=0），不会留下悬空的 DMA 引擎。 */
+/* 单次 Bus Master DMA 传输（单 PRD，最多 ATA_DMA_MAX_SECTORS 扇区）。
+ * 严格遵循 OSDev《ATA/ATAPI using DMA》命令序列：
+ *   1) 编程 PRDT  -> 2) 写 PRDT 地址  -> 3) 设 R/W 方向(Start=0 时)
+ *   4) 清 Error/IRQ  -> 5) 选盘 + 发 LBA  -> 6) 发 DMA 命令
+ *   7) 置 Start 位  -> 8) 轮询 BM_STATUS 完成  -> 9) 清 Start + 清状态
+ * 方向位 BM_CMD_DIR(bit3)：读盘(设备->内存)置 1，写盘(内存->设备)清 0。
+ * 整个传输持 g_ata_lock + cli，且本函数内部严禁调用 dbg_printf/kprintf
+ * （以免在持锁期间又去获取 console 自旋锁，引入交叉持锁导致 ticket 死锁）。
+ * 返回 true 表示传输成功。轮询带 ~30ms 硬上限，超时即停引擎返回 false，
+ * 由上层 ata_read/write_sectors 干净回退 PIO（数据正确性优先、绝不霸占 CPU）。 */
 static bool __attribute__((noinline)) ata_dma_xfer(uint64_t lba, uint8_t count, bool write)
 {
-    dbg_printf("[ata] dbg: dma_xfer enter lba=%lu cnt=%u write=%u bm=0x%x\n",
-            (unsigned long)lba, (unsigned)count, (unsigned)write,
-            (unsigned)g_bm_base);
+#if ATA_DEBUG
+    static int g_dx = 0;
+    bool dx = (g_dx++ < 4);
+    if (dx) ata_err("[ata] D enter\n");
+#else
+    const bool dx = false;
+#endif
     if (g_bm_base == 0 || count == 0 || count > ATA_DMA_MAX_SECTORS) {
         return false;
     }
 
     uint32_t bytes = (uint32_t)count * ATA_SECTOR_SIZE;
 
-    /* 1. 构造单项 PRDT：地址 + 字节数 + EOT */
+    /* 1. 构造单项 PRDT：物理缓冲地址 + 字节数(低16) + EOT(bit15 of word3)。
+     *    OSDev：count 字段为 0 表示 64KiB；本路径 bytes<=4096 不会溢出。 */
     g_prdt[0] = (uint64_t)(uint32_t)g_dma_buf_phys
               | ((uint64_t)(bytes & 0xFFFFu) << 32)
               | (0x8000ULL << 48);                   /* bit15 of word3 = EOT */
 
-    /* 2. 停总线主控并设定方向（Start 必须为 0 时才能改方向/PRDT）。
-     *    方向位 bit2 (BM_CMD_DIR)：0=写内存(设备->内存，磁盘读)，
-     *                              1=读内存(内存->设备，磁盘写)。 */
-    outb(g_bm_base + BM_CMD, write ? 0 : BM_CMD_DIR);
+    /* 2. 写 PRDT 物理地址（32 位；已确保 <4GiB） */
     outl(g_bm_base + BM_PRDT, (uint32_t)g_prdt_phys);
 
-    /* 3. 清 Error/IRQ（写 1 清），保留只读的能力位 */
+    /* 3. 设方向位（必须在 Start=0 时）：读盘置 BM_CMD_DIR，写盘清 0 */
+    outb(g_bm_base + BM_CMD, write ? 0 : BM_CMD_DIR);
+
+    /* 4. 清 Error/IRQ（写 1 清），保留只读能力位 */
     uint8_t st = inb(g_bm_base + BM_STATUS);
     outb(g_bm_base + BM_STATUS, (uint8_t)(st | BM_ST_ERROR | BM_ST_IRQ));
 
-    /* 4. 选盘并下发 DMA 命令 */
+    /* 5. 选盘并下发 DMA 命令 */
     if (!ata_wait_not_busy()) {
-        dbg_printf("[ata] dbg: dma pre-busy timeout\n");
         return false;
     }
     bool use48 = g_lba48 && (lba + count) > 0x0FFFFFFFULL;
@@ -398,47 +435,64 @@ static bool __attribute__((noinline)) ata_dma_xfer(uint64_t lba, uint8_t count, 
     }
     ata_delay400();
 
-    /* 5. 启动引擎（方向位：读盘置位、写盘清零） */
+    /* 6. 启动引擎：遵循 OSDev 规范分两步——先确保方向位已置(Start=0 时)，
+     *    再单独置 Start=1。同时写方向+Start 在某些芯片组上可能令方向位未生效。
+     *    （审计清单 #3） */
+    outb(g_bm_base + BM_CMD, (uint8_t)(write ? 0 : BM_CMD_DIR));
     outb(g_bm_base + BM_CMD,
          (uint8_t)((write ? 0 : BM_CMD_DIR) | BM_CMD_START));
 
-    /* 6. 轮询完成：IRQ 置位表示设备已发中断（传输结束），
-     *    Active 清零同样表示 PRDT 耗尽。
-     *    关键生产约束（此前卡死根因）：绝不能无上限死等。QEMU TCG 下若某次
-     *    DMA 因 BM 中断未触发/Active 长保持而迟迟不结束，2000 万次 inb 轮询会
-     *    独占 CPU 数十秒，使等待 IPC 的用户态任务永远得不到调度，表现为“系统
-     *    卡死”。这里把超时收束到约 30ms（足够覆盖一次 4KB DMA 的物理完成时间），
-     *    超时即停引擎并返回 false，由上层（ata_read/write_sectors）干净回退 PIO，
-     *    保证数据正确性优先、且绝不长时间霸占 CPU。 */
+    /* 7. 轮询 BM_STATUS：IRQ 置位=正常完成；ERROR=失败；
+     *    ACTIVE 清零且无 IRQ 时以设备状态寄存器为准判定。
+     *    时间基准超时（50ms，覆盖最差真机），超时停引擎返回 false 回退 PIO。 */
     bool ok = false;
-    for (uint32_t i = 0; i < 60000u; i++) {       /* ~30ms @ ~2us/iter */
-        uint8_t s = inb(g_bm_base + BM_STATUS);
-        if (s & BM_ST_ERROR) {
-            ok = false;
-            break;
-        }
-        if (s & BM_ST_IRQ) {                 /* 正常完成 */
-            ok = true;
-            break;
-        }
-        if (!(s & BM_ST_ACTIVE)) {
-            /* Active 已清但没有 IRQ：可能刚完成也可能从未启动，
-             * 以设备状态寄存器为准判定。 */
-            ok = !(inb(ATA_STATUS) & ST_ERR);
-            break;
+    {
+        uint64_t deadline = clock_monotonic_ns() + 50000000ULL;   /* 50ms */
+        for (;;) {
+            uint8_t s = inb(g_bm_base + BM_STATUS);
+            if (s & BM_ST_ERROR) {
+                ok = false;
+                break;
+            }
+            if (s & BM_ST_IRQ) {                 /* 正常完成 */
+                ok = true;
+                break;
+            }
+            if (!(s & BM_ST_ACTIVE)) {
+                ok = !(inb(ATA_STATUS) & ST_ERR);
+                break;
+            }
+            if (clock_monotonic_ns() >= deadline) {
+                ok = false;
+                break;
+            }
+            cpu_relax();
         }
     }
     if (!ok) {
-        /* 轮询未能确认成功：立即停掉总线主控，避免悬空 DMA 引擎污染后续传输。
-         * 返回 false 让上层回退 PIO。 */
         outb(g_bm_base + BM_CMD, write ? 0 : BM_CMD_DIR);
         uint8_t fin = inb(g_bm_base + BM_STATUS);
         outb(g_bm_base + BM_STATUS,
              (uint8_t)(fin | BM_ST_ERROR | BM_ST_IRQ));
     }
 
-    /* 7. 无论成败都必须停掉引擎并清状态位，防止残留影响下一次传输 */
+    /* 8. 无论成败都必须停掉引擎并清状态位，防止残留影响下一次传输。
+     *    【关键修复】仅清除 Start 位不够——必须等待硬件将 BM_ST_ACTIVE 清零，
+     *    否则残留的 DMA 引擎会与下一次传输（尤其下次 DMA）冲突，导致数据错乱
+     *    或死锁（审计清单 #1）。超时则强制停引擎。 */
     outb(g_bm_base + BM_CMD, write ? 0 : BM_CMD_DIR);
+    {
+        uint64_t deadline = clock_monotonic_ns() + 1000000ULL;   /* 1ms */
+        for (uint32_t i = 0; i < 10000u; i++) {
+            if (!(inb(g_bm_base + BM_STATUS) & BM_ST_ACTIVE)) {
+                break;
+            }
+            if (clock_monotonic_ns() >= deadline) {
+                break;   /* 超时：继续清状态，不无限等 */
+            }
+            cpu_relax();
+        }
+    }
     uint8_t fin = inb(g_bm_base + BM_STATUS);
     outb(g_bm_base + BM_STATUS, (uint8_t)(fin | BM_ST_ERROR | BM_ST_IRQ));
     if (fin & BM_ST_ERROR) {
@@ -446,42 +500,66 @@ static bool __attribute__((noinline)) ata_dma_xfer(uint64_t lba, uint8_t count, 
     }
 
     if (!ata_wait_not_busy()) {
+        if (dx) ata_err("[ata] D abort(notbusy)\n");
         return false;
     }
     if (inb(ATA_STATUS) & ST_ERR) {
+        if (dx) ata_err("[ata] D abort(stderr)\n");
         return false;
     }
-    dbg_printf("[ata] dbg: dma xfer done write=%u ok=%u bmst=0x%x devst=0x%x\n",
-            (unsigned)write, (unsigned)ok,
-            (unsigned)inb(g_bm_base + BM_STATUS), (unsigned)inb(ATA_STATUS));
+    if (dx) ata_err("[ata] D exit ok\n");
     return ok;
 }
 
+/* 启动期 DMA 自检：在 BM 基址探测、缓冲分配完成后，做一次 1 扇区 LBA0 读取。
+ * 成功则真正启用 DMA（g_bm_base=base），失败则回退 PIO（g_bm_base=0）。
+ * 这样默认行为变为“自检通过才启用”，无需用户态干预即可实证本环境 BM 基址
+ * 下的 DMA 是否可用；且自检失败自动降级，绝不引入生产风险。 */
+static void __attribute__((noinline)) ata_dma_self_test(void)
+{
+    if (g_bm_base == 0) {
+        return;     /* 无 BM 基址，无需自检 */
+    }
+    /* 复用 ata_dma_xfer 读 LBA0 到 g_dma_buf，仅以返回成功与否判定 DMA 链路可用。 */
+    bool rc = ata_dma_xfer(0, 1, false);
+    if (rc) {
+        kprintf("[ata] BMIDE DMA self-test PASSED @ I/O 0x%x -> ENABLED\n",
+                (unsigned)g_bm_base);
+    } else {
+        kprintf("[ata] BMIDE DMA self-test FAILED @ I/O 0x%x -> forcing PIO\n",
+                (unsigned)g_bm_base);
+        g_bm_base = 0;
+    }
+}
+
+
 bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
 {
-    dbg_printf("[ata] read_sectors enter lba=%lu cnt=%u present=%u total=%lu\n",
-            (unsigned long)lba, (unsigned)count, (unsigned)g_disk_present,
-            (unsigned long)g_total_sectors);
+#if ATA_DEBUG
+    static int g_diag = 0;
+    bool diag = (g_diag++ < 6);   /* 只诊断前几次，避免刷屏 */
+#else
+    const bool diag = false;
+#endif
+    if (diag) ata_err("[ata] R enter\n");
     if (!g_disk_present || count == 0) {
         return false;
     }
     /* SMP 串行化：整个 ATA 事务持锁并关中断，防止本核 tick 抢占破坏 PIO 相位，
      * 或他核并发访问同一组 ATA I/O 端口导致命令/数据相位错乱。 */
     uint32_t ata_flags = spin_lock_irqsave(&g_ata_lock);
+    if (diag) ata_err("[ata] R lock\n");
     /* M10 修复：读路径补上越界读盘防护（此前仅写路径有）。lba+count 越过
      * 卷尾会令控制器读无效扇区/越界 DMA；无符号回绕一并防范。 */
     if ((uint64_t)lba + count > g_total_sectors || (uint64_t)lba + count < lba) {
-        dbg_printf("[ata] read_sectors OOB reject: lba+count=%lu total=%lu\n",
-                (unsigned long)((uint64_t)lba + count),
-                (unsigned long)g_total_sectors);
+        ata_err("[ata] read_sectors OOB reject\n");
         spin_unlock_irqrestore(&g_ata_lock, ata_flags);
         return false;
     }
     /* 优先走 Bus Master DMA：按 ATA_DMA_MAX_SECTORS 分块，经反弹缓冲拷出。
      * 任一块 DMA 失败则整体回退 PIO 重做（保证数据正确性优先于速度）。 */
     if (g_bm_base != 0) {
-        dbg_printf("[ata] read_sectors: DMA path, lba=%lu cnt=%u\n",
-                (unsigned long)lba, (unsigned)count);
+        if (diag) ata_err("[ata] R dma-branch\n");
         uint8_t done = 0;
         bool dma_ok = true;
         while (done < count) {
@@ -498,39 +576,44 @@ bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
             done = (uint8_t)(done + chunk);
         }
         if (dma_ok) {
+            spin_unlock_irqrestore(&g_ata_lock, ata_flags);
             return true;
         }
         /* 落到下面的 PIO 路径重试整个请求 */
     }
 
-    if (!ata_wait_not_busy()) {
-        dbg_printf("[ata] PIO read lba=%lu: not-busy timeout\n",
-                (unsigned long)lba);
-        spin_unlock_irqrestore(&g_ata_lock, ata_flags);
-        return false;
-    }
+    if (diag) ata_err("[ata] R pio-branch\n");
+    /* 【修复】PIO 读增加命令级重试（最多 3 次），抵御瞬时 DRQ/BSY 超时，
+     * 增强健壮性（审计清单 #4）。每次重试前重新选盘+发命令。 */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (!ata_wait_not_busy()) {
+            ata_err("[ata] PIO read: not-busy timeout\n");
+            continue;
+        }
+        bool use48 = g_lba48 && ((uint64_t)lba + count) > 0x0FFFFFFFULL;
+        ata_select_lba(lba, count, use48);
+        outb(ATA_CMD, use48 ? 0x24 : CMD_READ_SECTORS);   /* READ SECTORS EXT */
 
-    bool use48 = g_lba48 && ((uint64_t)lba + count) > 0x0FFFFFFFULL;
-    ata_select_lba(lba, count, use48);
-    outb(ATA_CMD, use48 ? 0x24 : CMD_READ_SECTORS);   /* READ SECTORS EXT */
-
-    uint16_t *out = (uint16_t *)buf;
-    for (uint8_t s = 0; s < count; s++) {
-        if (!ata_wait_drq()) {
-            dbg_printf("[ata] PIO read lba=%lu: drq timeout sec=%u\n",
-                    (unsigned long)lba, (unsigned)s);
+        bool ok = true;
+        uint16_t *out = (uint16_t *)buf;
+        for (uint8_t s = 0; s < count; s++) {
+            if (!ata_wait_drq()) {
+                ata_err("[ata] PIO read: drq timeout\n");
+                ok = false;
+                break;
+            }
+            for (int i = 0; i < 256; i++) {
+                *out++ = inw(ATA_DATA);
+            }
+            ata_delay400();
+        }
+        if (ok) {
             spin_unlock_irqrestore(&g_ata_lock, ata_flags);
-            return false;
+            return true;
         }
-        for (int i = 0; i < 256; i++) {
-            *out++ = inw(ATA_DATA);
-        }
-        ata_delay400();
     }
-    dbg_printf("[ata] PIO read lba=%lu done (cpu=%u)\n",
-            (unsigned long)lba, (unsigned)cpu_index());
     spin_unlock_irqrestore(&g_ata_lock, ata_flags);
-    return true;
+    return false;
 }
 
 /* PIO 写扇区（LBA28/48）：逐扇区等待 DRQ 后以 outw 写入 256 字，
@@ -552,8 +635,6 @@ bool ata_write_sectors(uint64_t lba, uint8_t count, const void *buf)
     /* DMA 写路径：分块拷入反弹缓冲后由总线主控写盘，最后 FLUSH CACHE 落盘。
      * 失败时回退下方 PIO 重试逻辑。 */
     if (g_bm_base != 0) {
-        dbg_printf("[ata] write_sectors: DMA path, lba=%lu cnt=%u\n",
-                (unsigned long)lba, (unsigned)count);
         uint8_t done = 0;
         bool dma_ok = true;
         while (done < count) {
@@ -577,6 +658,13 @@ bool ata_write_sectors(uint64_t lba, uint8_t count, const void *buf)
                 spin_unlock_irqrestore(&g_ata_lock, ata_flags);
                 return true;
             }
+            /* 【关键修复】DMA 数据已成功落盘缓冲（传输完成），但 FLUSH 失败。
+             * 此时重复 PIO 写入无益：FLUSH 失败的根本原因是设备状态异常，
+             * PIO 重试不会改变它，反而可能因二次写入造成磨损/部分写。直接上报
+             * 错误（审计清单 #2）。 */
+            ata_err("[ata] DMA write done but FLUSH failed; report error\n");
+            spin_unlock_irqrestore(&g_ata_lock, ata_flags);
+            return false;
         }
         /* 落到 PIO 路径重试整个请求 */
     }

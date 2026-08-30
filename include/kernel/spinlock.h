@@ -27,13 +27,29 @@
 #include <kernel/serial.h>   /* 死锁诊断用 serial_writestr/dec（绕过 kprintf 锁） */
 #include <kernel/console.h>  /* panic() 声明（死锁诊断末尾停机）；console.h 仅
                               * 依赖 types.h，与 spinlock.h 无循环包含关系 */
+#include <kernel/percpu.h>   /* cpu_index()：每个持锁计数按 CPU 维护，避免多核误判 */
+
+/* 持锁不可抢占保护（P0 死锁根因修复）：
+ * 单核下若任务在持自旋锁期间（spin_lock_irqsave 已 cli）被 self-IPI
+ * （IPI_RESCHED=0xF0，由 sched_wake 经 self-IPI 投递）抢占并 schedule() 切走，
+ * 锁永不释放 -> 后续请求者自旋 50M 次 panic（disk-srv 持 'ata' 锁被切走）。
+ * 标准做法：持任何自旋锁期间禁止任务切换。preempt_count[cpu] 在
+ * spin_lock 时 +1、spin_unlock 时 -1；schedule() 入口若 >0 则立即返回（仅置
+ * need_resched，推迟到 unlock 后的最近调度点）。单核 MAX_CPUS=1，数组退化为
+ * 单元素；多核下每 CPU 独立计数，互不干扰。 */
+extern uint32_t g_preempt_count[MAX_CPUS];
+
+/* 取得当前运行任务名（sched.c 提供，返回 cpu_local()->current_task->name）。
+ * 用于在死锁诊断时打印持锁任务名；返回不透明字符串避免与 task.h 循环包含。 */
+extern const char *get_current_task_name(void);
 
 typedef struct spinlock {
     volatile uint32_t tickets;   /* [31:16]=next, [15:0]=owner */
     const char *name;            /* 诊断用（死锁排查时打印） */
+    const char *owner_name;      /* 诊断：当前持有者任务名（死锁时打印） */
 } spinlock_t;
 
-#define SPINLOCK_INIT(nm)  { 0, nm }
+#define SPINLOCK_INIT(nm)  { .tickets = 0, .name = (nm), .owner_name = NULL }
 
 static inline void spinlock_init(spinlock_t *l, const char *name)
 {
@@ -79,16 +95,30 @@ static inline void spin_lock(spinlock_t *l)
             serial_write_dec((uint64_t)next);
             serial_writestr(" my=");
             serial_write_dec((uint64_t)my);
-            serial_writestr("\n");
-            panic("[spinlock] deadlock on '%s' (owner=%u next=%u my=%u)",
+            serial_writestr(" held_by='");
+            serial_writestr(l->owner_name ? l->owner_name : "?");
+            serial_writestr("'\n");
+            panic("[spinlock] deadlock on '%s' (owner=%u next=%u my=%u held_by=%s)",
                   l->name ? l->name : "?", (unsigned)owner, (unsigned)next,
-                  (unsigned)my);
+                  (unsigned)my, (l->owner_name ? l->owner_name : "?"));
         }
     }
+    l->owner_name = get_current_task_name();   /* 记录持锁任务名（诊断用） */
+    /* 进入原子/持锁区：禁止调度器在持锁期间抢占本任务（死锁根因修复）。
+     * self-IPI(0xF0) 经 sched_wake 投递后，若直接 schedule() 会把持锁任务切走，
+     * 锁永不释放 -> 后续请求者自旋 panic。持锁期间累计计数，schedule() 入口
+     * 据此跳过切换，待 unlock 后再由 need_resched 触发。 */
+    g_preempt_count[cpu_index()]++;
 }
 
 static inline void spin_unlock(spinlock_t *l)
 {
+    /* 退出原子/持锁区；必须严格配平 spin_lock 的 ++，否则计数失衡 */
+    uint32_t _idx = cpu_index();
+    if (g_preempt_count[_idx]) {
+        g_preempt_count[_idx]--;
+    }
+    l->owner_name = NULL;                          /* 释放：清除持锁者记录 */
     /* owner += 1（只动低 16 位；直接对低半字做原子加） */
     __atomic_fetch_add((volatile uint16_t *)&l->tickets, 1,
                        __ATOMIC_RELEASE);

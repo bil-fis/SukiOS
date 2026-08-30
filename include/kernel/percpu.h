@@ -64,6 +64,13 @@ typedef struct percpu {
      * utmp_r9：用户第 6 参数（mmap 的 off）。入口立刻存入，构造 GPR 帧时
      * 再取回填，否则 6 参 syscall 的第 6 个参数会变成内核指针。 */
     uint64_t utmp_r9;               /* 用户 %r9（syscall 第 6 参数） */
+
+    /* 本 CPU 需要重新调度的标志（P0 死锁修复）：
+     * 持自旋锁期间 self-IPI(0xF0) 触发 schedule() 时，因 g_preempt_count>0 会跳过
+     * 切换并置本标志；待 spin_unlock 后由最近调度点（task_yield / 端口阻塞 /
+     * 100Hz tick）消费并真正切换。新增字段加在末尾，不影响既有偏移。 */
+    volatile uint32_t need_resched;
+    uint32_t _pad2;
 } percpu_t;
 
 /* percpu_t 内的字节偏移，供 syscall_entry.S 的 %gs: 相对寻址使用。

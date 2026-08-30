@@ -33,6 +33,7 @@
 #include <mm/kmalloc.h>
 #include <ipc/port.h>
 #include <ipc/fs_proto.h>
+#include <kernel/vfs.h>       /* VFS 路由：DISK/tmpfs/devfs 多后端分派 */
 
 /* ========================================================================== */
 /*  全局 fd 槽池                                                               */
@@ -212,6 +213,22 @@ void fd_close_backend(fd_entry_t *e)
     if (!e || e->backend < 0) {
         return;
     }
+    /* 内建后端（tmpfs/devfs）：直接在本地关闭，不经 FS_PORT */
+    if (e->vfs_backend == FD_BACKEND_TMPFS) {
+        if (e->type == FD_TYPE_DIR) {
+            vfs_builtin_closedir(e->backend, VFS_BACKEND_TMPFS);
+        } else {
+            tmpfs_close(e->backend);
+        }
+        e->backend = -1;
+        return;
+    }
+    if (e->vfs_backend == FD_BACKEND_DEVFS) {
+        /* devfs 设备无状态，无需关闭（句柄即表索引，下次 open 复用） */
+        e->backend = -1;
+        return;
+    }
+    /* DISK 后端：转发 FS_PORT */
     uint8_t *req = rpc_req_buf();
     memset(req, 0, sizeof(mach_msg_header_t) + sizeof(fs_fd_req_t));
     mach_msg_header_t *h = (mach_msg_header_t *)req;
@@ -562,6 +579,43 @@ int fd_open(struct task *t, const char *path, int flags, uint32_t mode)
         return -SUKI_EINVAL;
     }
 
+    /* ---- VFS 路由：命中内建后端（tmpfs/devfs）时直接走内核实现 ---- */
+    if (vfs_ready()) {
+        vfs_resolved_t vr;
+        vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+            uint32_t vh = 0;
+            int brc = vfs_builtin_open(vr.rel, (int32_t)flags, mode, &vh,
+                                       vr.backend);
+            if (brc < 0) {
+                return brc;   /* 负 errno */
+            }
+            int type = (flags & SUKI_O_DIRECTORY) ? FD_TYPE_DIR : FD_TYPE_FILE;
+            uint64_t f = spin_lock_irqsave(&g_fd_lock);
+            int fdnum = fd_bind_locked(t, type, (int32_t)flags);
+            if (fdnum >= 0) {
+                fd_entry_t *e = &g_fd_slots[t->fds[fdnum]];
+                e->backend = (int)vh;                 /* VFS 内部句柄 */
+                e->vfs_backend = (vr.backend == VFS_BACKEND_TMPFS)
+                                 ? FD_BACKEND_TMPFS : FD_BACKEND_DEVFS;
+                e->path = (char *)kmalloc(plen + 1);
+                if (e->path) {
+                    memcpy(e->path, path, plen + 1);
+                }
+            }
+            spin_unlock_irqrestore(&g_fd_lock, f);
+            if (fdnum < 0) {
+                /* 本地槽耗尽：关闭内建句柄 */
+                if (vr.backend == VFS_BACKEND_TMPFS) {
+                    tmpfs_close((int)vh);
+                }
+                return fdnum;
+            }
+            return fdnum;
+        }
+        /* DISK 后端（含 '/' 根挂载）：落到下方原 FS_PORT 路径，路径用原 path */
+    }
+
     uint8_t *req = rpc_req_buf();
     uint32_t reqsz = (uint32_t)(sizeof(mach_msg_header_t)
                                 + sizeof(fs_open_req_t) + plen + 1);
@@ -611,6 +665,7 @@ int fd_open(struct task *t, const char *path, int flags, uint32_t mode)
     if (fdnum >= 0) {
         fd_entry_t *e = &g_fd_slots[t->fds[fdnum]];
         e->backend = (int)backend;
+        e->vfs_backend = FD_BACKEND_DISK;   /* 走 FS_PORT 的 FatFs 服务 */
         e->path = (char *)kmalloc(plen + 1);
         if (e->path) {
             memcpy(e->path, path, plen + 1);
@@ -667,6 +722,54 @@ suki_ssize_t fd_read(struct task *t, int fd, void *ubuf, size_t count)
     }
     if (e->type == FD_TYPE_DIR) {
         return -SUKI_EISDIR;
+    }
+    if (e->vfs_backend == FD_BACKEND_TMPFS) {
+        /* 内建 tmpfs 文件读：直接调 tmpfs_read（offset 用 fd 偏移） */
+        uint8_t *kbuf = kmalloc(count ? count : 1);
+        if (!kbuf) {
+            return -SUKI_ENOMEM;
+        }
+        uint64_t nread = 0;
+        int rc = tmpfs_read(e->backend, kbuf, (uint32_t)count, &nread);
+        if (rc < 0) {
+            kfree(kbuf);
+            return rc;
+        }
+        /* 更新文件偏移（tmpfs_read 已推进 fh->offset，但 fd 层也需记录以便 lseek
+         * 语义一致；这里以 tmpfs 内部偏移为准，fd->offset 仅对 DISK 用）。 */
+        e->offset += nread;
+        if (nread > 0) {
+            rc = copy_to_user(ubuf, kbuf, (size_t)nread);
+            if (rc < 0) {
+                kfree(kbuf);
+                return rc;
+            }
+        }
+        kfree(kbuf);
+        return (suki_ssize_t)nread;
+    }
+    if (e->vfs_backend == FD_BACKEND_DEVFS) {
+        /* 内建 devfs 字符设备读：offset 对字符设备通常忽略（传 e->offset） */
+        uint8_t *kbuf = kmalloc(count ? count : 1);
+        if (!kbuf) {
+            return -SUKI_ENOMEM;
+        }
+        uint64_t nread = 0;
+        int rc = devfs_read((uint32_t)e->backend, kbuf, (uint32_t)count, e->offset, &nread);
+        if (rc < 0) {
+            kfree(kbuf);
+            return rc;
+        }
+        e->offset += nread;
+        if (nread > 0) {
+            rc = copy_to_user(ubuf, kbuf, (size_t)nread);
+            if (rc < 0) {
+                kfree(kbuf);
+                return rc;
+            }
+        }
+        kfree(kbuf);
+        return (suki_ssize_t)nread;
     }
     if (e->backend < 0) {
         return -SUKI_EBADF;
@@ -757,6 +860,63 @@ suki_ssize_t fd_write(struct task *t, int fd, const void *ubuf, size_t count)
     if (e->type == FD_TYPE_DIR) {
         return -SUKI_EBADF;
     }
+    if (e->vfs_backend == FD_BACKEND_TMPFS) {
+        /* 内建 tmpfs 文件写：copy_from_user -> tmpfs_write（offset=-1 表当前位） */
+        uint8_t *kbuf = kmalloc(FS_WRITE_MAX);
+        if (!kbuf) {
+            return -SUKI_ENOMEM;
+        }
+        size_t total = 0;
+        while (total < count) {
+            size_t chunk = count - total;
+            if (chunk > FS_WRITE_MAX) {
+                chunk = FS_WRITE_MAX;
+            }
+            if (copy_from_user(kbuf, (const uint8_t *)ubuf + total, chunk) != chunk) {
+                kfree(kbuf);
+                return total ? (suki_ssize_t)total : -SUKI_EFAULT;
+            }
+            uint64_t nw = 0;
+            int rc = tmpfs_write(e->backend, kbuf, (uint32_t)chunk,
+                                 (uint64_t)-1, &nw);
+            if (rc < 0) {
+                kfree(kbuf);
+                return total ? (suki_ssize_t)total : rc;
+            }
+            total += (size_t)nw;
+        }
+        kfree(kbuf);
+        return (suki_ssize_t)total;
+    }
+    if (e->vfs_backend == FD_BACKEND_DEVFS) {
+        /* 内建 devfs 字符设备写：直接转发到设备回调（e.g. /dev/console 输出） */
+        uint8_t *kbuf = kmalloc(FS_WRITE_MAX);
+        if (!kbuf) {
+            return -SUKI_ENOMEM;
+        }
+        size_t total = 0;
+        while (total < count) {
+            size_t chunk = count - total;
+            if (chunk > FS_WRITE_MAX) {
+                chunk = FS_WRITE_MAX;
+            }
+            if (copy_from_user(kbuf, (const uint8_t *)ubuf + total, chunk) != chunk) {
+                kfree(kbuf);
+                return total ? (suki_ssize_t)total : -SUKI_EFAULT;
+            }
+            uint64_t nw = 0;
+            int rc = devfs_write((uint32_t)e->backend, kbuf, (uint32_t)chunk,
+                                 e->offset, &nw);
+            if (rc < 0) {
+                kfree(kbuf);
+                return total ? (suki_ssize_t)total : rc;
+            }
+            total += (size_t)nw;
+            e->offset += nw;
+        }
+        kfree(kbuf);
+        return (suki_ssize_t)total;
+    }
     if (e->backend < 0) {
         return -SUKI_EBADF;
     }
@@ -825,6 +985,18 @@ suki_off_t fd_lseek(struct task *t, int fd, suki_off_t off, int whence)
     if (e->type == FD_TYPE_TTY || e->type == FD_TYPE_PIPE) {
         return -SUKI_ESPIPE;
     }
+    if (e->vfs_backend == FD_BACKEND_TMPFS) {
+        uint64_t pos = 0;
+        int rc = tmpfs_lseek(e->backend, off, whence, &pos);
+        if (rc < 0) {
+            return (suki_off_t)rc;
+        }
+        e->offset = pos;   /* 同步 fd 层偏移（DISK 路径由服务端维护，fd 不依赖） */
+        return (suki_off_t)pos;
+    }
+    if (e->vfs_backend == FD_BACKEND_DEVFS) {
+        return -SUKI_ESPIPE;   /* 字符设备不支持 seek */
+    }
     if (e->backend < 0) {
         return -SUKI_EBADF;
     }
@@ -864,6 +1036,28 @@ suki_off_t fd_lseek(struct task *t, int fd, suki_off_t off, int whence)
         return fs_status_to_errno((uint32_t)(-pos));
     }
     return (suki_off_t)pos;
+}
+
+/* 把内核态 fs_stat_t 拷贝到用户态 suki_stat_t（字段语义一致） */
+static void fd_stat_copy(suki_stat_t *out, const fs_stat_t *fs_st)
+{
+    memset(out, 0, sizeof(*out));
+    out->st_dev = fs_st->dev;
+    out->st_ino = fs_st->ino;
+    out->st_mode = fs_st->mode;
+    out->st_nlink = fs_st->nlink;
+    out->st_uid = fs_st->uid;
+    out->st_gid = fs_st->gid;
+    out->st_rdev = fs_st->rdev;
+    out->st_size = fs_st->size;
+    out->st_blksize = fs_st->blksize;
+    out->st_blocks = fs_st->blocks;
+    out->st_atim_sec = fs_st->atime;
+    out->st_atim_nsec = 0;
+    out->st_mtim_sec = fs_st->mtime;
+    out->st_mtim_nsec = 0;
+    out->st_ctim_sec = fs_st->ctime;
+    out->st_ctim_nsec = 0;
 }
 
 /* stat / fstat 共用：by_fd=1 走句柄，=0 走路径 */
@@ -909,24 +1103,7 @@ static int fd_stat_common(int by_fd, int backend, const char *path,
         return fs_status_to_errno((uint32_t)(-resp_ret(resp)->value));
     }
     const fs_stat_t *fs_st = (const fs_stat_t *)(resp + RESP_RET_SIZE);
-
-    memset(out, 0, sizeof(*out));
-    out->st_dev = fs_st->dev;
-    out->st_ino = fs_st->ino;
-    out->st_mode = fs_st->mode;
-    out->st_nlink = fs_st->nlink;
-    out->st_uid = fs_st->uid;
-    out->st_gid = fs_st->gid;
-    out->st_rdev = fs_st->rdev;
-    out->st_size = fs_st->size;
-    out->st_blksize = fs_st->blksize;
-    out->st_blocks = fs_st->blocks;
-    out->st_atim_sec = fs_st->atime;
-    out->st_atim_nsec = 0;
-    out->st_mtim_sec = fs_st->mtime;
-    out->st_mtim_nsec = 0;
-    out->st_ctim_sec = fs_st->ctime;
-    out->st_ctim_nsec = 0;
+    fd_stat_copy(out, fs_st);
     return 0;
 }
 
@@ -951,6 +1128,25 @@ int fd_fstat(struct task *t, int fd, suki_stat_t *out)
         out->st_nlink = 1;
         return 0;
     }
+    if (e->vfs_backend == FD_BACKEND_TMPFS) {
+        fs_stat_t st;
+        int rc = tmpfs_fstat(e->backend, &st);
+        if (rc < 0) {
+            return rc;
+        }
+        fd_stat_copy(out, &st);
+        return 0;
+    }
+    if (e->vfs_backend == FD_BACKEND_DEVFS) {
+        fs_stat_t st;
+        int rc = devfs_stat(e->path ? e->path : "/dev", &st);
+        /* devfs_stat/devfs_find 可识别完整路径 /dev/xxx 或相对名 */
+        if (rc < 0) {
+            return rc;
+        }
+        fd_stat_copy(out, &st);
+        return 0;
+    }
     if (e->backend < 0) {
         return -SUKI_EBADF;
     }
@@ -961,6 +1157,20 @@ int fd_stat(const char *path, suki_stat_t *out)
 {
     if (!path || path[0] == '\0') {
         return -SUKI_EINVAL;
+    }
+    /* VFS 路由：内建后端走 vfs_builtin_stat */
+    if (vfs_ready()) {
+        vfs_resolved_t vr;
+        vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+            fs_stat_t st;
+            int rc = vfs_builtin_stat(vr.rel, &st, vr.backend);
+            if (rc < 0) {
+                return rc;
+            }
+            fd_stat_copy(out, &st);
+            return 0;
+        }
     }
     return fd_stat_common(0, 0, path, out);
 }
@@ -973,6 +1183,37 @@ int fd_opendir(struct task *t, const char *path)
     size_t plen = strlen(path);
     if (plen >= FS_PATH_MAX) {
         return -SUKI_ENAMETOOLONG;
+    }
+
+    /* VFS 路由：内建后端（tmpfs/devfs 目录）走 vfs_builtin_opendir */
+    if (vfs_ready()) {
+        vfs_resolved_t vr;
+        vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+            int dd = vfs_builtin_opendir(vr.rel, vr.backend);
+            if (dd < 0) {
+                return dd;
+            }
+            uint64_t f = spin_lock_irqsave(&g_fd_lock);
+            int fdnum = fd_bind_locked(t, FD_TYPE_DIR,
+                                       SUKI_O_RDONLY | SUKI_O_DIRECTORY);
+            if (fdnum >= 0) {
+                fd_entry_t *e = &g_fd_slots[t->fds[fdnum]];
+                e->backend = dd;     /* 内建目录句柄 */
+                e->vfs_backend = (vr.backend == VFS_BACKEND_TMPFS)
+                                 ? FD_BACKEND_TMPFS : FD_BACKEND_DEVFS;
+                e->path = (char *)kmalloc(plen + 1);
+                if (e->path) {
+                    memcpy(e->path, path, plen + 1);
+                }
+            }
+            spin_unlock_irqrestore(&g_fd_lock, f);
+            if (fdnum < 0) {
+                vfs_builtin_closedir(dd, vr.backend);   /* 槽满，关内建句柄 */
+                return fdnum;
+            }
+            return fdnum;
+        }
     }
 
     uint8_t *req = rpc_req_buf();
@@ -1008,6 +1249,7 @@ int fd_opendir(struct task *t, const char *path)
     if (fdnum >= 0) {
         fd_entry_t *e = &g_fd_slots[t->fds[fdnum]];
         e->backend = (int)dd;
+        e->vfs_backend = FD_BACKEND_DISK;
         e->path = (char *)kmalloc(plen + 1);
         if (e->path) {
             memcpy(e->path, path, plen + 1);
@@ -1034,6 +1276,21 @@ int fd_readdir(struct task *t, int fd, suki_dirent_t *out)
     }
     if (e->type != FD_TYPE_DIR || e->backend < 0) {
         return -SUKI_EBADF;
+    }
+
+    /* 内建后端目录读：直接调 vfs_builtin_readdir */
+    if (e->vfs_backend == FD_BACKEND_TMPFS || e->vfs_backend == FD_BACKEND_DEVFS) {
+        fs_dirent_t de;
+        int rc = vfs_builtin_readdir(e->backend, &de, e->vfs_backend);
+        if (rc < 0) {
+            return rc;
+        }
+        /* rc==1 有条目，rc==0 目录结束 */
+        memset(out, 0, sizeof(*out));
+        out->d_ino = de.ino;
+        out->d_type = de.type;
+        strncpy(out->d_name, de.name, sizeof(out->d_name) - 1);
+        return rc;
     }
 
     uint8_t *req = rpc_req_buf();
@@ -1097,6 +1354,25 @@ static int fd_path_op(uint32_t msg_id, const char *path, int32_t mode)
     if (plen >= FS_PATH_MAX) {
         return -SUKI_ENAMETOOLONG;
     }
+
+    /* VFS 路由：内建后端（tmpfs/devfs）走 vfs_builtin_* */
+    if (vfs_ready()) {
+        vfs_resolved_t vr;
+        vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+            if (msg_id == FS_MSG_UNLINK2) {
+                return vfs_builtin_unlink(vr.rel, mode ? true : false, vr.backend);
+            }
+            if (msg_id == FS_MSG_MKDIR2) {
+                return vfs_builtin_mkdir(vr.rel, (uint32_t)mode, vr.backend);
+            }
+            if (msg_id == FS_MSG_ACCESS) {
+                return vfs_builtin_access(vr.rel, mode, vr.backend);
+            }
+            /* 其它 msg_id 在内建后端不支持，回落到下面 DISK 路径会失败；
+             * 但本项目 FD 层只有这三类走 fd_path_op 且内建支持，故不会到此。 */
+        }
+    }
     uint8_t *req = rpc_req_buf();
     uint32_t reqsz = (uint32_t)(sizeof(mach_msg_header_t)
                                 + sizeof(fs_path_mode_req_t) + plen + 1);
@@ -1148,6 +1424,16 @@ int fd_rename(const char *oldp, const char *newp)
 {
     if (!oldp || !newp || oldp[0] == '\0' || newp[0] == '\0') {
         return -SUKI_EINVAL;
+    }
+    /* VFS 路由：两路径须同属一个内建后端才可重命名（暂不支持跨后端） */
+    if (vfs_ready()) {
+        vfs_resolved_t vo, vn;
+        vfs_resolve(oldp, &vo);
+        vfs_resolve(newp, &vn);
+        if ((vo.backend == VFS_BACKEND_TMPFS || vo.backend == VFS_BACKEND_DEVFS)
+            && vo.backend == vn.backend) {
+            return vfs_builtin_rename(vo.rel, vn.rel, vo.backend);
+        }
     }
     size_t ol = strlen(oldp), nl = strlen(newp);
     if (ol >= FS_PATH_MAX || nl >= FS_PATH_MAX) {
@@ -1488,6 +1774,13 @@ int fd_chmod(const char *path, uint32_t mode)
     if (plen >= FS_PATH_MAX) {
         return -SUKI_ENAMETOOLONG;
     }
+    if (vfs_ready()) {
+        vfs_resolved_t vr;
+        vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+            return vfs_builtin_chmod(vr.rel, mode, vr.backend);
+        }
+    }
     uint8_t *req = rpc_req_buf();
     uint32_t reqsz = (uint32_t)(sizeof(mach_msg_header_t)
                                 + sizeof(fs_chmod_req_t) + plen + 1);
@@ -1525,6 +1818,13 @@ int fd_utimes(const char *path, int64_t atime, int64_t mtime)
     size_t plen = strlen(path);
     if (plen >= FS_PATH_MAX) {
         return -SUKI_ENAMETOOLONG;
+    }
+    if (vfs_ready()) {
+        vfs_resolved_t vr;
+        vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+            return vfs_builtin_utime(vr.rel, atime, mtime, vr.backend);
+        }
     }
     uint8_t *req = rpc_req_buf();
     uint32_t reqsz = (uint32_t)(sizeof(mach_msg_header_t)

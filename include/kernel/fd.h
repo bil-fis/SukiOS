@@ -47,11 +47,20 @@ struct task;
 #define FD_TYPE_TTY    3    /* 控制台（内核本地实现） */
 #define FD_TYPE_PIPE   4    /* 管道（内核本地环形缓冲） */
 
+/* fd 后端（与 VFS 后端一一对应）。open 时由 VFS 路由确定；
+ * read/write/lseek/fstat/close 据此分派到 FS_PORT 或内核内建后端。 */
+#define FD_BACKEND_DISK  0   /* FS_PORT 的 Ring3 FS_SERVER(FatFs) —— 默认 */
+#define FD_BACKEND_TMPFS 1   /* 内核态 tmpfs（/tmp、/run） */
+#define FD_BACKEND_DEVFS 2   /* 内核态 devfs（/dev） */
+
 /* 前端 fd 表项（全局槽池中的一个槽） */
 typedef struct fd_entry {
     uint32_t type;          /* FD_TYPE_* */
     int32_t  flags;         /* SUKI_O_* 打开标志（含访问模式） */
-    int      backend;       /* FS_SERVER 侧句柄（文件/目录）；管道时 = peer 槽号 */
+    int      backend;       /* 文件/目录后端句柄（DISK=TMPFS=DEVFS 各自的内部句柄）；
+                             * 管道时 = peer 槽号 */
+    uint8_t  vfs_backend;   /* FD_BACKEND_*：标识该 fd 的数据来自哪个 VFS 后端 */
+    uint8_t  _pad[3];
     uint32_t refcount;      /* 引用计数（fork/dup 共享） */
     uint64_t offset;        /* 文件偏移（TTY/管道未用）；目录时作游标计数 */
 

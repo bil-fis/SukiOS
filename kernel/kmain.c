@@ -363,6 +363,13 @@ static void boot_late_init(void *arg)
                     "enabled\n",
                     (unsigned long)fs_task->id);
         }
+        /* 初始化内核 VFS：注册挂载点（/->DISK, /tmp+/run->TMPFS, /dev->DEVFS）
+         * 并初始化 tmpfs/devfs 后端。必须在 FS_SERVER 授权后调用，使 DISK 后端
+         * 可用。 */
+        extern void vfs_init(void);
+        vfs_init();
+        extern void vfs_selftest(void);
+        vfs_selftest();
     }
     else
     {

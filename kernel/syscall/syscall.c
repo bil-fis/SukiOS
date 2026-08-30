@@ -821,6 +821,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_MUNMAP_LEGACY: return sys_munmap(a1, a2);
     case SYS_SERIAL_READ: return sys_serial_read();
     case SYS_FRAMEBUFFER_MAP: return sys_framebuffer_map(a1);
+    case SYS_DISPLAY_READY:   display_set_active(); return 0;
     default: {
         /* 其余全部交给 POSIX 层（进程/文件/内存/时间/系统/网络号区） */
         int64_t r = 0;

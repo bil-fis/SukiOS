@@ -25,6 +25,16 @@ display_config_t g_display = {
     .parsed     = false,
 };
 
+/* 显示服务接管帧缓冲标志：false=内核直接写屏/串口；true=文本转交显示服务。
+ * 由 display_set_active()（SYS_DISPLAY_READY 处理体）置位，细节见头文件注释。 */
+bool g_display_active = false;
+
+void display_set_active(void)
+{
+    g_display_active = true;
+    serial_writestr("[display] active: kernel console text now routed to display server\n");
+}
+
 /* 常量（避免依赖不确定头文件） */
 #ifndef PHYS_TO_VIRT
 /* 内核线性映射：物理地址 + KERNEL_BASE 即内核虚拟地址（见 vmm 常量）。 */

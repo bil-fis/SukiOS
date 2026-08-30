@@ -37,6 +37,21 @@ typedef struct display_config {
 extern display_config_t g_display;
 
 /*
+ * g_display_active —— 显示服务「是否已接管帧缓冲、准备接收控制台文本」的标志。
+ *   false（默认）: 内核 user_puts() 直接写帧缓冲/串口（启动早期、纯文本模式、
+ *                  或显示服务尚未就绪时）。
+ *   true         : 显示服务已合成桌面并进入消息循环，此后内核 user_puts() 不再
+ *                  直接写帧缓冲（否则会覆盖显示服务的合成画面），改为经 IPC 把
+ *                  文本交给显示服务，由它渲染到桌面内的终端窗口。
+ * 由显示服务在进入消息循环前调用 SYS_DISPLAY_READY 置位（握手），保证内核不会
+ * 在显示服务就绪前误把文本发过去。
+ */
+extern bool g_display_active;
+
+/* display_set_active —— SYS_DISPLAY_READY 的处理体：置 g_display_active=true。 */
+void display_set_active(void);
+
+/*
  * display_cfg_parse —— 从引导模块物理区间解析显示配置。
  *   cfg_phys : 配置文本物理地址（0=无模块）；cfg_size : 字节数（含 NUL）
  * 解析失败或缺失时保持默认值（video_mode=true, 1280x720），绝不破坏启动。

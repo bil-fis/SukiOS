@@ -80,6 +80,17 @@ bool fb_init(const boot_info_t *bi)
     g_fb.height = bi->fb_height;
     g_fb.bpp    = bi->fb_bpp;
     g_fb.ready  = true;
+    /* 诊断：报告 GRUB 实际转交的硬件帧缓冲分辨率（可能因 QEMU/VBE 不支持
+     * 而回退，未必等于配置里请求的 1280x720）。验证显示服务真实画布尺寸。 */
+    serial_writestr("[fb] real framebuffer: ");
+    serial_write_dec(g_fb.width);
+    serial_writestr("x");
+    serial_write_dec(g_fb.height);
+    serial_writestr(" pitch=");
+    serial_write_dec(g_fb.pitch);
+    serial_writestr(" bpp=");
+    serial_write_dec(g_fb.bpp);
+    serial_writestr("\n");
     return true;
 }
 

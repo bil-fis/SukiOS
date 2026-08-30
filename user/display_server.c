@@ -1,166 +1,384 @@
 /*
  * user/display_server.c
  * -----------------------------------------------------------------------------
- * SukiOS 显示服务（Ring3，DISPLAY_PORT=3）—— 图形合成层。
+ * SukiOS Ring3 显示合成服务（.ssvc）。
  *
- * 职责（与内核分工）：
- *   - 内核 framebuffer.c 负责底层显存驱动与 fbcon 文本光栅化（已有）；
- *   - 显示服务负责「合成」：根据 configs/display.cfg 的配置（video_mode 开关、
- *     逻辑分辨率 1280x720 等）决定是否启用视频合成，并在帧缓冲上绘制桌面层。
- *
- * 工作流程：
- *   1. 认领 DISPLAY_PORT（A2 项 IPC 能力）。
- *   2. 调用 SYS_FRAMEBUFFER_MAP 取得帧缓冲用户态映射 + 实际/逻辑分辨率。
- *      - video_mode=on 且帧缓冲就绪：enabled=1，拿到用户虚拟地址，绘制合成桌面；
- *      - video_mode=off 或帧缓冲不可用：enabled=0，降级为纯文本转发（sys_debug_write），
- *        保持「纯文本输出」语义（不碰帧缓冲）。
+ * 职责：
+ *   1. 认领 DISPLAY_PORT，经 SYS_FRAMEBUFFER_MAP 获得帧缓冲的用户态映射。
+ *   2. 合成「桌面」：背景 + 应用边框 + 标题栏（标注分辨率）+ 终端客户区底色。
  *   3. 进入消息循环：接收 SHELL/其它组件经 DISPLAY_PORT 发来的 DISP_MSG_TEXT，
- *      视频模式时绘制到客户区，文本模式时转发 sys_debug_write。
+ *      把文本【真正栅格化】渲染到桌面内嵌的终端窗口（内嵌 8x8 点阵字体，
+ *      放大 2x），并增量写屏——不再只是转发串口。
+ *   4. 调用 SYS_DISPLAY_READY 通知内核：此后内核 user_puts() 不再直接写帧缓冲
+ *      （否则会覆盖本服务合成好的桌面），改把文本经 IPC 交本服务渲染。
  *
- * 验证（headless）：服务在串口打印 [display] 模式/映射/分辨率等关键信息，
- * 经 -serial file 落盘后由 grep 判读；无头无法看像素，需人工在 QEMU 窗口确认
- * 桌面合成层（背景/边框/标题栏/分辨率标注）正确。
+ * 关键：本服务是帧缓冲的唯一写入者（合成器模型）。内核/ shell 文本经由 IPC
+ * 到达后，由本服务决定如何呈现在终端客户区，从而「画面是桌面而非控制台 shell」。
+ *
+ * 编译：USER_PROGS += display_server（Makefile）；内嵌进内核（user_display_server_*）。
  */
-#include "lib/suki.h"
-#include <kernel/framebuffer.h>   /* fb_map_result_t：SYS_FRAMEBUFFER_MAP 返回结构 */
-#include <stddef.h>
+#include "lib/suki.h"   /* suki_syscall* / mach_msg* / u_print / udbg_printf */
 
 #ifndef DISP_MSG_TEXT
-#define DISP_MSG_TEXT 1           /* shell 经 DISPLAY_PORT 发送的文本消息 id */
+#define DISP_MSG_TEXT 1   /* shell 经 DISPLAY_PORT 发送的文本消息 id */
 #endif
 
-/* 桌面合成层调色板（XRGB 小端，与内核 FB_* 一致） */
-#define DSP_BG      0x00101828u   /* 深色背景 */
-#define DSP_BAR     0x00579BFEu   /* 标题栏蓝 */
-#define DSP_BORDER  0x008BE9FDu   /* 边框青 */
-#define DSP_TEXT    0x00FFFFFFu   /* 文本白 */
-#define DSP_PANEL   0x001E2A3Au   /* 客户区面板 */
+/* SYS_FRAMEBUFFER_MAP 返回结构（与 kernel/syscall/syscall.c:sys_framebuffer_map
+ * 填写的字段严格一致；内核未导出到用户头，此处独立定义）。 */
+typedef struct {
+    uint64_t enabled;       /* 1=视频模式可用, 0=纯文本回退 */
+    uint64_t fb_user_va;    /* 帧缓冲用户态映射基址 */
+    uint64_t fb_phys;       /* 帧缓冲物理地址 */
+    uint32_t pitch;         /* 每行字节数（stride） */
+    uint32_t width;         /* 硬件帧缓冲宽 */
+    uint32_t height;        /* 硬件帧缓冲高 */
+    uint32_t bpp;           /* 每像素位数（32） */
+    uint32_t cfg_width;     /* 配置文件逻辑宽 */
+    uint32_t cfg_height;    /* 配置文件逻辑高 */
+} fb_map_result_t;
 
-/* 在帧缓冲用户虚拟地址上画一个 32bpp 像素（fb 已是线性 XRGB） */
-static inline void put_px(uint32_t *fb, uint32_t pitch, uint32_t x, uint32_t y,
-                          uint32_t color)
+/* ---- 内嵌 8x8 点阵字体（公有领域 font8x8_basic，ASCII 0x20-0x7E）----
+ * 与内核 framebuffer 控制台同款字模；bit0(LSB)=最左像素，行主序，每行 1 字节。
+ * 渲染时放大 2x（每字模像素 → 2x2 实心块），与内核 fbcon 视觉一致。 */
+static const uint8_t g_font[128][8] = {
+    [0x20] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    [0x21] = {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},
+    [0x22] = {0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00},
+    [0x23] = {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
+    [0x24] = {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00},
+    [0x25] = {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},
+    [0x26] = {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00},
+    [0x27] = {0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00},
+    [0x28] = {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00},
+    [0x29] = {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},
+    [0x2A] = {0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00},
+    [0x2B] = {0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00},
+    [0x2C] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06},
+    [0x2D] = {0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00},
+    [0x2E] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00},
+    [0x2F] = {0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00},
+    [0x30] = {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00},
+    [0x31] = {0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},
+    [0x32] = {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00},
+    [0x33] = {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00},
+    [0x34] = {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00},
+    [0x35] = {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00},
+    [0x36] = {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00},
+    [0x37] = {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00},
+    [0x38] = {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00},
+    [0x39] = {0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00},
+    [0x3A] = {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00},
+    [0x3B] = {0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06},
+    [0x3C] = {0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00},
+    [0x3D] = {0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00},
+    [0x3E] = {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00},
+    [0x3F] = {0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00},
+    [0x40] = {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00},
+    [0x41] = {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},
+    [0x42] = {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00},
+    [0x43] = {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00},
+    [0x44] = {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00},
+    [0x45] = {0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00},
+    [0x46] = {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00},
+    [0x47] = {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00},
+    [0x48] = {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00},
+    [0x49] = {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
+    [0x4A] = {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00},
+    [0x4B] = {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00},
+    [0x4C] = {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00},
+    [0x4D] = {0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00},
+    [0x4E] = {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00},
+    [0x4F] = {0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00},
+    [0x50] = {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00},
+    [0x51] = {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00},
+    [0x52] = {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00},
+    [0x53] = {0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00},
+    [0x54] = {0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
+    [0x55] = {0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00},
+    [0x56] = {0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00},
+    [0x57] = {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
+    [0x58] = {0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00},
+    [0x59] = {0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00},
+    [0x5A] = {0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00},
+    [0x5B] = {0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00},
+    [0x5C] = {0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00},
+    [0x5D] = {0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00},
+    [0x5E] = {0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00},
+    [0x5F] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF},
+    [0x60] = {0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00},
+    [0x61] = {0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00},
+    [0x62] = {0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00},
+    [0x63] = {0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00},
+    [0x64] = {0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00},
+    [0x65] = {0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00},
+    [0x66] = {0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00},
+    [0x67] = {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F},
+    [0x68] = {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00},
+    [0x69] = {0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00},
+    [0x6A] = {0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E},
+    [0x6B] = {0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00},
+    [0x6C] = {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00},
+    [0x6D] = {0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00},
+    [0x6E] = {0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00},
+    [0x6F] = {0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00},
+    [0x70] = {0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F},
+    [0x71] = {0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78},
+    [0x72] = {0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00},
+    [0x73] = {0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00},
+    [0x74] = {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00},
+    [0x75] = {0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00},
+    [0x76] = {0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00},
+    [0x77] = {0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00},
+    [0x78] = {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00},
+    [0x79] = {0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F},
+    [0x7A] = {0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00},
+    [0x7B] = {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00},
+    [0x7C] = {0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00},
+    [0x7D] = {0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00},
+    [0x7E] = {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00},
+};
+
+/* 全局帧缓冲视图 */
+static volatile uint32_t *g_fb = 0;     /* 用户态映射的帧缓冲（32bpp 像素数组） */
+static uint32_t g_fb_pitch = 0;         /* 每行字节数 */
+static uint32_t g_fb_w = 0, g_fb_h = 0; /* 硬件分辨率 */
+
+/* 终端客户区与光标状态 */
+#define CHAR_W 8
+#define CHAR_H 8
+#define SCALE  2                 /* 字模放大倍数（像素 = 字模像素 * SCALE） */
+#define GLYPH_W (CHAR_W * SCALE)
+#define GLYPH_H (CHAR_H * SCALE)
+
+/* 桌面装饰尺寸 */
+#define WIN_MARGIN  60           /* 应用窗口外边距 */
+#define TITLE_H    28            /* 标题栏高度 */
+#define TERM_PAD    18           /* 终端区内边距 */
+
+/* 颜色（0xAARRGGBB 的 RGB，32bpp 帧缓冲） */
+#define COL_BG      0x0B0B14     /* 整屏背景（深蓝黑） */
+#define COL_WIN     0x12121F     /* 应用窗口底色 */
+#define COL_TITLE   0x23244A     /* 标题栏 */
+#define COL_BORDER  0x3A3C66     /* 应用窗口边框 */
+#define COL_TERM    0x070710     /* 终端客户区底色 */
+#define COL_FG      0xC9CAD6     /* 终端前景（亮灰） */
+#define COL_TITLE_FG 0x9AA0E0    /* 标题栏文字 */
+
+/* 终端文本缓冲（用于滚屏重绘源） */
+static int  g_term_cx = 0;       /* 当前列（字符格） */
+static int  g_term_cy = 0;       /* 当前行（字符格） */
+static int  g_term_cols = 0;     /* 客户区可容纳列数 */
+static int  g_term_rows = 0;     /* 客户区可容纳行数 */
+static uint32_t g_term_x0 = 0;   /* 客户区左上角 x（像素） */
+static uint32_t g_term_y0 = 0;   /* 客户区左上角 y（像素） */
+
+/* 像素绘制（带边界保护） */
+static inline void put_px(uint32_t x, uint32_t y, uint32_t c)
 {
-    uint32_t *row = (uint32_t *)((uint8_t *)fb + (uint64_t)y * pitch);
-    row[x] = color;
+    if (x >= g_fb_w || y >= g_fb_h) return;
+    g_fb[y * (g_fb_pitch / 4) + x] = c;
 }
 
-/* 填充矩形 */
-static void fill_rect(uint32_t *fb, uint32_t pitch, uint32_t x, uint32_t y,
-                      uint32_t w, uint32_t h, uint32_t color)
+/* 客户端区（x,y,w,h）填充矩形 */
+static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t c)
 {
-    for (uint32_t j = 0; j < h; j++)
-        for (uint32_t i = 0; i < w; i++)
-            put_px(fb, pitch, x + i, y + j, color);
-}
-
-/* 绘制桌面合成层：背景 + 边框 + 标题栏 + 分辨率指示矩形（按配置缩放映射）。 */
-static void draw_desktop(uint32_t *fb, uint32_t pitch, uint32_t fw, uint32_t fh,
-                         uint32_t cfg_w, uint32_t cfg_h)
-{
-    /* 整体背景 */
-    fill_rect(fb, pitch, 0, 0, fw, fh, DSP_BG);
-
-    /* 外边框（4px） */
-    const uint32_t bw = 4;
-    fill_rect(fb, pitch, 0, 0, fw, bw, DSP_BORDER);
-    fill_rect(fb, pitch, 0, fh - bw, fw, bw, DSP_BORDER);
-    fill_rect(fb, pitch, 0, 0, bw, fh, DSP_BORDER);
-    fill_rect(fb, pitch, fw - bw, 0, bw, fh, DSP_BORDER);
-
-    /* 顶部标题栏（高 24px） */
-    fill_rect(fb, pitch, bw, bw, fw - 2 * bw, 24, DSP_BAR);
-
-    /* 客户区面板（标题栏下方内缩 8px） */
-    fill_rect(fb, pitch, bw + 8, bw + 24 + 8,
-              fw - 2 * bw - 16, fh - (bw + 24 + 8) - bw - 8, DSP_PANEL);
-
-    /* 分辨率指示矩形：把配置逻辑分辨率等比缩放进客户区中央，
-     * 直观证明「配置文件的分辨率」真正影响了合成画面。 */
-    uint32_t cw = fw - 2 * bw - 16;
-    uint32_t ch = fh - (bw + 24 + 8) - bw - 8;
-    uint32_t rx, ry, rw, rh;
-    if (cfg_w * ch >= cfg_h * cw) {
-        rw = cw * 3 / 4;
-        rh = (uint32_t)((uint64_t)rw * cfg_h / cfg_w);
-    } else {
-        rh = ch * 3 / 4;
-        rw = (uint32_t)((uint64_t)rh * cfg_w / cfg_h);
+    for (uint32_t j = 0; j < h; j++) {
+        for (uint32_t i = 0; i < w; i++) {
+            put_px(x + i, y + j, c);
+        }
     }
-    rx = bw + 8 + (cw - rw) / 2;
-    ry = bw + 24 + 8 + (ch - rh) / 2;
-    fill_rect(fb, pitch, rx, ry, rw, rh, 0x0050FA7Bu);  /* 绿：配置分辨率的「桌面」 */
+}
+
+/* 绘制一个字符到 (px,py) 像素位置（放大 SCALE）。前景 fg，背景 bg（先擦） */
+static void draw_glyph(uint32_t px, uint32_t py, char ch, uint32_t fg, uint32_t bg)
+{
+    uint8_t c = (uint8_t)ch;
+    if (c < 0x20 || c > 0x7E) c = 0x20;
+    const uint8_t *g = g_font[c];
+    for (int row = 0; row < CHAR_H; row++) {
+        uint8_t bits = g[row];
+        for (int col = 0; col < CHAR_W; col++) {
+            uint32_t color = (bits & (1u << (7 - col))) ? fg : bg;
+            uint32_t x0 = px + col * SCALE;
+            uint32_t y0 = py + row * SCALE;
+            for (int sy = 0; sy < SCALE; sy++)
+                for (int sx = 0; sx < SCALE; sx++)
+                    put_px(x0 + sx, y0 + sy, color);
+        }
+    }
+}
+
+/* 终端滚屏：客户区整体上移一行（GLYPH_H 像素），末行清空 */
+static void term_scroll(void)
+{
+    uint32_t rows = g_fb_pitch / 4;
+    uint32_t y0 = g_term_y0;
+    uint32_t y1 = y0 + GLYPH_H;
+    uint32_t h  = (g_term_cy + 1) * GLYPH_H; /* 当前已用高度 */
+    if (y1 + h > g_term_y0 + (uint32_t)g_term_rows * GLYPH_H)
+        h = g_term_y0 + (uint32_t)g_term_rows * GLYPH_H - y1;
+    /* 逐行 memmove（帧缓冲按行 stride 拷贝） */
+    for (uint32_t y = 0; y < h; y++) {
+        uint32_t *dst = (uint32_t*)&g_fb[(y0 + y) * rows];
+        uint32_t *src = (uint32_t*)&g_fb[(y1 + y) * rows];
+        for (uint32_t x = 0; x < (uint32_t)g_term_cols * GLYPH_W; x++)
+            dst[x] = src[x];
+    }
+    /* 清空末行 */
+    uint32_t last_y = g_term_y0 + (uint32_t)(g_term_rows - 1) * GLYPH_H;
+    fill_rect(g_term_x0, last_y,
+              (uint32_t)g_term_cols * GLYPH_W, GLYPH_H, COL_TERM);
+}
+
+/* 写单个字符到终端（处理控制字符与滚屏） */
+static void term_putc(char ch)
+{
+    if (ch == '\n') {
+        g_term_cx = 0;
+        g_term_cy++;
+        if (g_term_cy >= g_term_rows) {
+            g_term_cy = g_term_rows - 1;
+            term_scroll();
+        }
+        return;
+    }
+    if (ch == '\r') { g_term_cx = 0; return; }
+    if (ch == '\t') {
+        int n = 4 - (g_term_cx & 3);
+        for (int i = 0; i < n; i++) term_putc(' ');
+        return;
+    }
+    if (ch == '\b') {
+        if (g_term_cx > 0) g_term_cx--;
+        uint32_t px = g_term_x0 + (uint32_t)g_term_cx * GLYPH_W;
+        uint32_t py = g_term_y0 + (uint32_t)g_term_cy * GLYPH_H;
+        fill_rect(px, py, GLYPH_W, GLYPH_H, COL_TERM);
+        return;
+    }
+    if (ch < 0x20) return; /* 其它控制字符忽略 */
+
+    if (g_term_cx >= g_term_cols) {
+        g_term_cx = 0;
+        g_term_cy++;
+        if (g_term_cy >= g_term_rows) {
+            g_term_cy = g_term_rows - 1;
+            term_scroll();
+        }
+    }
+    uint32_t px = g_term_x0 + (uint32_t)g_term_cx * GLYPH_W;
+    uint32_t py = g_term_y0 + (uint32_t)g_term_cy * GLYPH_H;
+    draw_glyph(px, py, ch, COL_FG, COL_TERM);
+    g_term_cx++;
+}
+
+/* 终端写字符串 */
+static void term_puts(const char *s)
+{
+    for (const char *p = s; *p; p++) {
+        term_putc(*p);
+    }
+}
+
+/* 绘制桌面（背景 + 应用窗口 + 标题栏 + 终端客户区） */
+static void draw_desktop(uint32_t cfg_w, uint32_t cfg_h)
+{
+    fill_rect(0, 0, g_fb_w, g_fb_h, COL_BG);
+
+    /* 应用窗口 */
+    uint32_t wx = WIN_MARGIN, wy = WIN_MARGIN;
+    uint32_t ww = g_fb_w - 2 * WIN_MARGIN;
+    uint32_t wh = g_fb_h - 2 * WIN_MARGIN;
+    fill_rect(wx, wy, ww, wh, COL_WIN);
+    /* 边框（双线） */
+    fill_rect(wx, wy, ww, 2, COL_BORDER);
+    fill_rect(wx, wy + wh - 2, ww, 2, COL_BORDER);
+    fill_rect(wx, wy, 2, wh, COL_BORDER);
+    fill_rect(wx + ww - 2, wy, 2, wh, COL_BORDER);
+
+    /* 标题栏 */
+    fill_rect(wx + 2, wy + 2, ww - 4, TITLE_H, COL_TITLE);
+    /* 标题栏三个圆点（红黄绿） */
+    fill_rect(wx + 14, wy + 12, 6, 6, 0xD05050);
+    fill_rect(wx + 26, wy + 12, 6, 6, 0xD0C050);
+    fill_rect(wx + 38, wy + 12, 6, 6, 0x50C060);
+    /* 标题文字 */
+    const char *title = "SukiOS Display Server";
+    uint32_t tx = wx + 60, ty = wy + 8;
+    for (const char *p = title; *p; p++) {
+        draw_glyph(tx, ty, *p, COL_TITLE_FG, COL_TITLE);
+        tx += GLYPH_W;
+    }
+
+    /* 终端客户区 */
+    g_term_x0 = wx + TERM_PAD;
+    g_term_y0 = wy + TITLE_H + TERM_PAD;
+    uint32_t term_w = ww - 2 * TERM_PAD;
+    uint32_t term_h = wh - TITLE_H - 2 * TERM_PAD;
+    fill_rect(g_term_x0, g_term_y0, term_w, term_h, COL_TERM);
+
+    g_term_cols = (int)(term_w / GLYPH_W);
+    g_term_rows = (int)(term_h / GLYPH_H);
+    if (g_term_cols < 1) g_term_cols = 1;
+    if (g_term_rows < 1) g_term_rows = 1;
+    g_term_cx = 0;
+    g_term_cy = 0;
+
+    (void)cfg_w; (void)cfg_h;
 }
 
 int main(void)
 {
-    udbg_printf("[display] main entered\n");
-    /* 1. 认领显示端口 */
+    u_print("[display] starting (Ring3 display compositor)...\n");
+
+    /* 认领显示端口（仅本服务可接收经 DISPLAY_PORT 转发的文本） */
     sys_port_claim(DISPLAY_PORT);
-    udbg_printf("[display] port claimed\n");
+    udbg_printf("[display] port claimed (DISPLAY_PORT)\n");
 
-    /* 2. 取得帧缓冲映射与配置 */
+    /* 获取帧缓冲用户态映射 */
     fb_map_result_t res;
-    long r = (long)suki_syscall6(SYS_FRAMEBUFFER_MAP, (uint64_t)&res, 0, 0, 0, 0, 0);
-    udbg_printf("[display] SYS_FRAMEBUFFER_MAP returned ");
-    udbg_printf(u_utoa_s((uint64_t)r, (char[12]){0}, 12));
-    udbg_printf("\n");
+    memset(&res, 0, sizeof(res));
+    suki_syscall6(SYS_FRAMEBUFFER_MAP, (uint64_t)&res,
+                  sizeof(res), 0, 0, 0, 0);
 
-    if (r == 0 && res.enabled) {
-        uint32_t *fb = (uint32_t *)(uintptr_t)res.fb_user_va;
-        /* 绘制桌面合成层 */
-        draw_desktop(fb, res.pitch, res.width, res.height,
-                     res.cfg_width, res.cfg_height);
-
-        /* 关键状态：无条件打印，确保 make run 下也能确认显示服务就绪 */
-        u_print("[display] VIDEO MODE active (desktop composited)\n");
-        /* 详细诊断：受 CONFIG_DEBUG_SERIAL 开关控制（make run-dbg 才输出） */
-        udbg_printf("[display] fb mapped @user_va=");
-        udbg_printf(u_utoa_s((uint64_t)res.fb_user_va, (char[24]){0}, 24));
-        udbg_printf(" phys=");
-        udbg_printf(u_utoa_s(res.fb_phys, (char[24]){0}, 24));
-        udbg_printf(" fb=");
-        udbg_printf(u_utoa_s(res.width, (char[12]){0}, 12));
-        udbg_printf("x");
-        udbg_printf(u_utoa_s(res.height, (char[12]){0}, 12));
-        udbg_printf(" pitch=");
-        udbg_printf(u_utoa_s(res.pitch, (char[12]){0}, 12));
-        udbg_printf(" cfg=");
-        udbg_printf(u_utoa_s(res.cfg_width, (char[12]){0}, 12));
-        udbg_printf("x");
-        udbg_printf(u_utoa_s(res.cfg_height, (char[12]){0}, 12));
-        udbg_printf("\n");
-
-        /* 消息循环：接收文本并绘制到客户区（本期复用内核 fbcon 文本路径，
-         * 显示服务仅做端口路由 + 已合成桌面层；后续里程碑接 GUI 文本栅格化） */
-        static uint8_t mbuf[512];
+    if (!res.enabled) {
+        /* 纯文本回退：仍通知内核本服务就绪（shell 文本会经 IPC 转发，
+         * 但无帧缓冲，这里继续走串口日志），保证不丢文本。 */
+        u_print("[display] TEXT MODE (no framebuffer): routing console to serial\n");
+        suki_syscall1(SYS_DISPLAY_READY, 0);
         for (;;) {
-            mach_msg_header_t *h = (mach_msg_header_t *)mbuf;
-            if (mach_msg_recv(mbuf, sizeof(mbuf), DISPLAY_PORT) == 0) {
-                if (h->msgh_id == DISP_MSG_TEXT) {
-                    /* 文本模式由内核 fbcon 直接显示；显示服务转发一份到串口日志，
-                     * 便于 headless 验证端口链路通畅 */
-                    const char *txt = (const char *)(mbuf + sizeof(mach_msg_header_t));
-                    u_print("[display] got text via DISPLAY_PORT: ");
-                    u_print(txt);
-                }
+            uint8_t msg[4096];
+            mach_msg_recv(msg, sizeof(msg), DISPLAY_PORT);
+            mach_msg_header_t *h = (mach_msg_header_t *)msg;
+            if (h->msgh_id == DISP_MSG_TEXT) {
+                u_print((const char *)(msg + sizeof(mach_msg_header_t)));
             }
-            sys_yield();
-        }
-    } else {
-        /* 纯文本回退：不碰帧缓冲，仅做端口路由转发 */
-        u_print("[display] TEXT MODE: video_mode=off or no framebuffer; "
-                "falling back to plain text output (no compositing)\n");
-
-        static uint8_t mbuf[512];
-        for (;;) {
-            mach_msg_header_t *h = (mach_msg_header_t *)mbuf;
-            if (mach_msg_recv(mbuf, sizeof(mbuf), DISPLAY_PORT) == 0) {
-                if (h->msgh_id == DISP_MSG_TEXT) {
-                    const char *txt = (const char *)(mbuf + sizeof(mach_msg_header_t));
-                    sys_debug_write(txt, u_strlen(txt));  /* 转发到内核文本输出 */
-                }
-            }
-            sys_yield();
         }
     }
+
+    g_fb       = (volatile uint32_t *)res.fb_user_va;
+    g_fb_pitch = res.pitch;
+    g_fb_w     = res.width;
+    g_fb_h     = res.height;
+
+    u_print("[display] VIDEO MODE active (desktop composited)\n");
+
+    /* 合成桌面（背景 + 窗口 + 标题栏 + 终端客户区） */
+    draw_desktop(res.cfg_width, res.cfg_height);
+
+    /* 握手：告知内核「我已就绪，可以接收经 IPC 转发的控制台文本」。
+     * 此后内核 user_puts() 不再直接写帧缓冲，避免覆盖本服务合成画面。 */
+    suki_syscall1(SYS_DISPLAY_READY, 0);
+
+    /* 进入合成器消息循环：接收 DISP_MSG_TEXT 并栅格化渲染到终端客户区 */
+    for (;;) {
+        uint8_t msg[4096];
+        mach_msg_recv(msg, sizeof(msg), DISPLAY_PORT);
+        mach_msg_header_t *h = (mach_msg_header_t *)msg;
+        if (h->msgh_id == DISP_MSG_TEXT) {
+            const char *text = (const char *)(msg + sizeof(mach_msg_header_t));
+            term_puts(text);
+        }
+    }
+
+    return 0;
 }

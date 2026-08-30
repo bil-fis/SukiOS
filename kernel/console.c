@@ -25,6 +25,8 @@
 #include <kernel/diagnostics.h>
 #include <kernel/spinlock.h>
 #include <kernel/smp.h>
+#include <kernel/display_cfg.h>
+#include <ipc/port.h>
 #include <stdarg.h>
 
 /* P0-3：kprintf 跨 CPU 串行化自旋锁。spin_lock_irqsave = 关本地中断 +
@@ -120,11 +122,49 @@ static void print_int(int64_t val)
     }
 }
 
-/* 用户态控制台输出（sys_debug_write -> 此处）。直接写帧缓冲 + 串口，
- * 不经由 kprintf 的 g_kernel_fb_diag 开关，确保 Ring3 shell/UI 文本恒定
- * 显示在图形终端，与内核诊断日志互不污染。 */
+/* 控制台文本消息：内核经 DISPLAY_PORT 转发给显示服务，由其渲染到桌面终端窗口。
+ * 与 user/display_server.c 的 DISP_MSG_TEXT 保持一致（用 #ifndef 防止重复定义）。 */
+#ifndef DISP_MSG_TEXT
+#define DISP_MSG_TEXT 1
+#endif
+#define USER_PUTS_MAX 256   /* 单条转发文本上限（shell 行输出远小于此） */
+
+/* 用户态控制台输出（sys_debug_write -> 此处）。
+ * 策略：
+ *   - 显示服务已激活（g_display_active）且帧缓冲可用：把文本经 IPC 转交显示服务，
+ *     由它在桌面内合成「终端窗口」渲染，内核【不再直接写帧缓冲】——否则会覆盖
+ *     显示服务已经画好的合成桌面（这正是「画面还是控制台 shell」的根因）。
+ *   - 未激活或转发失败（端口队列满/内存紧张）：降级为直接 fbcon/vga + 串口，
+ *     保证文本在任何情况下都不丢失。
+ * 串口日志恒定输出，便于无图形场景也能看到 Ring3 输出。 */
 void user_puts(const char *s)
 {
+    if (g_display_active && g_use_fb) {
+        char buf[USER_PUTS_MAX];
+        uint32_t n = 0;
+        for (const char *p = s; *p && n < USER_PUTS_MAX - 1; p++) {
+            buf[n++] = *p;
+        }
+        buf[n] = 0;
+
+        uint8_t msg[sizeof(mach_msg_header_t) + USER_PUTS_MAX];
+        memset(msg, 0, sizeof(msg));
+        mach_msg_header_t *h = (mach_msg_header_t *)msg;
+        h->msgh_bits        = 0;
+        h->msgh_size        = sizeof(*h) + (uint32_t)strlen(buf) + 1;
+        h->msgh_remote_port = DISPLAY_PORT;
+        h->msgh_local_port  = PORT_NULL;
+        h->msgh_id          = DISP_MSG_TEXT;
+        h->msgh_reserved    = 0;
+        memcpy(msg + sizeof(*h), buf, n + 1);
+
+        if (ipc_send_kernel(DISPLAY_PORT, msg, h->msgh_size) == MACH_MSG_SUCCESS) {
+            serial_writestr(s);   /* 转发成功：仅串口留底，避免再写屏覆盖桌面 */
+            return;
+        }
+        /* 转发失败（队列满/未就绪）：降级直接写屏 + 串口 */
+    }
+
     if (g_use_fb) {
         fbcon_write(s);
     } else {

@@ -360,12 +360,14 @@ $(KERNEL): $(OBJS) $(RELK) boot/linker.ld
 
 # ---- 生成可引导 ISO (BIOS + UEFI 双启动) ----
 iso: $(ISO)
-$(ISO): $(KERNEL) grub/grub.cfg
+$(ISO): $(KERNEL) grub/grub.cfg configs/display.cfg
 	@mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.ski
 	cp grub/grub.cfg $(ISODIR)/boot/grub/grub.cfg
 	# 显示服务配置文件：经 GRUB module2 加载，内核在 fb_init 前解析。
-	-cp configs/display.cfg $(ISODIR)/boot/display.cfg
+	# 去掉 `-` 前缀：配置缺失应显式失败而非静默跳过，避免 ISO 不含配置导致
+	# 内核误用旧缓存/残留内容而把 video_mode 解析成错误值。
+	cp configs/display.cfg $(ISODIR)/boot/display.cfg
 	grub-mkrescue -o $(ISO) $(ISODIR) 2>/dev/null
 	@echo "==> Built $(ISO)"
 

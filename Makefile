@@ -20,7 +20,7 @@ endif
 # ---- 目录 ----
 BUILD  := build
 ISODIR := $(BUILD)/isodir
-KERNEL := $(BUILD)/kernel.elf
+KERNEL := $(BUILD)/kernel.ski
 ISO    := $(BUILD)/SukiOS.iso
 
 # =============================================================================
@@ -43,6 +43,16 @@ ISO    := $(BUILD)/SukiOS.iso
 # =============================================================================
 SMP        ?= 0
 CONFIG_SMP := $(if $(filter 1,$(SMP)),1,0)
+
+# ---- 串口冗长诊断输出开关（CONFIG_DEBUG_SERIAL）----
+# 默认 0：make run 产出的内核不含 IPC/disk-srv/console-srv 的逐条调试日志，
+# 串口流量极小，系统全速运行（串口 PIO 输出极慢，完整 POSIX 层并发时每秒
+# 数百条 IPC 若全打印会刷爆串口、严重拖慢系统）。
+#   make run      -> CONFIG_DEBUG_SERIAL=0（默认）
+#   make run-dbg  -> CONFIG_DEBUG_SERIAL=1，输出全部冗长诊断
+# 经 build/config.h 注入到每个内核/用户编译单元（与 CONFIG_SMP 同机制）。
+DBG                  ?= 0
+CONFIG_DEBUG_SERIAL  := $(if $(filter 1,$(DBG)),1,0)
 
 # 配置注入载体：由本 Makefile 生成，经 `-include` 插入到每个内核编译单元的
 # 最前面。它被 -MMD 记录进 .d 依赖文件，因此 SMP 开关一改，全部 .o 自动
@@ -104,7 +114,10 @@ FATFS_OBJS := $(BUILD)/fatfs/ff.c.o $(BUILD)/fatfs/ffunicode.c.o $(BUILD)/fatfs/
 # 注意：ffsystem.c 在 FF_USE_LFN!=3 且 FF_FS_REENTRANT==0 时整文件被 #if 屏蔽，
 # 故不编入；ff_memalloc/ff_memfree 由 user/lib/suki.c 的简易堆提供。
 
-USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.blob.o,$(USER_PROGS))
+# 系统服务以 .ssvc 后缀作为内核内嵌 blob 的产物名（官方后缀：系统服务 → .ssvc）。
+# 逻辑名（fs_server 等）保持不变，内核符号 user_fs_server_start 由 blob 规则用
+# $(basename $*) 剥离 .ssvc 后缀得到，故 kmain.c 无需改动。
+USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.ssvc.blob.o,$(USER_PROGS))
 
 # ---- 独立程序（standalone apps，源码在 user/apps/）----
 # 这些程序不嵌入内核，仅放入 FAT32 磁盘的 ::BIN/ 目录（文件名无 .elf 后缀），
@@ -179,7 +192,7 @@ QEMU_AUDIODRV ?= pa
 QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
                -device intel-hda -device hda-duplex,audiodev=snd0
 
-.PHONY: all iso run run-headless run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk FORCE
+.PHONY: all iso run run-headless run-dbg run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk FORCE
 
 all: $(KERNEL)
 
@@ -187,7 +200,8 @@ info:
 	@echo "Toolchain : $(TOOLCHAIN)"
 	@echo "CC        : $(CC)"
 	@echo "SMP       : $(CONFIG_SMP) ($(if $(filter 1,$(CONFIG_SMP)),multi-core, single-core); make SMP=1 to enable)"
-	@echo "Config    : $(CONFIG_H) (CONFIG_SMP=$(CONFIG_SMP), MAX_CPUS=$(if $(filter 1,$(CONFIG_SMP)),8,1))"
+	@echo "DEBUG     : $(CONFIG_DEBUG_SERIAL) (serial verbose diag; make run-dbg to enable DBG=1)"
+	@echo "Config    : $(CONFIG_H) (CONFIG_SMP=$(CONFIG_SMP), CONFIG_DEBUG_SERIAL=$(CONFIG_DEBUG_SERIAL), MAX_CPUS=$(if $(filter 1,$(CONFIG_SMP)),8,1))"
 	@echo "QEMU smp  : $(QEMU_SMP)"
 	@echo "Objects   : $(OBJS)"
 
@@ -237,10 +251,15 @@ $(BUILD)/user/fs_server.elf: $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATF
 # _binary_build_user_<name>_elf_start/end 符号），并重命名为
 # user_<name>_start / user_<name>_end。内核 ELF 加载器在启动任务时读取
 # 这段字节并解析 ELF64（废除平坦二进制）。
-$(BUILD)/user/%.blob.o: $(BUILD)/user/%.elf
+#
+# 模式 %.ssvc.blob.o 对应逻辑名 fs_server（% 为 fs_server），其依赖为
+# $(BUILD)/user/fs_server.elf（由通用 %.elf 规则生成）。符号用 $(basename $*)
+# 剥离 .ssvc 后缀，得到 user_fs_server_start / user_fs_server_end，与 kmain.c
+# 中硬编码的引用保持一致。
+$(BUILD)/user/%.ssvc.blob.o: $(BUILD)/user/%.elf
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-		--redefine-sym _binary_build_user_$*_elf_start=user_$*_start \
-		--redefine-sym _binary_build_user_$*_elf_end=user_$*_end \
+		--redefine-sym _binary_build_user_$*_elf_start=user_$(basename $*)_start \
+		--redefine-sym _binary_build_user_$*_elf_end=user_$(basename $*)_end \
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
 		$< $@
 	# objcopy -I binary 会丢掉 .note.GNU-stack，导致最终内核 ELF 的
@@ -268,6 +287,7 @@ $(CONFIG_H): FORCE
 	@printf '#ifndef _SUKI_BUILD_CONFIG_H\n'                     >> $@.tmp
 	@printf '#define _SUKI_BUILD_CONFIG_H\n'                     >> $@.tmp
 	@printf '#define CONFIG_SMP %s\n' '$(CONFIG_SMP)'            >> $@.tmp
+	@printf '#define CONFIG_DEBUG_SERIAL %s\n' '$(CONFIG_DEBUG_SERIAL)' >> $@.tmp
 	@printf '#endif /* _SUKI_BUILD_CONFIG_H */\n'                >> $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
@@ -326,7 +346,7 @@ $(KERNEL): $(OBJS) $(RELK) boot/linker.ld
 iso: $(ISO)
 $(ISO): $(KERNEL) grub/grub.cfg
 	@mkdir -p $(ISODIR)/boot/grub
-	cp $(KERNEL) $(ISODIR)/boot/kernel.elf
+	cp $(KERNEL) $(ISODIR)/boot/kernel.ski
 	cp grub/grub.cfg $(ISODIR)/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) $(ISODIR) 2>/dev/null
 	@echo "==> Built $(ISO)"
@@ -348,10 +368,13 @@ $(DISK): $(APP_ELFS) others_tests/moonhalo.mp3
 	mcopy -i $@ $(BUILD)/ROADMAP.TXT ::ROADMAP.TXT
 	mmd -i $@ ::SYS
 	mmd -i $@ ::BIN
+	# 独立程序（用户态二进制应用）按官方后缀体系使用 .ska：
+	# 磁盘文件名 BIN/<NAME>.SKA，shell 的 exec 在找不到原路径时会自动补 .ska，
+	# 故 `exec BIN/playaudio` 与 `exec BIN/playaudio.ska` 均可装载。
 	@for p in $(APP_PROGS); do \
 		up=$$(echo $$p | tr a-z A-Z); \
-		echo "  disk: BIN/$$up  <= $(BUILD)/apps/$$p.elf"; \
-		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up; \
+		echo "  disk: BIN/$$up.SKA  <= $(BUILD)/apps/$$p.elf"; \
+		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up.SKA; \
 	done
 	mcopy -i $@ others_tests/moonhalo.mp3 ::MOONHALO.MP3
 	@echo "==> Built FAT32 disk $(DISK)"
@@ -366,6 +389,14 @@ run: $(ISO) $(DISK)
 # ---- 无头运行 (仅串口，用于自动化验证) ----
 run-headless: $(ISO) $(DISK)
 	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
+
+# ---- 调试运行（带全部串口冗长诊断） ----
+# 通过递归子 make 把 DBG=1 作为全局变量传入，确保 build/config.h 生成
+# CONFIG_DEBUG_SERIAL=1（触发全量重编），从而输出 IPC/disk-srv/console-srv
+# 的逐条追踪日志。其余与 run 完全一致。-display none 便于无图形环境自动化
+# 验证（串口即诊断输出通道）。
+run-dbg:
+	$(MAKE) DBG=1 run-headless
 
 # P0-7：磁盘挂 AHCI（DMA+中断），验证 kernel/drivers/ahci.c
 run-ahci: $(ISO) $(DISK)

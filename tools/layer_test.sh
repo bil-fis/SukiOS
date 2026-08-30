@@ -19,14 +19,14 @@ echo "[test] TL=$TL AP=$AP DS=$DS  -> $LOG"
 
 # 2) 仅重建受影响的对象（kmain.o + 重链 kernel.elf），跳过 ISO/disk
 cd "$ROOT"
-make build/kernel.elf >/tmp/sukios_make.log 2>&1 || { echo "[test] MAKE FAILED"; tail -30 /tmp/sukios_make.log; exit 1; }
+make build/kernel.ski >/tmp/sukios_make.log 2>&1 || { echo "[test] MAKE FAILED"; tail -30 /tmp/sukios_make.log; exit 1; }
 
 # 3) PVH 直启：串口落盘 + -d int 捕获异常 + -no-reboot（避免重启掩盖卡死）
 rm -f "$LOG" "$INTLOG"
 timeout "$SECS" qemu-system-x86_64 \
   -machine pc,accel=kvm -cpu host -smp 1 -m 2G -no-shutdown \
   -display none -serial file:"$LOG" \
-  -kernel build/kernel.elf -append "pvh" \
+  -kernel build/kernel.ski -append "pvh" \
   -drive file=build/disk.img,format=raw,index=0,media=disk \
   -d int -D "$INTLOG" -no-reboot \
   >/dev/null 2>&1

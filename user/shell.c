@@ -230,8 +230,34 @@ static void run_command(char *line)
             }
             argv[ac] = NULL;
             /* spawn 一个独立子任务运行该程序，当前 shell 阻塞等待其退出，
-             * 子任务结束后 shell 重新接管（不会像 execve 那样被替换掉）。 */
+             * 子任务结束后 shell 重新接管（不会像 execve 那样被替换掉）。
+             *
+             * 独立应用按官方后缀体系带 .ska（磁盘文件名 BIN/<NAME>.SKA）。
+             * 为兼容用户习惯，若输入路径不含 '.' 后缀（如 `exec BIN/playaudio`）
+             * 则自动尝试补 .ska / .SKA 再 spawn（文件名大小写不敏感由 FatFs 处理）。 */
             int pid = sys_task_spawn(argv[0], argv, NULL);
+            if (pid < 0) {
+                /* 用户可能省略了独立应用后缀 .ska（如 `exec BIN/playaudio`），
+                 * 自动补 .ska 再尝试一次。 */
+                int has_dot = 0;
+                for (const char *q = argv[0]; *q; q++) {
+                    if (*q == '.') { has_dot = 1; break; }
+                }
+                if (!has_dot) {
+                    char ska[256];
+                    int n = 0;
+                    const char *s = argv[0];
+                    while (*s && n < (int)sizeof(ska) - 6) {
+                        ska[n++] = *s++;
+                    }
+                    ska[n]   = '.';
+                    ska[n+1] = 's';
+                    ska[n+2] = 'k';
+                    ska[n+3] = 'a';
+                    ska[n+4] = '\0';
+                    pid = sys_task_spawn(ska, argv, NULL);
+                }
+            }
             if (pid < 0) {
                 u_print("exec failed: file not found or invalid ELF\n");
             } else {

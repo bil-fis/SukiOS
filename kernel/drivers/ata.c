@@ -650,9 +650,9 @@ static void disk_srv_task(void *arg)
         }
         mach_msg_header_t *rh = (mach_msg_header_t *)req;
         uint32_t reply = rh->msgh_local_port;
-        kprintf("[disk-srv] dbg: rx id=%u n=%u reply=%u\n",
+        dbg_printf("[disk-srv] dbg: rx id=%u n=%u reply=%u\n",
                 (unsigned)rh->msgh_id, (unsigned)n, (unsigned)reply);
-        kprintf("[disk-srv] dbg: after-rx hdr_bits=%u remote=%u local=%u id=%u\n",
+        dbg_printf("[disk-srv] dbg: after-rx hdr_bits=%u remote=%u local=%u id=%u\n",
                 (unsigned)rh->msgh_bits, (unsigned)rh->msgh_remote_port,
                 (unsigned)rh->msgh_local_port, (unsigned)rh->msgh_id);
         if (reply == PORT_NULL) {
@@ -671,7 +671,7 @@ static void disk_srv_task(void *arg)
             mach_msg_header_t *h = (mach_msg_header_t *)resp;
             disk_read_resp_t *rr = (disk_read_resp_t *)(resp + sizeof(*h));
             uint8_t *data = resp + sizeof(*h) + sizeof(*rr);
-            kprintf("[disk-srv] dbg: READ branch lba=%lu count=%u -> calling blk_read\n",
+            dbg_printf("[disk-srv] dbg: READ branch lba=%lu count=%u -> calling blk_read\n",
                     (unsigned long)r->lba, (unsigned)count);
 
             bool ok = blk_read(r->lba, (uint8_t)count, data);
@@ -685,10 +685,10 @@ static void disk_srv_task(void *arg)
             h->msgh_local_port = DISK_PORT;
             h->msgh_id = DISK_MSG_READ;
             h->msgh_reserved = 0;
-            kprintf("[disk-srv] dbg: sending reply id=DISK_MSG_READ ok=%u to port=%u\n",
+            dbg_printf("[disk-srv] dbg: sending reply id=DISK_MSG_READ ok=%u to port=%u\n",
                     (unsigned)ok, (unsigned)reply);
             ipc_send_kernel(reply, resp, total);
-            kprintf("[disk-srv] dbg: reply sent to port=%u\n", (unsigned)reply);
+            dbg_printf("[disk-srv] dbg: reply sent to port=%u\n", (unsigned)reply);
         } else if (rh->msgh_id == DISK_MSG_WRITE &&
                    n >= sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)) {
             disk_write_req_t *w =
@@ -701,10 +701,10 @@ static void disk_srv_task(void *arg)
                      + count * ATA_SECTOR_SIZE) {
                 const uint8_t *data = req + sizeof(mach_msg_header_t)
                                     + sizeof(disk_write_req_t);
-                kprintf("[disk-srv] dbg: write lba=%u count=%u\n",
+                dbg_printf("[disk-srv] dbg: write lba=%u count=%u\n",
                         (unsigned)w->lba, (unsigned)count);
                 ok = blk_write(w->lba, (uint8_t)count, data);
-                kprintf("[disk-srv] dbg: write done ok=%u\n", (unsigned)ok);
+                dbg_printf("[disk-srv] dbg: write done ok=%u\n", (unsigned)ok);
             }
 
             mach_msg_header_t *h = (mach_msg_header_t *)resp;

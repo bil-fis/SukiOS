@@ -3,7 +3,7 @@
  * ---------------------------------------------------------------------------
  * Xen PVH ELF Note。当 GRUB 不可用时，QEMU 的 `-kernel` 加载器对 64 位 ELF
  * 仅支持两条路径：Linux bzImage 或 Xen PVH。本内核两者皆非，故通过此 note
- * 声明自己为 PVH 内核，从而让 `qemu -kernel build/kernel.elf` 直接进入。
+ * 声明自己为 PVH 内核，从而让 `qemu -kernel build/kernel.ski` 直接进入。
  *
  * QEMU PVH 加载器（hw/i386/pvh.c）扫描 ELF 的 SHT_NOTE 段，寻找：
  *     name = "Xen\0"   (4 字节)

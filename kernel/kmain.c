@@ -75,7 +75,7 @@ static void console_srv(void *arg)
             uint32_t len = n - (uint32_t)sizeof(mach_msg_header_t);
             char *text = (char *)buf + sizeof(mach_msg_header_t);
             text[len] = '\0';
-            kprintf("  [console-srv] got %u bytes via IPC: %s", len, text);
+            dbg_printf("  [console-srv] got %u bytes via IPC: %s", len, text);
         }
     }
 }

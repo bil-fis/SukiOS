@@ -30,7 +30,7 @@
 static kernel_port_t g_ports[PORT_MAX];
 
 /*
- * IPC_TRACE —— IPC 逐条收发追踪日志开关，默认【关闭】。
+ * ipc_trace —— IPC 逐条收发追踪日志。
  *
  * 为什么必须可关：这些 printk 在 P0 调试阶段用于定位「接收方阻塞→schedule
  * 摘链→仅置 READY 不再入队→永久死锁」，每条消息打印 2~4 行。当时全系统每秒
@@ -38,17 +38,13 @@ static kernel_port_t g_ports[PORT_MAX];
  * 往返，shell + fs-server + posixtest 并发时每秒数百条，日志会完全淹没
  * 真正有用的输出（实测 60 秒产生 1866 行 [ipc]，串口被刷爆，测试结论不可读）。
  *
- * 保留而非删除：排查 IPC 死锁时把下行的 0 改成 1 重新编译即可，无需重新
- * 编写调试代码。真正需要长期保留的「异常事件」（端口耗尽、OOL 窗口耗尽）
- * 不走本开关，无条件打印。
+ * 改为编译期开关 CONFIG_DEBUG_SERIAL 控制：
+ *   make run     -> CONFIG_DEBUG_SERIAL=0（默认）：ipc_trace 编译为空，系统全速。
+ *   make run-dbg -> CONFIG_DEBUG_SERIAL=1：输出全部 IPC 逐条追踪。
+ * 真正需要长期保留的「异常事件」（端口耗尽、OOL 窗口耗尽）不走本宏，
+ * 在下方用无条件 kprintf 打印。
  */
-#define IPC_TRACE 0
-
-#if IPC_TRACE
-#define ipc_trace(...)  kprintf(__VA_ARGS__)
-#else
-#define ipc_trace(...)  ((void)0)
-#endif
+#define ipc_trace(...)  dbg_printf(__VA_ARGS__)
 
 /* P0-R1：端口表自旋锁，取代单核 cli/sti 临界区（cli/sti 在 SMP 下不隔离
  * 其它核）。原 irq_save/irq_restore 包裹接口保留，内部改为 spin_lock_irqsave。 */
@@ -392,8 +388,8 @@ static uint64_t deliver(uint32_t dest, kernel_msg_t *m)
     spin_unlock_irqrestore(&g_port_lock, f);
     /* 唤醒所需的 RESCHED IPI 已由 enqueue→sched_wake 在解锁后发出，
      * 本处不再重复发送，避免持 g_port_lock 时切走。 */
-    ipc_trace("[ipc] deliver dest=%u queued (len=%u) woke_waiter=%s\n",
-            (unsigned)dest, (unsigned)m->size, wcpu >= 0 ? "yes" : "no");
+    ipc_trace("[ipc] deliver dest=%u queued (len=%u)\n",
+            (unsigned)dest, (unsigned)m->size);
     return MACH_MSG_SUCCESS;
 }
 

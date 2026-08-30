@@ -58,6 +58,12 @@ static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
         req.r.offset = (uint32_t)off;
         req.r.length = FS_DATA_MAX;
 
+        if (off == 0 || (off % (FS_DATA_MAX * 100)) == 0) {
+            u_print("bmploader: req off=");
+            { char d[24]; u_print(u_utoa_s(off, d, sizeof(d))); }
+            u_print("\n");
+        }
+
         /* 发送 READ_AT 请求到 FS_PORT（目标端口填在 msgh_remote_port） */
         req.h.msgh_bits        = 0;
         req.h.msgh_size        = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_read_at_req_t) + (uint32_t)pathlen + 1);
@@ -84,6 +90,14 @@ static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
             return 0;
         }
         uint8_t *data = resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t);
+        {
+            char d1[24], d2[24];
+            u_print("bmploader: got ");
+            u_print(u_utoa_s((uint64_t)fr->length, d1, sizeof(d1)));
+            u_print(" total=");
+            u_print(u_utoa_s(got, d2, sizeof(d2)));
+            u_print("\n");
+        }
         if (fr->length == 0) break;                 /* EOF */
         if (got + fr->length > cap) {               /* 超出容量 */
             u_print("bmploader: file too large for buffer\n");

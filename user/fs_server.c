@@ -1065,6 +1065,12 @@ static void handle_read_at(uint32_t local_port, uint32_t id,
 
     FRESULT fr = f_open(&g_fil, path, FA_READ | FA_OPEN_EXISTING);
     if (fr != FR_OK) {
+        /* 诊断：打印实际 FatFs 错误码与路径，便于排查子目录/大小写/挂载问题 */
+        u_print("[fs] read_at open FAIL fr=");
+        { char d[16]; u_print(u_utoa_s((uint64_t)fr, d, sizeof(d))); }
+        u_print(" path='");
+        u_print(path);
+        u_print("'\n");
         build_resp(local_port, id, fr_to_status(fr), 0, NULL);
         mach_msg_send(g_resp, resp_header()->msgh_size);
         return;

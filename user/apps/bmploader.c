@@ -68,7 +68,9 @@ static uint64_t fs_read_whole(const char *path, uint8_t *out, uint64_t cap)
         }
         fs_resp_t *fr = (fs_resp_t *)(resp + sizeof(mach_msg_header_t));
         if (fr->status != 0) {
-            u_print("bmploader: FS error status\n");
+            u_print("bmploader: FS error status=");
+            { char d[16]; u_print(u_utoa_s((uint64_t)fr->status, d, sizeof(d))); }
+            u_print("\n");
             return 0;
         }
         uint8_t *data = resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t);

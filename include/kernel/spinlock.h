@@ -46,7 +46,13 @@ static inline void cpu_relax(void)
     __asm__ volatile("pause" ::: "memory");
 }
 
-/* 拿锁（不处理中断状态——调用方保证上下文安全） */
+/* 拿锁（不处理中断状态——调用方保证上下文安全）
+ *
+ * 单一 ticket 协议（单核/多核通用）。注释曾计划单核退化为 cli/sti，但实测
+ * 裸 cli/sti 无法阻止单核协作式任务切换（yield 不依赖中断），会导致临界区
+ * 同时被两个任务进入、runqueue 损坏、系统静默冻结（比死锁更糟）。因此统一走
+ * ticket 协议：单核下持锁路径只要不主动 yield，owner 票号即被正确推进，行为
+ * 与原稳定版本一致。多核同样走严格 FIFO ticket 协议。 */
 static inline void spin_lock(spinlock_t *l)
 {
     /* 原子取票：next += 1，返回旧值的 next 字段作为本 CPU 的票号 */
@@ -57,8 +63,7 @@ static inline void spin_lock(spinlock_t *l)
      * 某路径持锁未释放（死锁）。严格 ticket 协议不容许"强制改写 owner"——
      * 那样会让两个 CPU 同时认为自己持锁，引入内核数据损坏。故超上限后只
      * 打印死锁诊断（绕过 kprintf 锁，直接 serial 输出）并 panic 停机，
-     * 既保留可观测性，又不破坏锁协议。单核下 spin_lock 必然立即成功，
-     * 该上限分支在正常的单核生产场景永不触发。 */
+     * 既保留可观测性，又不破坏锁协议。 */
     uint64_t spins = 0;
     while ((uint16_t)__atomic_load_n(&l->tickets, __ATOMIC_ACQUIRE) != my) {
         cpu_relax();

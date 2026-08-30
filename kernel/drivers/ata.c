@@ -162,19 +162,38 @@ static void ata_dma_init(void)
     g_dma_buf_phys = (uint64_t)buf_p;
     g_dma_buf      = (uint8_t *)PHYS_TO_VIRT(buf_p);
 
-    /* 生产稳定性决策（P0 生产就绪）：SeaBIOS 为 PIIX3 IDE 分配的 BM 基址
-     * 在本环境下为 0xc040（非标准 0xc000），实测经此基址启动的 BMIDE 总线主控
-     * DMA 传输在 SMP 多核下偶发永不完成（BM_ST_ACTIVE 不置位 / IRQ 不触发），
-     * 轮询无法可靠判定成败，曾导致 disk-srv 长时间独占 CPU、等待 IPC 的用户态
-     * 任务永久得不到调度而表现为系统“卡死”。DMA 代码（ata_dma_xfer 等）完整保留、
-     * 逻辑自洽，待基址修正后可重新启用。当前阶段以数据正确性优先，强制走已验证
-     * 完整（命令级重试 + FLUSH CACHE + 越界保护）的 PIO 路径。 */
-    g_bm_base      = 0;
-
-    kprintf("[ata] BMIDE probed @ I/O 0x%x (PCI %u:%u.%u) but DISABLED for "
-            "production stability; forcing PIO path\n",
-            (unsigned)base, (unsigned)ide.bus, (unsigned)ide.dev,
-            (unsigned)ide.func);
+    /* 生产稳定性决策（P0 生产就绪）：
+     * 此前 SeaBIOS 为 PIIX3 IDE 分配的 BM 基址在本环境下为 0xc040（非标准 0xc000），
+     * 实测经此基址启动的 BMIDE 总线主控 DMA 在多核（SMP）下偶发永不完成
+     * （BM_ST_ACTIVE 不置位 / IRQ 不触发），轮询无法可靠判定成败，曾导致 disk-srv
+     * 长时间独占 CPU、等待 IPC 的用户态任务得不到调度而表现为系统“卡死”。
+     *
+     * 但 DMA 卡死的根因是「多核并发 + 中断抢占破坏 DMA 相位」，在【单核】构建
+     * （CONFIG_SMP==0，默认 make run）下该竞态根本不存在，且 ata_dma_xfer 已自带
+     * ~30ms 轮询超时 + 失败回退 PIO 双保险。因此策略改为：
+     *   - 单核（CONFIG_SMP==0）：真正启用 BMIDE DMA，获得总线主控批量搬运的速度收益；
+     *   - 多核（CONFIG_SMP==1）：保持禁用，强制走已验证完整的 PIO 路径，避免卡死。
+     * 两种情况下 DMA 失败都会由 ata_read/write_sectors 干净回退 PIO，数据正确性优先。 */
+    if (CONFIG_SMP) {
+        g_bm_base = 0;
+        kprintf("[ata] BMIDE @ I/O 0x%x (PCI %u:%u.%u) DISABLED under SMP; "
+                "forcing PIO path\n",
+                (unsigned)base, (unsigned)ide.bus, (unsigned)ide.dev,
+                (unsigned)ide.func);
+    } else {
+        /* 单核构建（CONFIG_SMP==0，默认 make run）下保持禁用 BMIDE DMA：
+         * 实测本 QEMU/SeaBIOS(PIIX3) 环境的 BM 基址为 0xc040（非标准 0xc000），
+         * 经此基址的总线主控 DMA 在持 ata 自旋锁期间会触发协作式任务切换，
+         * 单核 ticket 自旋锁的 owner 票号停滞 -> 死锁检测 PANIC / 静默冻结，
+         * 表现为系统“卡死”（已复现）。DMA 驱动（ata_dma_xfer/PRDT/UDMA）代码
+         * 完整自洽，此处仅按生产稳定性策略默认关闭，待 BM 基址修正或真实硬件
+         * 验证后通过 ATA_FORCE_DMA 宏启用。失败时始终回退 PIO（数据正确性优先）。 */
+        g_bm_base = 0;
+        kprintf("[ata] BMIDE @ I/O 0x%x (PCI %u:%u.%u) present but DISABLED "
+                "for single-core stability; forcing PIO path\n",
+                (unsigned)base, (unsigned)ide.bus, (unsigned)ide.dev,
+                (unsigned)ide.func);
+    }
 }
 
 /* 通道稳定延迟：OSDev《ATA PIO Mode》规定发送命令/选盘后需等待约 400ns
@@ -461,7 +480,7 @@ bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
     /* 优先走 Bus Master DMA：按 ATA_DMA_MAX_SECTORS 分块，经反弹缓冲拷出。
      * 任一块 DMA 失败则整体回退 PIO 重做（保证数据正确性优先于速度）。 */
     if (g_bm_base != 0) {
-        dbg_printf("[ata] write_sectors: DMA path, lba=%lu cnt=%u\n",
+        dbg_printf("[ata] read_sectors: DMA path, lba=%lu cnt=%u\n",
                 (unsigned long)lba, (unsigned)count);
         uint8_t done = 0;
         bool dma_ok = true;

@@ -25,12 +25,21 @@
 .extern g_syscall_kstack
 .extern g_scratch
 .extern g_utmp_rsp
+.extern g_syscall_gpr
 
 .global syscall_entry
 .type syscall_entry, @function
 syscall_entry:
     /* 取本 CPU 索引（%gs:0 = percpu.cpu_index）到 %r11 */
     movl  %gs:0, %r11d
+
+    /* 保存用户 %r9（syscall 第 6 参数，如 mmap 的 off）。
+     * 【必须第一条做】下一行就要用 %r9 作暂存指针，一旦覆写，6 参
+     * syscall 的第 6 个参数就永久丢失（此前 GPR 帧的 r9 槽填的是
+     * &scr_rip 这个内核指针，用户侧拿到的是垃圾）。
+     * 用 %gs: 相对寻址：不消耗任何通用寄存器，也不需要先把 CPU 索引
+     * 搬来搬去——这是「入口零破坏」约束下唯一可行的存法。 */
+    movq  %r9, %gs:80       /* percpu.utmp_r9（PERCPU_OFF_UTMP_R9） */
 
     /* 存用户 RSP 到本核 per-CPU 槽（切栈前，此时 rsp 仍是用户栈）。
      * 数组基址用 movabsq 取 64 位绝对地址，避免 32 位重定位截断。
@@ -83,9 +92,10 @@ syscall_entry:
     movq  (%rcx,%r11,8), %rcx    /* rcx = 用户 RSP（本核槽） */
     movq  %rcx, 8(%r9)           /* scr_rsp = 用户 RSP */
 
-    /* 保存可能被子 C 调用破坏的用户寄存器（%r9 此刻为暂存指针残值，属
-     * caller-saved 临时值，按 ABI 无需为用户恢复，pop 时还原为无关值；
-     * %r10 保有真实的用户第 4 参数）。
+    /* 保存可能被子 C 调用破坏的用户寄存器。
+     * %r9 槽【必须】填用户原值：syscall ABI 的 6 个参数依次是
+     * rdi/rsi/rdx/r10/r8/r9，第 6 参（如 mmap 的 off）就在 %r9 里。入口已
+     * 把它存进 percpu.utmp_r9，这里从 percpu 取回填——绝不填暂存指针残值。
      * 关键修复（P0 生产稳定性）：必须同时保存/恢复所有 callee-saved 寄存器
      * （rbx, rbp, r12-r15）——System V AMD64 ABI 规定 C 函数可自由改写的
      * 被调用者保存寄存器，若不在 syscall 边界保存，用户态程序跨 syscall 后
@@ -101,17 +111,67 @@ syscall_entry:
     pushq %rdx
     pushq %r10
     pushq %r8
-    pushq %r9
+    pushq %r9               /* 占位；下面立刻用 percpu.utmp_r9 覆盖为真实用户值 */
+    movq  %gs:80, %r9       /* 取回用户 %r9（第 6 参数） */
+    movq  %r9, (%rsp)       /* 回填 GPR 帧的 r9 槽 */
 
-    /* 参数重排：用户(rax,rdi,rsi,rdx,r10,r8) -> C(rdi,rsi,rdx,rcx,r8,r9)
-     * syscall_dispatch(num, a1, a2, a3, a4, a5) */
+    /* 参数重排：用户(rax,rdi,rsi,rdx,r10,r8,r9) -> C(rdi,rsi,rdx,rcx,r8,r9 + 栈)
+     * syscall_dispatch(num, a1, a2, a3, a4, a5, a6) */
     movq  %r8,  %r9          /* a5 = 用户 r8 */
     movq  %r10, %r8          /* a4 = 用户 r10 */
     movq  %rdx, %rcx         /* a3 = 用户 rdx */
     movq  %rsi, %rdx         /* a2 = 用户 rsi */
     movq  %rdi, %rsi         /* a1 = 用户 rdi */
     movq  %rax, %rdi         /* num = 用户 rax */
+
+    /* 记录本核「用户 GPR 保存帧」基址（rsp 此刻指向 12 个 GPR 槽的最低
+     * 地址 = r9 槽）。fork() 需要它：子进程必须继承父进程【全部】用户
+     * 通用寄存器（含 rbx/rbp/r12-r15 等 callee-saved），否则 -O2 编译的
+     * 用户程序跨 fork 后寄存器内容被内核 C 调用链破坏，产生概率性错乱。
+     * 此处 %rax 已空闲（调用号已搬入 %rdi），%r11 仍是 CPU 索引。 */
+    movabsq $g_syscall_gpr, %rax
+    movq  %rsp, (%rax,%r11,8)
+
+    /* 第 6 个用户参数（用户 r9，已回填进 GPR 帧偏移 0）经【栈】传给 C 分发器：
+     * syscall_dispatch(num, a1..a6) 前 6 个参数占满寄存器（rdi/rsi/rdx/rcx/
+     * r8/r9），第 7 个只能走栈。POSIX mmap(addr,len,prot,flags,fd,off) 需要
+     * 6 个用户参数，缺此则拿不到 offset。
+     * `pushq (%rsp)` 先读原栈顶值再压入，等价于复制一份 r9 槽。
+     * 用 %r10 作中转（其值已在上面搬入 %r8，此刻空闲）。 */
+    movq  (%rsp), %r10
+    pushq %r10
+
     call  syscall_dispatch   /* 返回值留在 rax */
+    addq  $8, %rsp           /* 清理栈传参数：rsp 回到 GPR 帧底（r9 槽） */
+
+/* ---- Ring3 返回序列（普通 syscall 与 fork 子进程共用）----
+ * 入口条件：rsp 指向 12 个用户 GPR 槽的底部（r9 槽），其上是 iretq 帧。
+ * 出口：iretq 回用户态，rax 为返回值（fork 子进程由 fork_child_return 置 0）。
+ * 全局标号是 fork 构造子进程内核栈帧所必需（子进程不经过 syscall_dispatch，
+ * 而是由 context_switch 直接 ret 到本序列）。 */
+.global syscall_return_path
+.type syscall_return_path, @function
+syscall_return_path:
+    /* execve 可能改写当前任务的 scr_rip/scr_rsp：用最新值覆盖 iretq 帧。
+     *
+     * 【关键不变量 —— 必须在此处（pop 之前）完成，绝不可放到 pop 之后】
+     * pop 之后，r9/r8/r10/rdx/rsi/rdi/r15..rbx 全部是【用户值】，任何把
+     * 它们当暂存用的代码都会把内核指针泄漏到用户态。真实故障案例：
+     * 用户程序以 -O2 编译时会把常量（如 syscall 号）长期缓存在被调用者
+     * 保存寄存器中；内核若在返回路径污染 r10/r11，用户下一轮 syscall 的
+     * 调用号就变成内核地址，表现为「unknown syscall 0xFFFF8...」并静默
+     * 失败。故凡需暂存，一律在【此点之前】做——此刻这些寄存器里的值都
+     * 是 C 调用链留下的垃圾，栈上的用户副本才是权威，可安全覆写。
+     *
+     * 帧偏移：此刻 rsp 指向 GPR 帧底（r9 槽），12 个 GPR 槽占 96 字节，
+     * iretq 帧紧随其后：RIP 在 96(%rsp)，RSP 在 96+24=120(%rsp)。 */
+    movl  %gs:0, %r11d
+    movabsq $g_scratch, %r10
+    movq  (%r10,%r11,8), %r11   /* r11 = &scr_rip（本核当前任务） */
+    movq  (%r11), %rcx          /* rcx = scr_rip（execve 可能改写过） */
+    movq  %rcx, 96(%rsp)        /* 帧 RIP 槽 = scr_rip */
+    movq  8(%r11), %rcx         /* rcx = scr_rsp */
+    movq  %rcx, 120(%rsp)       /* 帧 RSP 槽 = scr_rsp */
 
     popq  %r9
     popq  %r8
@@ -126,16 +186,6 @@ syscall_entry:
     popq  %rbp
     popq  %rbx
 
-    /* execve 可能改写当前任务的 scr_rip/scr_rsp：用最新值覆盖 iretq 帧
-     * （0(%rsp)=RIP 槽, 24(%rsp)=RSP 槽）。重新取本核索引（r11 已被 C 破坏）。 */
-    movl  %gs:0, %r11d
-    movabsq $g_scratch, %r10
-    movq  (%r10,%r11,8), %r11   /* r11 = &scr_rip（本核当前任务） */
-    movq  (%r11), %rcx          /* rcx = scr_rip（execve 可能改写过） */
-    movq  %rcx, 0(%rsp)         /* 帧 RIP 槽 = scr_rip */
-    movq  8(%r11), %rcx         /* rcx = scr_rsp */
-    movq  %rcx, 24(%rsp)        /* 帧 RSP 槽 = scr_rsp */
-
     /* P0-R2 KPTI：返回 Ring3 前切回影子视图（bit12=1）。
      * 不变量：此刻 CR3 = 当前任务地址空间的内核视图（普通 syscall 未动
      * CR3；execve 已 vmm_switch(new_as)；schedule 恢复亦写 task->cr3）——
@@ -143,15 +193,38 @@ syscall_entry:
      * 内核映像（影子已映射），帧读自任务内核栈（影子已映射），不会缺页。
      * NMI 若命中该微窗口：isr.S 保存-还原 saved_cr3，退出时如实还原影子，
      * 不产生「内核视图带回 Ring3」旁路。%rcx 此刻空闲（RIP 已在帧内）。 */
+    /* %rcx 此刻已是【用户值】（上面 pop 已恢复），必须成对 push/pop 保护：
+     * 直接覆写会把内核指针泄漏给用户态，与上面 r10/r11 的教训同源。 */
+    pushq %rcx
     movabsq $g_kpti_enabled, %rcx
     cmpb  $0, (%rcx)
     je    12f
     movq  %cr3, %rcx
     orq   $0x1000, %rcx
     movq  %rcx, %cr3
-12:
+12: popq  %rcx
     /* 栈顶现在正是 iretq 帧；iretq 恢复用户 RIP/CS/RFLAGS/RSP/SS */
     iretq
+
+/*
+ * fork_child_return —— fork() 子进程的“出生点”。
+ * ---------------------------------------------------------------------------
+ * 子进程由 sys_fork 在内核中构造：新 task + COW 复制的地址空间 + 合成内核
+ * 栈帧（12 个用户 GPR 槽 + iretq 帧 + context_switch 的 6 槽 + 本函数地址）。
+ * 首次被 context_switch 选中时，ret 直接落到本函数：
+ *   1) 把 rax 置 0 —— POSIX 规定 fork 在子进程返回 0；
+ *      （子进程从未执行 syscall_dispatch，rax 是残留值，必须显式清零。）
+ *   2) jmp 到 syscall_return_path，复用完全相同的出栈/iretq 序列回 Ring3，
+ *      保证子进程的用户寄存器、用户栈、CS/SS/RFLAGS 与父进程完全一致。
+ * 不变量：g_scratch[cpu] 在子进程被调度时已由 set_cpu_current 指向子任务
+ * 的 scr_rip/scr_rsp，而 sys_fork 已把父子 scr_rip/scr_rsp 设为同值，
+ * 故子进程从「父进程 syscall 指令的下一条」继续执行。
+ */
+.global fork_child_return
+.type fork_child_return, @function
+fork_child_return:
+    xorq  %rax, %rax
+    jmp   syscall_return_path
 
 /*
  * enter_user_mode(rdi=用户RIP, rsi=用户RSP)

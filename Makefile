@@ -85,7 +85,7 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server shell
+USER_PROGS   := fs_server input_server shell posixtest
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \

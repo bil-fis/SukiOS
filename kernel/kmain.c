@@ -22,6 +22,8 @@
 #include <kernel/ioapic.h>
 #include <kernel/clock.h>
 #include <kernel/config.h>   /* CONFIG_SMP：构建形态（默认单核） */
+#include <kernel/posix.h>    /* posix_init()：完整 POSIX 系统调用层 */
+#include <kernel/rtc.h>      /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
 #include <kernel/smp.h>
 #include <kernel/percpu.h>
 #include <kernel/diagnostics.h>
@@ -58,6 +60,7 @@ extern uint8_t g_smap_enabled;
 extern const uint8_t user_fs_server_start[],    user_fs_server_end[];
 extern const uint8_t user_input_server_start[], user_input_server_end[];
 extern const uint8_t user_shell_start[],        user_shell_end[];
+extern const uint8_t user_posixtest_start[],    user_posixtest_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -221,8 +224,20 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     /* ---- 阶段六：syscall + Ring3 ---- */
     syscall_init();
 
+    /* POSIX 墙上时间基准（读一次 CMOS RTC）。依赖 clock_init 已完成 TSC 校准，
+     * 且必须在任何用户任务跑起来之前——time()/clock_gettime 一开始就要有正确
+     * 的墙上时间，而不是让应用先看到一段「退化时间」。 */
+    rtc_time_init();
+
     /* ---- 阶段七：Mach IPC ---- */
     ipc_init();
+
+    /* POSIX 系统调用层（fd 槽池等）。
+     * 顺序要求：在 ipc_init() 之后（fd 层的 open/read/write 全部经 Mach IPC
+     * 转发到 FS_SERVER，端口子系统须先就绪）、在任何用户任务创建之前
+     * （fd_install_stdio 在每个 Ring3 任务创建时执行，需要槽池已初始化）。 */
+    posix_init();
+
     task_create_kernel(console_srv, NULL, "console-srv");
 
     /* ---- 阶段八·补：Intel HDA 音频（内核态特例，类 ATA） ---- */
@@ -293,11 +308,44 @@ static void boot_late_init(void *arg)
     console_set_fb_diag(false);
 
     /* ============================================================
-     * 本阶段只加载「非文件系统」的 Ring3 服务：input-server + shell。
-     * 文件系统部分（AHCI/ATA 探测、disk-srv 内核线程、FS_SERVER 用户态）按
-     * 当前需求暂不加载——shell 进入后仅交互式命令可用，依赖磁盘的命令
-     * （ls/cat/exec 等）会报告 service unavailable，不影响 shell 本身运行。
+     * 磁盘（内核态特例）与 Ring3 FAT32 服务。
+     *
+     * 为什么要恢复这一段：完整 POSIX 文件系统调用（open/read/write/stat/
+     * opendir/readdir…）全部经内核 VFS 层（kernel/fs/fd.c）以 Mach IPC 转发
+     * 到用户态 FS_SERVER。不加载它，所有文件类 syscall 都会返回 -EIO，
+     * POSIX 层形同虚设。
+     *
+     * 时序（「生产者先就绪」同步，缺此会丢唤醒）：
+     *   1) 先探测 AHCI（中断驱动 DMA），失败再回退 ATA PIO；
+     *   2) 启动 disk-srv 内核线程（DISK_PORT 的服务端）；
+     *   3) 自旋等 disk-srv 真正阻塞在 DISK_PORT 上（port_has_waiter）后再
+     *      spawn FS_SERVER 并授权其向 DISK_PORT 发请求——否则消费者先发、
+     *      生产者尚未进入等待，该条请求会永久无人应答（历史故障）。
      * ========================================================== */
+    bool ahci_ok = ahci_init();
+    bool disk_ok = ata_init() || ahci_ok;
+    if (disk_ok) {
+        disk_srv_start();
+        /* 等 disk-srv 真正阻塞在 DISK_PORT（上限约 2 秒，绝不无限自旋：
+         * 磁盘线程若因初始化失败未能进入等待，继续等待只会挂死引导）。 */
+        for (uint32_t i = 0; i < 2000 && !port_has_waiter(DISK_PORT); i++) {
+            task_yield();
+        }
+        task_t *fs_task = task_create_user(
+                              user_fs_server_start,
+                              (size_t)(user_fs_server_end
+                                       - user_fs_server_start),
+                              "fs-server");
+        /* A2 项：仅 FS_SERVER 被授权向内核 DISK_PORT 发送磁盘请求 */
+        if (fs_task) {
+            port_grant_send(DISK_PORT, fs_task);
+            kprintf("[boot] fs-server spawned (pid=%lu), POSIX file syscalls "
+                    "enabled\n", (unsigned long)fs_task->id);
+        }
+    } else {
+        kprintf("[boot] no disk: FS_SERVER not started (POSIX file syscalls "
+                "will return -EIO)\n");
+    }
 
     /* ---- Ring3 输入服务 + Shell ---- */
     task_create_user(user_input_server_start,
@@ -305,6 +353,15 @@ static void boot_late_init(void *arg)
                      "input-server");
     task_create_user(user_shell_start,
                      (size_t)(user_shell_end - user_shell_start), "shell");
+
+    /* ---- POSIX 一致性测试（Ring3，开机自检）----
+     * 在 fs-server 之后启动：posixtest 内部会轮询等待 FS 就绪（wait_fs_ready），
+     * 再跑文件类用例，故与 fs-server 的 mount 时序无关。
+     * 它的输出是「完整 POSIX 系统调用层」的验收依据，用
+     * `make run-headless QEMU_SERIAL="-serial file:/tmp/x.log"` 收集。 */
+    task_create_user(user_posixtest_start,
+                     (size_t)(user_posixtest_end - user_posixtest_start),
+                     "posixtest");
 
     kprintf("[boot] all services spawned; system fully up.\n\n");
 

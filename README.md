@@ -8,7 +8,7 @@
 )
 ![sukios_building](https://img.shields.io/badge/build-locally%20passing-brightgreen
 )
-![sukios_usablility](https://img.shields.io/badge/usable-obviously%20not-red)
+![sukios_usablility](https://img.shields.io/badge/usable-single%20core%20maybe-blue)
 
 **x86_64 混合内核操作系统**。
 
@@ -354,15 +354,15 @@ tail -8 /tmp/sukios.log
 
 ## 7. 致谢
 
-- **OSDev 社区**（`wiki.osdev.org`，离线副本见 `osdev_wiki/`）——本项目的分页、GDT/TSS、SMP、CR4、TLB、SWAPGS、syscall 等架构实现均以 OSDev 文档为标准参考。
+- **OSDev 社区**（`wiki.osdev.org`）——本项目的分页、GDT/TSS、SMP、CR4、TLB、SWAPGS、syscall 等架构实现均以 OSDev 文档为标准参考。
 - **ChaN** —— FatFs 通用 FAT 文件系统模块（R0.16），使 Ring3 fs-server 能正确解析 FAT32。
 - **lieff** —— minimp3（CC0 公共领域），提供 MP3 解码能力。
 - **Rich Geldreich / RAD Game Tools / Valve** —— miniz（zlib 风格许可），压缩能力库。
 - **newlib 贡献者**（Red Hat、UC Berkeley 等）—— 作为 freestanding 用户态实现的参考与符号来源。
 - **GRUB / SeaBIOS / OVMF / QEMU** 项目 —— 提供可引导固件与验证环境。
 - 所有为操作系统底层技术布道、撰写教程与开源代码的前辈与社区成员。  
-- **CodeBuddy Hy3 Model** —— 提供代码生成与调试支持。
-- **DeepSeek V3** —— 提供项目结构、初期选型方面的指导。
+- **CodeBuddy** —— 提供代码生成与调试支持。
+- **DeepSeek** —— 提供项目结构、初期选型方面的指导。
 - **Xiaomi MiMo V2 Pro** —— 承担SukiOS早期版本的全部代码编写工作（现已弃用，并从代码提交历史中删除。未参与当前版本编写工作。感谢Xiaomi MiMo对项目的支持）。
 - **永雏塔菲（Ace Taffy）** —— 解决了等待ai执行时无聊的问题。
 

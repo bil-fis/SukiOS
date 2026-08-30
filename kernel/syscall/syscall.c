@@ -25,6 +25,8 @@
 #include <kernel/hda.h>
 #include <kernel/acpi.h>   /* acpi_poweroff：SYS_REBOOT(mode!=0) 经 ACPI S5 软关机 */
 #include <kernel/percpu.h>   /* cpu_index()/MAX_CPUS：H8 per-CPU syscall 缓冲 */
+#include <kernel/posix.h>    /* posix_dispatch()：完整 POSIX 系统调用层 */
+#include <kernel/fd.h>       /* fd_exit_task()：任务退出时释放其 fd 表 */
 
 /* ---- 用户指针校验（A1 项）----
  * 合法用户区间：[0, USER_SPACE_TOP]，且 [ptr, ptr+n) 不得回绕/越界；
@@ -112,6 +114,52 @@ size_t copy_to_user(void *user_dest, const void *src, size_t n)
     memcpy(user_dest, src, n);
     smap_clac();
     return n;
+}
+
+/*
+ * copy_str_from_user —— 从用户态拷贝一个 NUL 结尾的字符串。
+ * 返回字符串长度（不含 NUL）；失败（越界/未终结/空串）返回 -1。
+ *
+ * 逐字节 copy_from_user 对长路径（如 4KB）会产生上万次函数调用，代价过高；
+ * 故先用「步长扫描 + 整段拷贝」：以 64 字节为块快速定位 NUL（每块一次
+ * copy_from_user），定位到长度后一次性 copy_from_user 整段。
+ * 与 copy_from_user 一致，非法指针返回 -1 而非触发内核缺页。
+ */
+int64_t copy_str_from_user(char *dest, const char *user_src, size_t max)
+{
+    if (!dest || !user_src || max == 0) {
+        return -1;
+    }
+    size_t len = 0;
+    char chunk[64];
+    while (len < max) {
+        size_t want = max - len;
+        if (want > sizeof(chunk)) {
+            want = sizeof(chunk);
+        }
+        if (copy_from_user(chunk, user_src + len, want) != want) {
+            return -1;
+        }
+        bool found = false;
+        for (size_t i = 0; i < want; i++) {
+            if (chunk[i] == '\0') {
+                len += i;
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            break;
+        }
+        len += want;
+    }
+    if (len >= max) {
+        return -1;               /* 未终结或超长 */
+    }
+    if (copy_from_user(dest, user_src, len + 1) != len + 1) {
+        return -1;
+    }
+    return (int64_t)len;
 }
 
 /* 保存/恢复 IF 的临界区原语（嵌套安全）：与无条件 sti 不同，
@@ -631,7 +679,15 @@ static uint64_t sys_mmap(uint64_t len, uint64_t prot)
     if (!base) {
         return 0;
     }
-    uint64_t vprot = PTE_NX | ((prot & 1) ? PTE_WRITE : 0);
+    /*
+     * prot 的「可写」判定同时接受两种位约定：
+     *   bit0 —— 本两参接口的历史约定（suki.h 早期 SUKI_PROT_WRITE = 1）；
+     *   bit1 —— POSIX 的 SUKI_PROT_WRITE = 0x2（posix.h 的现行定义）。
+     * 二者都判为可写，使新旧用户程序行为一致；若只认 bit0，改用 POSIX
+     * 常量（0x2）的既有程序会被降级为只读映射，首次写入即 #PF 杀任务。
+     * 恒不可执行（W^X 红线：内核从不给用户映射可执行内存）。
+     */
+    uint64_t vprot = PTE_NX | ((prot & (SUKI_PROT_WRITE | 1)) ? PTE_WRITE : 0);
     if (!vma_insert(t, base, base + len, vprot, VMA_TYPE_ANON)) {
         return 0;
     }
@@ -653,9 +709,34 @@ static uint64_t sys_munmap(uint64_t addr, uint64_t len)
     return vma_unmap_range(t, addr, addr + len) ? 0 : (uint64_t)-1;
 }
 
+/*
+ * C 分发器。
+ *
+ * 参数：num=调用号；a1..a6 对应用户态 rdi/rsi/rdx/r10/r8/r9（第 4 参走 r10，
+ * 因 syscall 指令用 rcx 保存返回 RIP）。a6 由 syscall_entry.S 经【栈】传入
+ * （前 6 个参数占满寄存器，第 7 个只能走栈）——POSIX mmap 需要 6 个用户参数。
+ *
+ * 分发顺序：先处理 SukiOS/Mach 原生号（0..19 中未划归 POSIX 者），
+ * 其余交给 posix_dispatch()（完整 POSIX 号区，见 kernel/syscall/sys_posix.c）。
+ *
+ * 【信号边界】进入分发前先处理 pending_kill：这是本内核投递信号的唯一
+ * 安全时机——任务此刻刚从用户态经 syscall 陷入，未持有任何内核锁、不在
+ * context_switch 内部、未半途更新任何链表。绝不在任务持锁/阻塞中途就地
+ * 杀死它（那会带走自旋锁或留下半改链表，是整机死锁的经典成因）。
+ */
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
-                          uint64_t a3, uint64_t a4, uint64_t a5)
+                          uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
+    task_t *cur = sched_current();
+
+    /* 信号边界：有待处理信号且默认动作为终止 -> 自我终止（128+signo） */
+    if (cur->pending_kill) {
+        int signo = cur->pending_signo;
+        cur->pending_kill = false;
+        cur->pending_signo = 0;
+        task_exit_current((uint64_t)(128 + signo));   /* 不返回 */
+    }
+
     switch (num) {
     case SYS_MACH_MSG:    return sys_mach_msg(a1, a2, a3, a4, a5);
     case SYS_TASK_SPAWN:  return sys_task_spawn(a1, a2, a3);
@@ -671,13 +752,21 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_AUDIO_WRITE: return sys_audio_write(a1, a2);
     case SYS_AUDIO_QUEUED:return sys_audio_queued();
     case SYS_AUDIO_STOP:  return sys_audio_stop();
-    case SYS_MMAP:        return sys_mmap(a1, a2);
-    case SYS_MUNMAP:      return sys_munmap(a1, a2);
+    /* 旧两参匿名映射（MAP 区）：保留以兼容既有用户程序；
+     * 完整六参 POSIX mmap 是 SYS_MMAP(90)，由 posix_dispatch 处理。 */
+    case SYS_MMAP_LEGACY:   return sys_mmap(a1, a2);
+    case SYS_MUNMAP_LEGACY: return sys_munmap(a1, a2);
     case SYS_SERIAL_READ: return sys_serial_read();
-    default:
+    default: {
+        /* 其余全部交给 POSIX 层（进程/文件/内存/时间/系统/网络号区） */
+        int64_t r = 0;
+        if (posix_dispatch(num, a1, a2, a3, a4, a5, a6, &r)) {
+            return (uint64_t)r;
+        }
         kprintf("[syscall] unknown syscall %lu from pid=%lu (user_rip=%p)\n",
                 (unsigned long)num, (unsigned long)sched_current()->id,
                 (void *)sched_current()->scr_rip);
         return (uint64_t)-1;
+    }
     }
 }

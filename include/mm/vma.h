@@ -69,6 +69,17 @@ bool vma_unmap_range(struct task *t, uint64_t start, uint64_t end);
  * 此处只回收链表元数据）。exit/execve 路径调用。 */
 void vma_destroy_all(struct task *t);
 
+/* fork 用：深拷贝父任务的 VMA 链表到子任务（保持升序；任一节点分配失败即
+ * 完整回滚并返回 false，绝不留下半截链表）。与 vmm_fork_cow 配对使用——
+ * 前者复制「页表」，后者复制「区间登记」，缺一则子进程的按需补页失效。 */
+bool vma_clone_all(struct task *dst, const struct task *src);
+
+/* mprotect 语义：把 [start, end) 的权限改为 prot（PTE_WRITE|PTE_NX 组合）。
+ * 同时更新 VMA 登记（按需拆分两端，绝不误改相邻区域）与已映射页的 PTE，
+ * 并全量刷 TLB。区间未被 VMA 完全覆盖、参数未页对齐或分配失败返回 false
+ * （失败时链表保持原状）。 */
+bool vma_protect(struct task *t, uint64_t start, uint64_t end, uint64_t prot);
+
 /* mmap 匿名区基址与上限（避开 OOL 窗口 0x600000000000 及用户镜像/栈） */
 #define VMA_MMAP_BASE   0x0000500000000000UL
 #define VMA_MMAP_TOP    0x0000580000000000UL

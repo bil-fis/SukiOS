@@ -7,6 +7,8 @@
 #define _SUKI_KERNEL_TASK_H
 
 #include <kernel/types.h>
+#define SUKI_KERNEL_BUILD 1
+#include <sukios/posix.h>   /* SUKI_FD_MAX 等 POSIX ABI 常量 */
 
 struct kernel_port;   /* 前向声明（ipc/port.h） */
 struct ool_map_node;   /* 前向声明（ipc/port.h，OOL 映射链表） */
@@ -72,6 +74,31 @@ typedef struct task {
 
     struct task *next;              /* 就绪队列（循环链表） */
     bool     in_rq;                  /* 是否已在某 CPU 运行队列中（sched_wake 判断是否需重新入队） */
+
+    /* --- POSIX 进程属性（完整系统调用层，见 kernel/syscall/sys_posix.c） --- */
+    int      fds[SUKI_FD_MAX];       /* 文件描述符表：值为全局 fd 槽号，-1 = 空 */
+    uint64_t brk;                    /* 程序断点（堆顶，用户虚拟地址）；
+                                      * 0 表示尚未初始化，首次 sys_brk 时定位
+                                      * 到 ELF 镜像末尾之后并页对齐 */
+    uint64_t brk_start;              /* 堆起始（= brk 初值，brk 不得小于它） */
+    uint32_t uid;                    /* 实际用户 ID */
+    uint32_t gid;                    /* 实际组 ID */
+    uint32_t euid;                   /* 有效用户 ID */
+    uint32_t egid;                   /* 有效组 ID */
+    uint32_t umask;                  /* 文件创建掩码（sys_umask） */
+    char     cwd[256];               /* 当前工作目录（绝对路径，"/" 表示根） */
+    uint64_t utime_ticks;            /* 累计用户态节拍（times/rusage 用） */
+    uint64_t stime_ticks;            /* 累计内核态节拍 */
+
+    /* --- POSIX 等待与信号语义 --- */
+    bool     wait_any;               /* 以 waitpid(-1,...) 方式阻塞等待【任意】
+                                      * 子进程退出（父阻塞在此标志上，任何子退出
+                                      * 时由 task_exit_current 唤醒它） */
+    bool     pending_kill;           /* 有待处理信号，默认动作 = 终止。
+                                      * 【重要】绝不在持锁/内核中途直接杀死任务——
+                                      * 只在 syscall 返回用户态的边界检查并自我
+                                      * 终止，避免锁被带走/资源半释放 */
+    int      pending_signo;          /* pending_kill 时待投递的信号号 */
 } task_t;
 
 /* FPU/SSE 状态保存与恢复原语（实现见 sched/switch.S） */
@@ -115,5 +142,62 @@ task_t *task_lookup(uint64_t pid);
 void task_reap(task_t *t);
 
 uint64_t sched_next_pid(void);
+
+/* ========================================================================== */
+/*  POSIX 进程层：fork / execve / 资源继承                                     */
+/* ========================================================================== */
+
+/*
+ * 完整 fork()：以当前任务为模板创建子进程。
+ *   - 新 task（新 PID、parent_id = 父 PID）、独立内核栈（守卫页）；
+ *   - 地址空间：vmm_create_address_space + vmm_fork_cow（写时复制共享），
+ *     VMA 链表深拷贝（vma_clone_all）；
+ *   - fd 表：fd_fork_clone（共享槽，POSIX 共享文件偏移语义）；
+ *   - 用户寄存器：复制父的 syscall GPR 帧（g_syscall_gpr[cpu]），合成内核
+ *     栈帧令子进程经 context_switch -> fork_child_return 以 rax=0 返回用户态。
+ * 返回子进程 task 指针，失败返回 NULL。
+ * 实现见 kernel/syscall/sys_posix.c。
+ */
+task_t *task_fork(void);
+
+/* 在当前任务上下文中装载并执行新 ELF（execve 语义）。
+ * path 为内核缓冲中的路径；argv/envp 为内核缓冲中的字符串数组（已校验）。
+ * 成功不返回（装入新镜像）；失败返回负 errno。 */
+int64_t task_execve(const char *path, int argc, const char *const argv[],
+                    int envc, const char *const envp[]);
+
+/* 记账：在时钟节拍中给当前任务累加 utime/stime（times/rusage/clock_gettime
+ * 的 PROCESS_CPUTIME_ID 数据源）。user_mode=true 记用户态，否则记内核态。 */
+void task_account_tick(bool user_mode);
+
+/* 发布一个「已由调用方完整构造好」的任务（fork 用）：与 task_create_kernel
+ * 的发布路径一致（入全局表 + 入运行队列 + RESCHED IPI），但不重新构造跳板
+ * 内核栈帧——fork 的子进程帧由 sys_fork 自行合成。 */
+void task_publish_ready(task_t *t);
+
+/*
+ * POSIX waitpid 核心（SMP 安全，g_sched_lock 保护）。
+ *   pid   >0 等待指定子进程；-1 等待任意子进程；其它值返回 -EINVAL
+ *   nohang  true = WNOHANG（无已退出子则立即返回 -EAGAIN，绝不阻塞）
+ * 返回 0 成功（*pid_out=退出子 PID，*rc_out=退出码）；<0 为负 errno
+ * （-ECHILD 无符合子进程 / -EAGAIN WNOHANG 且无就绪 / -EINVAL 参数非法）。
+ */
+int64_t task_wait_any_child(int64_t pid, uint64_t *pid_out,
+                            uint64_t *rc_out, bool nohang);
+
+/* 当前存活任务总数（含 idle 与 zombie），供 sys_sysinfo 的 procs 字段使用。
+ * 计数器是调度器私有状态，经本函数导出，避免外部直接引用 static 变量。 */
+uint32_t task_count(void);
+
+/*
+ * POSIX kill：向 pid 投递信号。
+ * 本阶段实现「默认动作」语义：所有信号默认终止目标（无自定义 handler，
+ * 无进程组）。安全边界：绝不就地杀死正在运行/持锁的任务——仅置
+ * pending_kill，由目标在【syscall 返回用户态的边界】自我终止（与 Linux
+ * 的 TIF_SIGPENDING 处理时机一致）；若目标正阻塞在等待队列，则同时唤醒它。
+ * 返回 0 成功；<0 为负 errno（-ESRCH 无此进程 / -EINVAL 非法信号 /
+ * -EPERM 不允许（如 idle）/ -EINVAL 不支持的 pid 语义）。
+ */
+int task_signal(uint64_t pid, int signo);
 
 #endif /* _SUKI_KERNEL_TASK_H */

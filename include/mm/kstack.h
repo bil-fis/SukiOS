@@ -38,6 +38,17 @@
 #define KSTACK_AREA_END    (KSTACK_AREA_BASE + \
                             (uint64_t)KSTACK_MAX_SLOTS * KSTACK_SLOT_BYTES)
 
+/*
+ * 内核栈布局契约（原为 sched.c 私有，因 fork 需要自行装配子进程内核栈
+ * 而上移至此——凡「分配内核栈 + 填栈底 canary + 用 KERNEL_STACK_BYTES 求
+ * 栈顶」的调用方（sched.c、sys_posix.c 的 sys_fork）都必须遵循同一套常量，
+ * 否则栈顶计算与溢出检测会各说各话）：
+ *   kstack_top = kstack_base + KERNEL_STACK_BYTES
+ *   *(uint64_t *)kstack_base = KSTACK_CANARY（schedule() 每次切换前校验）
+ */
+#define KERNEL_STACK_BYTES  KSTACK_BYTES
+#define KSTACK_CANARY       0xCDC1FEEDDEADBEEFUL
+
 /* 分配一条 16KB 内核栈，返回栈底 VA（低端，向上可用 KSTACK_BYTES）。
  * 失败返回 0。栈页 RW+NX；栈底正下方一页保证未映射。 */
 uint64_t kstack_alloc(void);

@@ -235,6 +235,186 @@ void vma_destroy_all(struct task *t)
     }
 }
 
+/*
+ * vma_protect —— mprotect 语义：修改 [start, end) 的访问权限。
+ * ---------------------------------------------------------------------------
+ * 两步缺一不可：
+ *   1) VMA 登记层：必须按需【拆分】区间两端（只改中间段），保持链表升序，
+ *      否则一次调用会误改整块 VMA 的权限（越权放宽相邻内存的保护）；
+ *   2) 页表层：对【已映射】的页必须用新权限重写 PTE——只改 VMA 不影响
+ *      现存映射，用户立刻就能以旧权限继续访问，mprotect 形同虚设。
+ *      未映射的页无需处理：首次触碰时由 vma_populate 按新 VMA 权限补页。
+ *
+ * 安全红线：prot 由调用方（sys_mprotect）过滤，此处不再做 W^X 判定，
+ * 但绝不允许出现「可执行」位——内核侧 PTE_NX 恒定，见 vma_populate 与
+ * sys_mmap 的一贯约定。
+ *
+ * 返回 false 表示参数非法、区间未被任何 VMA 覆盖，或节点分配失败（此时
+ * 链表保持原状，绝不留下半改状态）。
+ */
+bool vma_protect(struct task *t, uint64_t start, uint64_t end, uint64_t prot)
+{
+    if (!t || start >= end) {
+        return false;
+    }
+    if (start & (PAGE_SIZE - 1) || end & (PAGE_SIZE - 1)) {
+        return false;
+    }
+    if (end > USER_SPACE_TOP + 1) {
+        return false;
+    }
+
+    uint64_t f = spin_lock_irqsave(&g_vma_lock);
+
+    /* 先做「全覆盖」校验：区间必须完全落在已有 VMA 的并集内，
+     * 中途失败不留副作用（先扫描再改）。 */
+    {
+        uint64_t cover = start;
+        vm_area_t *v = (vm_area_t *)t->vma_list;
+        while (v && cover < end) {
+            if (v->start <= cover && v->end > cover) {
+                cover = v->end;
+            }
+            v = v->next;
+        }
+        if (cover < end) {
+            spin_unlock_irqrestore(&g_vma_lock, f);
+            return false;
+        }
+    }
+
+    /* 拆分 + 改权限。遍历期间会插入新节点，用「先取 next 再处理」避免踩空。 */
+    vm_area_t *v = (vm_area_t *)t->vma_list;
+    vm_area_t *prev = NULL;
+    while (v) {
+        vm_area_t *next = v->next;
+        uint64_t vs = v->start, ve = v->end;
+        if (ve <= start || vs >= end) {
+            prev = v;
+            v = next;
+            continue;
+        }
+        uint64_t os = (vs > start) ? vs : start;
+        uint64_t oe = (ve < end) ? ve : end;
+
+        if (os > vs) {
+            /* 前段：保留原权限 */
+            vm_area_t *a = (vm_area_t *)kmalloc(sizeof(vm_area_t));
+            if (!a) {
+                spin_unlock_irqrestore(&g_vma_lock, f);
+                return false;
+            }
+            a->start = vs; a->end = os; a->prot = v->prot;
+            a->type = v->type; a->next = v;
+            if (prev) {
+                prev->next = a;
+            } else {
+                t->vma_list = a;
+            }
+            prev = a;
+        }
+        if (oe < ve) {
+            /* 后段：保留原权限 */
+            vm_area_t *b = (vm_area_t *)kmalloc(sizeof(vm_area_t));
+            if (!b) {
+                spin_unlock_irqrestore(&g_vma_lock, f);
+                return false;
+            }
+            b->start = oe; b->end = ve; b->prot = v->prot;
+            b->type = v->type; b->next = v->next;
+            v->next = b;
+        }
+        /* 中段：应用新权限 */
+        v->start = os;
+        v->end = oe;
+        v->prot = prot;
+
+        prev = v;
+        v = v->next;
+    }
+
+    /* 页表层：更新区间内已映射页的 PTE 权限（未映射页交给按需补页） */
+    for (uint64_t a = start; a < end; a += PAGE_SIZE) {
+        uint64_t pte = vmm_pte(t->cr3, a);
+        if (!(pte & PTE_PRESENT)) {
+            continue;                       /* 尚未补页，VMA 权限已足够 */
+        }
+        uint64_t phys = pte & PTE_ADDR_MASK;
+        uint64_t newflags = PTE_PRESENT | PTE_USER
+                          | (prot & PTE_WRITE) | PTE_NX;
+        if (pte & PTE_OOL) {
+            newflags |= PTE_OOL;            /* OOL 共享页标记不得丢失 */
+        }
+        vmm_map_page(t->cr3, a, phys, newflags);
+    }
+    /* 改页表后必须刷 TLB：否则 CPU 仍按旧权限翻译，mprotect 不生效。
+     * 重载 CR3 是最彻底的全量失效（等价于 Linux 的 flush_tlb_mm）；此处
+     * CR3 已是本任务的内核视图，写回同值不会改变地址空间语义。 */
+    {
+        uint64_t cr3;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3) :: "memory");
+        __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+    }
+
+    spin_unlock_irqrestore(&g_vma_lock, f);
+    return true;
+}
+
+/*
+ * vma_clone_all —— fork 用：把父进程的 VMA 链表深拷贝到子进程。
+ * ---------------------------------------------------------------------------
+ * 必要性：fork 的地址空间由 vmm_fork_cow 建立（用户半区页表级 COW 共享），
+ * 但 VMA 是「登记型元数据」（区间/权限/类型），不随页表复制。子进程若没有
+ * 自己的 VMA 链表，则：
+ *   - mmap 区域与栈增长区的按需补页（#PF -> vma_populate）在子进程中失效，
+ *     首次访问即被当作非法访问而杀任务；
+ *   - munmap/mprotect 找不到区间，误返回 EINVAL。
+ * 故必须与 COW 页表同步克隆，二者共同构成完整的 fork 地址空间语义。
+ *
+ * 实现：按升序单链表逐节点 kmalloc + 复制（保持升序，vma_find_free/
+ * vma_populate 的首次适配与查找逻辑依赖该顺序）。任一节点分配失败即回滚
+ * 全部已分配节点并返回 false，绝不留下半截链表（半截链表会让子进程在
+ * 部分区间上“看起来合法”却无法补页，属隐蔽故障）。
+ */
+bool vma_clone_all(struct task *dst, const struct task *src)
+{
+    if (!dst || !src) {
+        return false;
+    }
+    uint64_t f = spin_lock_irqsave(&g_vma_lock);
+
+    vm_area_t *s = (vm_area_t *)src->vma_list;
+    vm_area_t *head = NULL, *tail = NULL;
+    while (s) {
+        vm_area_t *n = (vm_area_t *)kmalloc(sizeof(vm_area_t));
+        if (!n) {
+            /* 回滚：释放本函数已分配的全部节点，dst->vma_list 保持原样 */
+            while (head) {
+                vm_area_t *nx = head->next;
+                kfree(head);
+                head = nx;
+            }
+            spin_unlock_irqrestore(&g_vma_lock, f);
+            return false;
+        }
+        n->start = s->start;
+        n->end = s->end;
+        n->prot = s->prot;
+        n->type = s->type;
+        n->next = NULL;
+        if (tail) {
+            tail->next = n;
+        } else {
+            head = n;
+        }
+        tail = n;
+        s = s->next;
+    }
+    dst->vma_list = head;
+    spin_unlock_irqrestore(&g_vma_lock, f);
+    return true;
+}
+
 /* ========================================================================= */
 /*  启动自检：VMA 操作 + demand 填充 + COW fork/断开全链路                     */
 /* ========================================================================= */

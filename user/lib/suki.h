@@ -5,6 +5,12 @@
  *
  * 提供：syscall 封装（ABI：rax=号, rdi/rsi/rdx/r10/r8=参数）、mach_msg
  * 便捷收发、最小字符串工具。与内核共享的消息/协议布局见 include/ipc/。
+ *
+ * 【系统调用号的唯一真相源】
+ *   号表、errno、POSIX 结构体与常量全部取自 <sukios/posix.h>——内核侧
+ *   （include/kernel/syscall.h）与用户侧（本文件）都包含它，两侧绝不各自
+ *   硬编码，从根本上杜绝号表漂移（历史上曾因此出现海量非法调用号）。
+ *   本文件不再重复定义任何 SYS_* 号与 SUKI_* 常量。
  */
 #ifndef _SUKI_USER_SUKI_H
 #define _SUKI_USER_SUKI_H
@@ -12,25 +18,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-
-/* ---- 系统调用号（与 include/kernel/syscall.h 一致） ---- */
-#define SYS_MACH_MSG      0
-#define SYS_TASK_SPAWN    1
-#define SYS_TASK_EXIT     2
-#define SYS_YIELD         3
-#define SYS_DEBUG_WRITE   4
-#define SYS_INPUT_READ    5
-#define SYS_REBOOT        6
-#define SYS_PORT_CLAIM    7
-#define SYS_EXECVE        8
-#define SYS_WAIT          9
-#define SYS_AUDIO_OPEN    10
-#define SYS_AUDIO_WRITE   11
-#define SYS_AUDIO_QUEUED  12
-#define SYS_AUDIO_STOP    13
-#define SYS_MMAP          14
-#define SYS_MUNMAP        15
-#define SYS_SERIAL_READ   16   /* 非阻塞读 COM1 控制台，返回 0..255，无数据-1 */
+#include <sukios/posix.h>   /* 完整 syscall 号表 + errno + POSIX 常量/结构体 */
 
 /* ---- mach_msg ABI（与 include/ipc/port.h 一致） ---- */
 #define MACH_SEND_MSG   0x1
@@ -75,6 +63,47 @@ static inline uint64_t suki_syscall5(uint64_t n, uint64_t a1, uint64_t a2,
                        "r"(r10), "r"(r8)
                      : "rcx", "r11", "r9", "rbx", "memory");
     return ret;
+}
+
+/*
+ * 0..4 参与 6 参版本（完整 POSIX 调用的参数个数从 0 到 6 都有：
+ * getpid 0 参、open 3 参、mmap 6 参）。
+ * 实现转发到 <sukios/posix.h> 的 __suki_syscallN —— 那里是 syscall 内联
+ * 汇编的实现处（含 rcx/r11/rbx/r9 的完整 clobber 清单）。本文件只做命名
+ * 包装，既有调用点（大量历史代码用 suki_syscall5）无需改动，也避免了
+ * 两处各写一份内联汇编而可能出现的 clobber 清单不一致。
+ */
+static inline uint64_t suki_syscall0(uint64_t n)
+{
+    return (uint64_t)__suki_syscall0((int64_t)n);
+}
+static inline uint64_t suki_syscall1(uint64_t n, uint64_t a1)
+{
+    return (uint64_t)__suki_syscall1((int64_t)n, (int64_t)a1);
+}
+static inline uint64_t suki_syscall2(uint64_t n, uint64_t a1, uint64_t a2)
+{
+    return (uint64_t)__suki_syscall2((int64_t)n, (int64_t)a1, (int64_t)a2);
+}
+static inline uint64_t suki_syscall3(uint64_t n, uint64_t a1, uint64_t a2,
+                                     uint64_t a3)
+{
+    return (uint64_t)__suki_syscall3((int64_t)n, (int64_t)a1, (int64_t)a2,
+                                     (int64_t)a3);
+}
+static inline uint64_t suki_syscall4(uint64_t n, uint64_t a1, uint64_t a2,
+                                     uint64_t a3, uint64_t a4)
+{
+    return (uint64_t)__suki_syscall4((int64_t)n, (int64_t)a1, (int64_t)a2,
+                                     (int64_t)a3, (int64_t)a4);
+}
+static inline uint64_t suki_syscall6(uint64_t n, uint64_t a1, uint64_t a2,
+                                     uint64_t a3, uint64_t a4, uint64_t a5,
+                                     uint64_t a6)
+{
+    return (uint64_t)__suki_syscall6((int64_t)n, (int64_t)a1, (int64_t)a2,
+                                     (int64_t)a3, (int64_t)a4, (int64_t)a5,
+                                     (int64_t)a6);
 }
 
 /* P0-R8：ACPI S5 软关机（SYS_REBOOT mode=1）。 */
@@ -161,17 +190,47 @@ static inline void sys_audio_stop(void)
     suki_syscall5(SYS_AUDIO_STOP, 0, 0, 0, 0, 0);
 }
 
-/* ---- P0-5：匿名内存映射（按需分页，首次触碰才耗物理页） ---- */
-/* prot bit0=可写；恒不可执行（内核 W^X 红线）。返回基址，失败 NULL。 */
-#define SUKI_PROT_READ   0
-#define SUKI_PROT_WRITE  1
+/* ---- P0-5：匿名内存映射（按需分页，首次触碰才耗物理页） ----
+ * 【两参旧接口】走 SYS_MMAP_LEGACY(14)/SYS_MUNMAP_LEGACY(15)。
+ * 完整六参 POSIX mmap(addr,len,prot,flags,fd,off) 是 SYS_MMAP(90)，
+ * 见下方 sys_mmap_posix() 封装。
+ * prot 用 POSIX 语义位（SUKI_PROT_READ/SUKI_PROT_WRITE，取自 posix.h）；
+ * 恒不可执行（内核 W^X 红线）。返回基址，失败 NULL。 */
 static inline void *sys_mmap(uint64_t len, uint64_t prot)
 {
-    return (void *)suki_syscall5(SYS_MMAP, len, prot, 0, 0, 0);
+    return (void *)suki_syscall5(SYS_MMAP_LEGACY, len, prot, 0, 0, 0);
 }
 
 /* 解除 sys_mmap 建立的映射。返回 0 成功，-1 失败。 */
 static inline int sys_munmap(void *addr, uint64_t len)
+{
+    return (int)suki_syscall5(SYS_MUNMAP_LEGACY, (uint64_t)addr, len, 0, 0, 0);
+}
+
+/*
+ * 完整六参 POSIX mmap（SYS_MMAP = 90）。
+ * 第 4 个参数必须经 r10 传递（syscall 指令占用 rcx 保存返回 RIP），
+ * 第 6 个参数走 r9 —— 故此处需要 7 个寄存器，单独写一个 6 参封装
+ * （suki_syscall5 只支持 5 个用户参数）。
+ * 返回映射基址；失败返回 (void *)-1（即 MAP_FAILED）。
+ */
+static inline void *sys_mmap_posix(void *addr, uint64_t len, int prot,
+                                   int flags, int fd, int64_t off)
+{
+    uint64_t ret;
+    register uint64_t r10 __asm__("r10") = (uint64_t)flags;
+    register uint64_t r8  __asm__("r8")  = (uint64_t)(int64_t)fd;
+    register uint64_t r9  __asm__("r9")  = (uint64_t)off;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"((uint64_t)SYS_MMAP), "D"(addr), "S"(len),
+                       "d"(prot), "r"(r10), "r"(r8), "r"(r9)
+                     : "rcx", "r11", "rbx", "memory");
+    return (void *)ret;
+}
+
+/* 完整 POSIX munmap（SYS_MUNMAP = 91）。成功返回 0，失败 -1。 */
+static inline int sys_munmap_posix(void *addr, uint64_t len)
 {
     return (int)suki_syscall5(SYS_MUNMAP, (uint64_t)addr, len, 0, 0, 0);
 }

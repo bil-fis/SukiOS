@@ -33,6 +33,17 @@ uint64_t  g_syscall_kstack[MAX_CPUS];
 uint64_t *g_scratch[MAX_CPUS];
 uint64_t  g_utmp_rsp[MAX_CPUS];
 
+/*
+ * g_syscall_gpr[cpu] = 本核最近一次 syscall 的「用户 GPR 保存帧」基址
+ * （指向 12 个 qword 槽的最低地址，槽序自低向高：
+ *    r9, r8, r10, rdx, rsi, rdi, r15, r14, r13, r12, rbp, rbx）。
+ * 由 syscall_entry.S 在 call syscall_dispatch 之前写入，供 sys_fork 读取
+ * 父进程的完整用户通用寄存器集合——子进程必须逐位继承它们，否则 -O2
+ * 生成的用户代码跨 fork 后 callee-saved 寄存器被污染，行为不可预期。
+ * 与上述三个数组同为 per-CPU：多核并发 syscall 各写各槽，互不干扰。
+ */
+uint64_t  g_syscall_gpr[MAX_CPUS];
+
 /* ---- 特权指令隔离封装（手册 9.2）---- */
 
 /*

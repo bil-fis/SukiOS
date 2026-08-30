@@ -24,6 +24,26 @@
 #include <kernel/config.h>   /* CONFIG_SMP */
 #include <kernel/smp.h>
 #include <kernel/percpu.h>
+
+/*
+ * IPI_TRACE —— IPI 逐次到达的追踪日志，默认【关闭】。
+ *
+ * 为什么必须可关：RESCHED 在单核构建下以 self-IPI 形式承担「新建任务 /
+ * 唤醒 waiter 时立即调度一次」的生存性职责（见 sched.c 的 task_publish /
+ * sched_wake 与 port.c 的唤醒路径），因此每有一次 yield、一次 IPC 唤醒就
+ * 会触发一次。完整 POSIX 层上线后，一次 open/read/write 各伴随一次 IPC
+ * 唤醒，实测 posixtest 等待 FS 就绪的 400 次轮询就产生约 1600 行该日志，
+ * 把串口完全淹没，真正的测试结果与异常信息全部被刷走无法判读。
+ *
+ * 保留而非删除：排查「丢失唤醒」类故障时把下行的 0 改成 1 重新编译即可。
+ */
+#define IPI_TRACE 0
+
+#if IPI_TRACE
+#define ipi_trace(...)  kprintf(__VA_ARGS__)
+#else
+#define ipi_trace(...)  ((void)0)
+#endif
 #include <kernel/apic.h>
 #include <kernel/acpi.h>
 #include <kernel/clock.h>
@@ -91,7 +111,7 @@ static void ipi_resched_handler(registers_t *r)
      * 此处 schedule() 是安全的——中断返回(iretq)会落到被选中任务上下文。
      * IPI handler 不持 g_sched_lock，无重入死锁风险。 */
     cpu_local()->ticks++;
-    kprintf("[smp] ipi_resched_handler on cpu=%u\n", (unsigned)cpu_index());
+    ipi_trace("[smp] ipi_resched_handler on cpu=%u\n", (unsigned)cpu_index());
     schedule();
 }
 

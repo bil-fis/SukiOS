@@ -42,9 +42,14 @@
 /* This option switches f_expand(). (0:Disable or 1:Enable) */
 
 
-#define FF_USE_CHMOD	0
+#define FF_USE_CHMOD	1
 /* This option switches attribute control API functions, f_chmod() and f_utime().
-/  (0:Disable or 1:Enable) Also FF_FS_READONLY needs to be 0 to enable this option. */
+/  (0:Disable or 1:Enable) Also FF_FS_READONLY needs to be 0 to enable this option.
+/
+/  SukiOS：置 1 —— POSIX 的 chmod/utimes 需要真正改写 FAT 属性字节与时间戳，
+/  内核侧（kernel/fs/fd.c）经 FS_MSG_CHMOD / FS_MSG_UTIME 转发到 FS_SERVER 的
+/  f_chmod/f_utime。若保持 0，这两个 POSIX 调用只能降级为「假装成功」，
+/  属不可接受的桩实现。代价：ff.c 多编入这两个函数（约数百字节）。 */
 
 
 #define FF_USE_LABEL	0

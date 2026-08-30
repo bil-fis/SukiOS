@@ -35,15 +35,11 @@
 #include <kernel/elf.h>
 #include <kernel/hda.h>      /* hda_release_owner：任务退出释放音频流 */
 #include <ipc/port.h>
+#include <kernel/fd.h>       /* fd_exit_task / fd_install_stdio */
 
-/* 每任务内核栈大小（字节）。Ring0 内核栈与用户态栈(USER_STACK_PAGES)独立。
- * P0-R5：栈体改由 kstack_alloc 提供（独立 VA 槽位 + 栈底下方未映射守卫页，
- * 溢出立即 #PF 定性），大小由 mm/kstack.h 统一定义（16KB 不变）。 */
-#define KERNEL_STACK_BYTES  KSTACK_BYTES
+/* 每任务内核栈大小与栈底哨兵：已上移至 mm/kstack.h（fork 需要同一套常量
+ * 装配子进程内核栈，见 sys_posix.c::sys_fork 的说明）。 */
 #define MAX_TASKS       256
-/* M7 修复：内核栈底守卫哨兵。任务内核栈从高地址向下增长，栈底写入哨兵；
- * 若向下溢出破坏相邻堆块，哨兵会被覆盖。每次调度前校验当前任务栈底哨兵。 */
-#define KSTACK_CANARY   0xCDC1FEEDDEADBEEFUL
 
 /* 用户程序装载布局 */
 #define USER_CODE_BASE   0x0000000000400000UL
@@ -507,6 +503,11 @@ task_t *task_create_user_args(const void *elf, size_t size,
     /* 修正跳板参数：r13 槽（arg）指向任务自身 */
     ((uint64_t *)t->rsp)[2] = (uint64_t)t;
 
+    /* POSIX：安装标准 fd（0=stdin/TTY, 1=stdout/TTY, 2=stderr/TTY）。
+     * 必须在发布入队前完成——否则子进程可能在还没有 fd 表时就被其它核
+     * 调度并触发 write(1, ...)，表现为莫名其妙的 EBADF。 */
+    fd_install_stdio(t);
+
     uint32_t cpu = __atomic_fetch_add(&g_rr_counter, 1, __ATOMIC_RELAXED)
                  % smp_online_count();
     task_publish(t, cpu);
@@ -705,6 +706,11 @@ void sched_tick(registers_t *r)
     if (!cur) {
         return;
     }
+    /* POSIX CPU 记账：依据「中断发生时 CPU 处于哪个特权级」判定本节拍归属
+     * 用户态还是内核态（r 是 CPU 在中断/异常时自动压入的 iret 帧；CS 低两
+     * 位即 CPL：0=Ring0 内核态，3=Ring3 用户态）。
+     * 供 times()/getrusage()/clock_gettime(CLOCK_PROCESS_CPUTIME_ID) 使用。 */
+    task_account_tick(r ? ((r->cs & 0x3) == 3) : false);
     if (cur->ticks_remaining > 0) {
         cur->ticks_remaining--;
     }
@@ -853,12 +859,31 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
         }
         t->waiters = NULL;
     }
+
+    /* POSIX waitpid(-1, ...)：父任务以「等待任意子进程」方式阻塞（wait_any）。
+     * 它没有登记在任何具体子的 waiters 链上，故必须在此显式唤醒，否则
+     * waitpid(-1) 会永久挂起（表现为 shell 等任意子进程时死等）。 */
+    for (task_t *p = g_all_tasks; p; p = p->all_next) {
+        if (p->id != t->parent_id || !p->wait_any) {
+            continue;
+        }
+        p->wait_any     = false;
+        p->wait_result  = code;
+        p->state        = READY;
+        p->wait_link    = NULL;
+        if (p->cpu != cpu && g_percpu[p->cpu].in_idle) {
+            lapic_send_ipi((uint8_t)g_percpu[p->cpu].lapic_id, IPI_RESCHED);
+        }
+    }
     t->exit_code = code;
     t->zombie    = true;
 
     port_release_owner(t);
     port_reap_ool(t);
     hda_release_owner(t);   /* P0-R1：owner 退出时停流，防悬空/音频锁死 */
+    fd_exit_task(t);        /* POSIX：关闭本任务持有的全部 fd（引用归零者会
+                             * 向 FS_SERVER 发 CLOSE，释放服务端句柄，避免
+                             * 反复 spawn 造成服务端句柄表耗尽） */
     vma_destroy_all(t);
     if (t->is_user && t->cr3 && t->cr3 != vmm_kernel_pml4()) {
         vmm_switch(vmm_kernel_pml4());
@@ -866,12 +891,41 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     }
     t->cr3 = 0;
 
-    /* 入死亡链表，待下次本核 schedule 由 reap_dead 回收 */
+    /* POSIX 僵尸语义（P0-R7 修复）：
+     *   有父进程的任务退出后必须保留为 zombie（仍在 g_all_tasks 中，
+     *   仅标记 zombie=true），等待父进程 waitpid 回收；绝不能被 reap_dead
+     *   在父 wait 之前就 kfree，否则 waitpid 返回 -ECHILD 且子状态丢失。
+     *   仅当「无父进程」（孤儿/父已不存在）时才直接进 g_dead_list 立即回收，
+     *   等价由 init 收养后即刻退出的简化路径。
+     *   注意：地址空间/端口/fd 等资源已在上方释放，zombie 仅保留 task 结构与
+     *   元数据（exit_code 等）供父读取，占用极小。 */
+    bool has_parent = (t->parent_id != 0);
+    if (has_parent) {
+        /* 确认父仍存活于 g_all_tasks（防止父先于子退出后仍残留引用） */
+        task_t *p = g_all_tasks;
+        bool parent_alive = false;
+        while (p) {
+            if (p->id == t->parent_id && !p->dead) {
+                parent_alive = true;
+                break;
+            }
+            p = p->all_next;
+        }
+        has_parent = parent_alive;
+    }
+
     t->alive = false;
     t->state = BLOCKED;
-    t->dead = true;
-    t->dead_next = g_dead_list;
-    g_dead_list = t;
+    if (has_parent) {
+        /* 保留为 zombie：留在 g_all_tasks，由 waitpid 的 task_reap_locked 回收 */
+        t->dead = false;
+        t->dead_next = NULL;
+    } else {
+        /* 无父：直接进死亡链表，下次 schedule 由 reap_dead 释放 */
+        t->dead = true;
+        t->dead_next = g_dead_list;
+        g_dead_list = t;
+    }
 
     task_t *next = pick_next();
     rq_unlink_cpu(t, cpu);
@@ -907,4 +961,192 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     panic("task_exit_current: context_switch returned unexpectedly "
           "(task '%s' pid=%lu next='%s')",
           t->name, (unsigned long)t->id, next->name);
+}
+
+/* ========================================================================== */
+/*  POSIX 进程层支撑：fork 发布 / waitpid / kill / CPU 记账                     */
+/* ========================================================================== */
+
+/*
+ * task_publish_ready —— 发布一个「已由调用方完整装配好」的任务（fork 用）。
+ * 与 task_publish 的唯一差别是调用方已自行构造好内核栈帧与地址空间，
+ * 本函数只负责「入全局表 + 入运行队列 + RESCHED IPI 立即唤醒」。
+ */
+uint32_t task_count(void)
+{
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    uint32_t n = g_task_count;
+    spin_unlock_irqrestore(&g_sched_lock, f);
+    return n;
+}
+
+void task_publish_ready(task_t *t)
+{
+    if (!t) {
+        return;
+    }
+    uint32_t cpu = __atomic_fetch_add(&g_rr_counter, 1, __ATOMIC_RELAXED)
+                 % smp_online_count();
+    task_publish(t, cpu);
+}
+
+/*
+ * task_wait_any_child —— POSIX waitpid 核心。
+ *
+ * 语义（与 POSIX 对齐）：
+ *   pid > 0  等待该 PID 的子进程；pid == -1 等待任意子进程；
+ *   nohang   WNOHANG：没有「已退出待回收」的子进程时立即返回 -EAGAIN，
+ *            绝不阻塞（应用可用它做非阻塞轮询）；
+ *   一个子进程只能被回收一次：回收时从 g_all_tasks 与死亡链表摘除并释放。
+ *
+ * 阻塞实现：置 cur->wait_any=true（等待任意子）或把 cur 登记到指定子的
+ * waiters 链（等待特定子），然后 schedule() 让出。子退出时
+ * task_exit_current 负责唤醒。唤醒后重新持锁复查（避免虚假唤醒——
+ * 例如父被 IPI 唤醒但子尚未完全退出）。
+ */
+int64_t task_wait_any_child(int64_t pid, uint64_t *pid_out,
+                            uint64_t *rc_out, bool nohang)
+{
+    if (pid != -1 && pid <= 0) {
+        return -SUKI_EINVAL;
+    }
+    task_t *cur = sched_current();
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+
+    for (;;) {
+        /* 1) 先找「已退出且待回收」的符合条件的子进程 */
+        task_t *child = NULL;
+        for (task_t *c = g_all_tasks; c; c = c->all_next) {
+            if (c->parent_id != cur->id || !c->zombie) {
+                continue;
+            }
+            if (pid > 0 && (uint64_t)pid != c->id) {
+                continue;
+            }
+            child = c;
+            break;
+        }
+        if (child) {
+            uint64_t rc = child->exit_code;
+            uint64_t cpid = child->id;
+            task_reap_locked(child);       /* 回收：二次 wait 将返回 -ECHILD */
+            spin_unlock_irqrestore(&g_sched_lock, f);
+            *pid_out = cpid;
+            *rc_out = rc;
+            return 0;
+        }
+
+        /* 2) 是否还有任何符合条件的（尚未退出的）子进程 */
+        bool has_child = false;
+        for (task_t *c = g_all_tasks; c; c = c->all_next) {
+            if (c->parent_id != cur->id || c->zombie) {
+                continue;
+            }
+            if (pid > 0 && (uint64_t)pid != c->id) {
+                continue;
+            }
+            has_child = true;
+            break;
+        }
+        if (!has_child) {
+            spin_unlock_irqrestore(&g_sched_lock, f);
+            return -SUKI_ECHILD;
+        }
+        if (nohang) {
+            spin_unlock_irqrestore(&g_sched_lock, f);
+            return -SUKI_EAGAIN;
+        }
+
+        /* 3) 阻塞：登记等待关系后让出 CPU */
+        cur->state = BLOCKED;
+        cur->wait_result = 0;
+        if (pid > 0) {
+            /* 等待特定子：登记到该子的 waiters 链 */
+            task_t *c0 = g_all_tasks;
+            while (c0 && c0->id != (uint64_t)pid) {
+                c0 = c0->all_next;
+            }
+            if (c0) {
+                cur->wait_link = c0->waiters;
+                c0->waiters = cur;
+                cur->wait_any = false;
+            } else {
+                cur->wait_any = true;   /* 极端竞态：子已消失，退化为等任意 */
+            }
+        } else {
+            cur->wait_any = true;
+            cur->wait_link = NULL;
+        }
+        spin_unlock(&g_sched_lock);
+        schedule();
+        if (f & (1UL << 9)) {
+            __asm__ volatile("sti" ::: "memory");
+        }
+        spin_lock(&g_sched_lock);       /* 重新持锁，回到循环复查 */
+    }
+}
+
+/*
+ * task_signal —— POSIX kill 的信号投递（默认动作语义）。
+ * 安全边界（关键）：绝不在内核中途就地杀死一个任务——它可能正持有自旋锁、
+ * 正停在 context_switch 内部或半途更新链表，强行摘除会造成整机死锁或
+ * 结构损坏。此处只做两件事：
+ *   1) 置目标的 pending_kill/pending_signo；
+ *   2) 若目标因阻塞（IPC/等待）不在运行队列，则 sched_wake 唤醒它，
+ *      使其尽快走到 syscall 返回边界并自我终止。
+ * 真正的终止发生在 syscall_dispatch 入口的 pending_kill 检查（等价于
+ * Linux 返回用户态前的 TIF_SIGPENDING 处理）。
+ */
+int task_signal(uint64_t pid, int signo)
+{
+    if (signo < 0 || signo > 32) {
+        return -SUKI_EINVAL;
+    }
+    task_t *cur = sched_current();
+
+    /* 发给自己：默认动作 = 终止（128+signo 是 shell 的死法约定） */
+    if (pid == cur->id) {
+        task_exit_current((uint64_t)(128 + signo));   /* 不返回 */
+    }
+
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    task_t *t = g_all_tasks;
+    while (t && t->id != pid) {
+        t = t->all_next;
+    }
+    if (!t || t->zombie || t->dead || !t->alive) {
+        spin_unlock_irqrestore(&g_sched_lock, f);
+        return -SUKI_ESRCH;
+    }
+    if (t->is_idle) {
+        spin_unlock_irqrestore(&g_sched_lock, f);
+        return -SUKI_EPERM;             /* 绝不允许杀死 idle（会导致无任务可调度） */
+    }
+    t->pending_kill = true;
+    t->pending_signo = signo;
+    bool need_wake = (t->state != READY && t->state != RUNNING);
+    spin_unlock_irqrestore(&g_sched_lock, f);
+
+    if (need_wake) {
+        sched_wake(t);                  /* 唤醒阻塞中的目标，使其尽快处理信号 */
+    }
+    return 0;
+}
+
+/*
+ * task_account_tick —— 在时钟节拍中给当前任务累加 CPU 时间。
+ * user_mode 由 sched_tick 依据「中断发生时是否在 Ring3」判定。
+ * 数据源供 times()/getrusage()/clock_gettime(CLOCK_PROCESS_CPUTIME_ID) 使用。
+ */
+void task_account_tick(bool user_mode)
+{
+    task_t *t = sched_current();
+    if (!t || t->is_idle) {
+        return;
+    }
+    if (user_mode) {
+        t->utime_ticks++;
+    } else {
+        t->stime_ticks++;
+    }
 }

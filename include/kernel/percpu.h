@@ -51,7 +51,25 @@ typedef struct percpu {
     uint32_t    rq_count;           /* 本 CPU 运行队列任务数（含 idle） */
     volatile uint32_t in_idle;      /* 本 CPU 是否处于 hlt 空闲（供 IPI 唤醒参考） */
     uint64_t user_switches;         /* 本 CPU 切换到 Ring3 任务的次数（负载均衡观测） */
+
+    /* ---- syscall 入口的用户寄存器暂存 ----
+     * 为什么必须放在 percpu 内（用 %gs: 相对寻址访问）而不是独立全局数组：
+     * syscall_entry 进入时【所有】通用寄存器都承载用户值（rax=调用号，
+     * rdi/rsi/rdx/r10/r8/r9=参数，rcx=用户 RIP，r11=用户 RFLAGS），只有先
+     * 从 %gs:0 取到 CPU 索引后才能改用暂存寄存器。独立数组需要一条
+     * `movabsq $addr, %reg` 才能寻址，而那条指令本身就会毁掉 %reg 里的
+     * 用户值——取到的"第 6 参数"早已不是原值。%gs:offset 寻址不消耗任何
+     * 通用寄存器，是唯一能在"零破坏"前提下保存用户寄存器的方式。
+     *
+     * utmp_r9：用户第 6 参数（mmap 的 off）。入口立刻存入，构造 GPR 帧时
+     * 再取回填，否则 6 参 syscall 的第 6 个参数会变成内核指针。 */
+    uint64_t utmp_r9;               /* 用户 %r9（syscall 第 6 参数） */
 } percpu_t;
+
+/* percpu_t 内的字节偏移，供 syscall_entry.S 的 %gs: 相对寻址使用。
+ * 必须与上面结构体布局严格一致；新增字段只能加在末尾。
+ * （静态断言见 kernel/arch/x86_64/percpu.c） */
+#define PERCPU_OFF_UTMP_R9   80
 
 extern percpu_t g_percpu[MAX_CPUS];
 

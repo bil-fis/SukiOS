@@ -8,6 +8,7 @@
  */
 #include <kernel/percpu.h>
 #include <kernel/console.h>
+#include <stddef.h>      /* offsetof：静态断言校验 %gs: 偏移与结构体布局 */
 
 percpu_t g_percpu[MAX_CPUS];
 
@@ -62,3 +63,13 @@ percpu_t *cpu_local(void)
 {
     return &g_percpu[cpu_index()];
 }
+
+/*
+ * 静态断言：syscall_entry.S 用【硬编码】的 %gs:72 访问 percpu.utmp_r9
+ * 汇编里没有结构体布局信息，一旦有人往 percpu_t 中间插字段，汇编就会静默
+ * 读写错误的槽位（表现为 6 参 syscall 拿到错误的第 6 参数，极难排查）。
+ * 这里让编译器在布局漂移时直接构建失败，把运行期玄学变成编译期硬错误。
+ */
+_Static_assert(offsetof(percpu_t, utmp_r9) == PERCPU_OFF_UTMP_R9,
+               "PERCPU_OFF_UTMP_R9 out of sync with percpu_t layout: "
+               "update include/kernel/percpu.h and syscall_entry.S together");

@@ -43,6 +43,12 @@ static bool g_kernel_fb_diag = true;
  * SMP 后的跨 CPU 串行化自旋锁随 P0-3 引入。 */
 static volatile int g_kp_depth = 0;
 
+/* ---- 早期控制台环形管道（详见 console.h 注释）---- */
+static char     g_console_pipe[CONSOLE_PIPE_SIZE];
+static volatile size_t g_pipe_head = 0;   /* 生产者写指针（环形索引） */
+static volatile size_t g_pipe_tail = 0;   /* 消费者读指针（环形索引） */
+static spinlock_t g_pipe_lock = SPINLOCK_INIT("conpipe");
+
 void console_init(void)
 {
     g_use_fb = fb_available();
@@ -59,14 +65,74 @@ static volatile size_t g_kprintf_nout = 0;
 void kputc(char c)
 {
     g_kprintf_nout++;
-    serial_write(c);
-    /* 内核诊断是否镜像到帧缓冲：进入用户态后由 console_set_fb_diag(false)
-     * 关闭，避免 [ipc]/[sched] 等运行期日志刷屏图形终端（shell 专用）。 */
+    serial_write(c);   /* 串口恒定输出，便于无图形场景也可见内核日志 */
+
+    /*
+     * 显示服务接管帧缓冲后（g_display_active），内核诊断【不再直接写屏】——
+     * 否则会覆盖显示服务合成的桌面。此时把本要送 fbcon 的字符「捕获」进
+     * 早期控制台环形管道，供后续用户态 shell 经 SYS_CONSOLE_READ 读回
+     * （类似 dmesg）。串口仍照常输出，因此无图形调试不受影响。
+     *
+     * 关系式：
+     *   - 显示未激活（启动早期/纯文本回退）：照旧写 fbcon/vga。
+     *   - 显示已激活：仅捕获进管道 + 串口；除非 panic() 强制把
+     *     g_kernel_fb_diag 拉回 true（致命错误须图形终端可见）。
+     */
+    if (g_display_active) {
+        if (g_kernel_fb_diag) {           /* panic 等致命场景：直接屏显 */
+            if (g_use_fb) fbcon_putc(c);
+            else          vga_putc(c);
+        }
+        /* 捕获进环形管道（独立于 fbcon，供 SYS_CONSOLE_READ 读取） */
+        uint64_t pl = spin_lock_irqsave(&g_pipe_lock);
+        size_t next = (g_pipe_head + 1) % CONSOLE_PIPE_SIZE;
+        if (next != g_pipe_tail) {        /* 未满：写入 */
+            g_console_pipe[g_pipe_head] = c;
+            g_pipe_head = next;
+        } else {
+            /* 环形满：丢弃最旧字符（覆盖式），保证最新日志不丢 */
+            g_pipe_tail = (g_pipe_tail + 1) % CONSOLE_PIPE_SIZE;
+            g_console_pipe[g_pipe_head] = c;
+            g_pipe_head = next;
+        }
+        spin_unlock_irqrestore(&g_pipe_lock, pl);
+        return;
+    }
+
+    /* 显示未激活：正常路径 */
     if (g_use_fb && g_kernel_fb_diag) {
         fbcon_putc(c);
     } else {
         vga_putc(c);
     }
+}
+
+/* SYS_CONSOLE_READ 处理体：把环形管道中累积的字符拷贝到用户态缓冲。
+ * 返回实际拷贝字节数（0 表示暂无数据）。user_ptr 由调用方 copy_to_user 校验。 */
+size_t console_pipe_read(char *dst, size_t max)
+{
+    if (max == 0) return 0;
+    uint64_t pl = spin_lock_irqsave(&g_pipe_lock);
+    size_t avail = (g_pipe_head >= g_pipe_tail)
+                       ? (g_pipe_head - g_pipe_tail)
+                       : (CONSOLE_PIPE_SIZE - g_pipe_tail + g_pipe_head);
+    size_t n = (avail < max) ? avail : max;
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = g_console_pipe[g_pipe_tail];
+        g_pipe_tail = (g_pipe_tail + 1) % CONSOLE_PIPE_SIZE;
+    }
+    spin_unlock_irqrestore(&g_pipe_lock, pl);
+    return n;
+}
+
+size_t console_pipe_avail(void)
+{
+    uint64_t pl = spin_lock_irqsave(&g_pipe_lock);
+    size_t avail = (g_pipe_head >= g_pipe_tail)
+                       ? (g_pipe_head - g_pipe_tail)
+                       : (CONSOLE_PIPE_SIZE - g_pipe_tail + g_pipe_head);
+    spin_unlock_irqrestore(&g_pipe_lock, pl);
+    return avail;
 }
 
 /* 受限字符串输出：防御 fmt 指向无 NULL 终止的损坏内存时陷入无限循环

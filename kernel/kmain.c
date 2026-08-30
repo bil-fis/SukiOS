@@ -21,19 +21,19 @@
 #include <kernel/apic.h>
 #include <kernel/ioapic.h>
 #include <kernel/clock.h>
-#include <kernel/config.h>   /* CONFIG_SMP：构建形态（默认单核） */
-#include <kernel/display_cfg.h>  /* g_display：显示配置文件（video_mode/分辨率） */
-#include <kernel/posix.h>    /* posix_init()：完整 POSIX 系统调用层 */
-#include <kernel/rtc.h>      /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
+#include <kernel/config.h>      /* CONFIG_SMP：构建形态（默认单核） */
+#include <kernel/display_cfg.h> /* g_display：显示配置文件（video_mode/分辨率） */
+#include <kernel/posix.h>       /* posix_init()：完整 POSIX 系统调用层 */
+#include <kernel/rtc.h>         /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
 #include <kernel/smp.h>
 #include <kernel/percpu.h>
 #include <kernel/diagnostics.h>
-#include <kernel/gdbstub.h>   /* P0-R3：常备串口 GDB stub（COM2） */
-#include <kernel/security.h>  /* P0-8：安全地基（UMIP/IST 守卫栈/Meltdown 检测） */
+#include <kernel/gdbstub.h>  /* P0-R3：常备串口 GDB stub（COM2） */
+#include <kernel/security.h> /* P0-8：安全地基（UMIP/IST 守卫栈/Meltdown 检测） */
 #include <kernel/keyboard.h>
 #include <kernel/string.h>
 #include <kernel/task.h>
-#include <mm/vma.h>           /* P0-5：vma_selftest */
+#include <mm/vma.h> /* P0-5：vma_selftest */
 #include <kernel/syscall.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -41,7 +41,7 @@
 
 #include <ipc/port.h>
 #include <kernel/ata.h>
-#include <kernel/ahci.h>      /* P0-7：AHCI DMA 优先探测 */
+#include <kernel/ahci.h> /* P0-7：AHCI DMA 优先探测 */
 
 /* 声明在 kernel/sched/sched.c：将 BSP 引导流切换到 idle0 独立内核栈 */
 extern void sched_switch_to_idle0(void);
@@ -50,7 +50,7 @@ extern void sched_switch_to_idle0(void);
  * 由 kmain 在 sched_switch_to_idle0() 之前经 task_create_kernel 拉起，
  * 运行于独立内核栈、被正常调度，负责加载 disk-srv 与全部 Ring3 服务。 */
 static void boot_late_init(void *arg);
-#include <kernel/pci.h>       /* P0-1/P0-2：ECAM、_PRT 路由、MSI 编程 */
+#include <kernel/pci.h> /* P0-1/P0-2：ECAM、_PRT 路由、MSI 编程 */
 #include <kernel/hda.h>
 
 /* L3：由 boot.S 在探测到 CPU 支持 SMAP 后置 1（见 syscall.c 的 copy_*_user
@@ -58,11 +58,11 @@ static void boot_late_init(void *arg);
 extern uint8_t g_smap_enabled;
 
 /* Ring3 用户程序 blob（user/ 下的 C 程序，Makefile 嵌入内核镜像） */
-extern const uint8_t user_fs_server_start[],    user_fs_server_end[];
+extern const uint8_t user_fs_server_start[], user_fs_server_end[];
 extern const uint8_t user_input_server_start[], user_input_server_end[];
 extern const uint8_t user_display_server_start[], user_display_server_end[];
-extern const uint8_t user_shell_start[],        user_shell_end[];
-extern const uint8_t user_posixtest_start[],    user_posixtest_end[];
+extern const uint8_t user_shell_start[], user_shell_end[];
+extern const uint8_t user_posixtest_start[], user_posixtest_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -70,10 +70,11 @@ static void console_srv(void *arg)
     (void)arg;
     static uint8_t buf[512];
     port_set_owner(CONSOLE_PORT, sched_current());
-    for (;;) {
+    for (;;)
+    {
         uint32_t n = 0;
-        if (ipc_recv_kernel(CONSOLE_PORT, buf, sizeof(buf) - 1, &n, true)
-                == MACH_MSG_SUCCESS && n > sizeof(mach_msg_header_t)) {
+        if (ipc_recv_kernel(CONSOLE_PORT, buf, sizeof(buf) - 1, &n, true) == MACH_MSG_SUCCESS && n > sizeof(mach_msg_header_t))
+        {
             uint32_t len = n - (uint32_t)sizeof(mach_msg_header_t);
             char *text = (char *)buf + sizeof(mach_msg_header_t);
             text[len] = '\0';
@@ -86,7 +87,8 @@ static boot_info_t g_boot;
 
 static void draw_boot_logo(void)
 {
-    if (!fb_available()) {
+    if (!fb_available())
+    {
         return;
     }
     uint32_t W = fb_width();
@@ -117,8 +119,13 @@ static void mm_selftest(void)
 
     int *arr = (int *)kzalloc(64 * sizeof(int));
     bool zeroed = true;
-    for (int i = 0; i < 64; i++) {
-        if (arr[i] != 0) { zeroed = false; break; }
+    for (int i = 0; i < 64; i++)
+    {
+        if (arr[i] != 0)
+        {
+            zeroed = false;
+            break;
+        }
     }
     arr[63] = 0xABCD;
     kprintf("[mm] kzalloc zeroed=%s, arr[63]=0x%x\n",
@@ -148,9 +155,13 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
      * 任务之前——kmain 自身永不返回，是唯一「序言读旧值」的在飞栈帧。 */
     stack_canary_reseed();
 
-    if (!bootinfo_prepare(magic, mbi_phys, &g_boot)) {
+    if (!bootinfo_prepare(magic, mbi_phys, &g_boot))
+    {
         serial_writestr("[boot] FATAL: unsupported boot protocol (not Multiboot2/PVH).\n");
-        for (;;) { __asm__ volatile("hlt"); }
+        for (;;)
+        {
+            __asm__ volatile("hlt");
+        }
     }
 
     /* 显示配置文件（configs/display.cfg，经 GRUB module2 加载）必须在 fb_init
@@ -183,7 +194,7 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
 
     /* ---- 阶段三：中断/异常子系统（IDT 先就位，APIC 向量才能投递）---- */
     gdt_init();
-    fpu_init();                     /* 启用 FPU/SSE 状态保存（D2 项） */
+    fpu_init(); /* 启用 FPU/SSE 状态保存（D2 项） */
     idt_init();
 
     /* ---- 阶段四：内存管理 ---- */
@@ -203,14 +214,14 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     diag_selftest();
 
     /* ---- P0-1/P0-2/P0-4：ACPI 拓扑发现 + LAPIC/IOAPIC 取代 8259 PIC+PIT ---- */
-    acpi_set_rsdp_hint(g_boot.rsdp_copy_phys);     /* P0-6：UEFI 下唯一 RSDP 来源 */
-    acpi_init();                                   /* 解析 RSDP/XSDT/MADT/HPET/MCFG/_PRT */
-    pci_cfg_init();                                /* P0-1：MCFG 存在则切 ECAM，否则 PIO 回退 */
-    uint8_t bsp_lapic = lapic_init();              /* 启用本地 APIC */
-    ioapic_init();                                 /* 初始化 I/O APIC（屏蔽全部） */
-    ioapic_set_dest(bsp_lapic);                    /* 中断投递到 BSP */
-    pic_disable();                                 /* 屏蔽遗留 8259，防双投递 */
-    clock_init();                                  /* TSC 校准 + LAPIC 100Hz 节拍 + HPET 探测 */
+    acpi_set_rsdp_hint(g_boot.rsdp_copy_phys); /* P0-6：UEFI 下唯一 RSDP 来源 */
+    acpi_init();                               /* 解析 RSDP/XSDT/MADT/HPET/MCFG/_PRT */
+    pci_cfg_init();                            /* P0-1：MCFG 存在则切 ECAM，否则 PIO 回退 */
+    uint8_t bsp_lapic = lapic_init();          /* 启用本地 APIC */
+    ioapic_init();                             /* 初始化 I/O APIC（屏蔽全部） */
+    ioapic_set_dest(bsp_lapic);                /* 中断投递到 BSP */
+    pic_disable();                             /* 屏蔽遗留 8259，防双投递 */
+    clock_init();                              /* TSC 校准 + LAPIC 100Hz 节拍 + HPET 探测 */
 
     /* ---- P0-3：SMP —— BSP percpu 安装 + AP 启动（INIT-SIPI-SIPI）----
      * SMP 是编译期可选特性（include/kernel/config.h 的 CONFIG_SMP），默认
@@ -219,13 +230,13 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     kprintf("[boot] SMP build config: %s (max_cpus=%u)\n",
             CONFIG_SMP ? "ENABLED (multi-core)" : "disabled (single-core)",
             (unsigned)MAX_CPUS);
-    percpu_install(0, bsp_lapic);                  /* BSP 的 GS_BASE -> percpu[0] */
-    smp_init();                                    /* 依 MADT 唤醒全部 AP */
+    percpu_install(0, bsp_lapic); /* BSP 的 GS_BASE -> percpu[0] */
+    smp_init();                   /* 依 MADT 唤醒全部 AP */
 
     /* ---- 阶段五：调度器 ---- */
     sched_init();
 
-    keyboard_init();              /* 经 I/O APIC GSI1 -> IRQ1 */
+    keyboard_init(); /* 经 I/O APIC GSI1 -> IRQ1 */
     interrupts_enable();
 
     /* ---- 阶段六：syscall + Ring3 ---- */
@@ -331,37 +342,49 @@ static void boot_late_init(void *arg)
      * ========================================================== */
     bool ahci_ok = ahci_init();
     bool disk_ok = ata_init() || ahci_ok;
-    if (disk_ok) {
+    if (disk_ok)
+    {
         disk_srv_start();
         /* 等 disk-srv 真正阻塞在 DISK_PORT（上限约 2 秒，绝不无限自旋：
          * 磁盘线程若因初始化失败未能进入等待，继续等待只会挂死引导）。 */
-        for (uint32_t i = 0; i < 2000 && !port_has_waiter(DISK_PORT); i++) {
+        for (uint32_t i = 0; i < 2000 && !port_has_waiter(DISK_PORT); i++)
+        {
             task_yield();
         }
         task_t *fs_task = task_create_user(
-                              user_fs_server_start,
-                              (size_t)(user_fs_server_end
-                                       - user_fs_server_start),
-                              "fs-server");
+            user_fs_server_start,
+            (size_t)(user_fs_server_end - user_fs_server_start),
+            "fs-server");
         /* A2 项：仅 FS_SERVER 被授权向内核 DISK_PORT 发送磁盘请求 */
-        if (fs_task) {
+        if (fs_task)
+        {
             port_grant_send(DISK_PORT, fs_task);
             kprintf("[boot] fs-server spawned (pid=%lu), POSIX file syscalls "
-                    "enabled\n", (unsigned long)fs_task->id);
+                    "enabled\n",
+                    (unsigned long)fs_task->id);
         }
-    } else {
+    }
+    else
+    {
         kprintf("[boot] no disk: FS_SERVER not started (POSIX file syscalls "
                 "will return -EIO)\n");
     }
 
-    /* ---- Ring3 输入服务 + 显示服务 + Shell ----
-     * 显示服务认领 DISPLAY_PORT，据 configs/display.cfg 决定视频合成或纯文本。 */
+    /* ---- Ring3 输入服务 + 显示服务（Shell 暂不启动）----
+     * 用户明确要求：「显示服务启动时，shell 不应该启动」。
+     * 因此本阶段只拉起 input-server 与 display-server；display-server
+     * 完成桌面合成、进入消息循环前会调用 SYS_DISPLAY_READY，内核随即置
+     * g_display_active=true、关闭 fbcon 对真实屏幕的写（改把内核诊断捕获进
+     * 内核环形管道，供后续用户态 shell 经 SYS_CONSOLE_READ 读回，类似 dmesg）。
+     * shell 的启动将作为后续独立里程碑，在显示层就绪后再接入。 */
     task_create_user(user_input_server_start,
                      (size_t)(user_input_server_end - user_input_server_start),
                      "input-server");
     task_create_user(user_display_server_start,
                      (size_t)(user_display_server_end - user_display_server_start),
                      "display-server");
+    /* TODO(P0 后续里程碑)：显示层就绪后，再 spawn shell；届时 shell 可经
+     * SYS_CONSOLE_READ 取回内核启动日志并渲染到显示服务的终端窗口。*/
     task_create_user(user_shell_start,
                      (size_t)(user_shell_end - user_shell_start), "shell");
 
@@ -374,7 +397,8 @@ static void boot_late_init(void *arg)
     //                  (size_t)(user_posixtest_end - user_posixtest_start),
     //                  "posixtest");
 
-    kprintf("[boot] all services spawned; system fully up.\n\n");
+    kprintf("[boot] core services spawned (input+display); shell deferred "
+            "until display layer ready.\n\n");
 
     /* 本线程使命完成，退出（zombie 由调度器回收）。 */
     task_exit_current(0);

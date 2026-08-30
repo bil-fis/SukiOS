@@ -17,6 +17,7 @@
 #include <kernel/display_cfg.h>
 #include <kernel/multiboot2.h>
 #include <kernel/serial.h>
+#include <kernel/types.h>   /* PHYS_TO_VIRT：使用运行期 g_virt_base，不硬编码 */
 
 display_config_t g_display = {
     .video_mode = true,
@@ -36,11 +37,6 @@ void display_set_active(void)
 }
 
 /* 常量（避免依赖不确定头文件） */
-#ifndef PHYS_TO_VIRT
-/* 内核线性映射：物理地址 + KERNEL_BASE 即内核虚拟地址（见 vmm 常量）。 */
-#define PHYS_TO_VIRT(pa) ((void *)((uint64_t)(pa) + 0xFFFF800000000000ULL))
-#endif
-
 #define KEY_MAX 32
 #define VAL_MAX 32
 

@@ -14,11 +14,19 @@
 #include <kernel/utf8.h>
 #include <kernel/display_cfg.h>   /* g_display.video_mode：配置文件开关 */
 #include <kernel/serial.h>
+#include <kernel/pci.h>            /* bga_locate_and_set 使用 PCI 配置访问 */
 
 #define CON_SCALE  2   /* 字形放大倍数：8x8 -> 16x16 */
 #define CON_MARGIN 4   /* 边距像素 */
 
 fb_info_t g_fb;
+
+/*
+ * bga_locate_and_set —— 声明在 kernel/arch/x86_64/bga.c。
+ * 找到 Bochs VGA（PCI 0x1234:0x1111），把线性帧缓冲设到 (width,height)@32bpp，
+ * 并返回 LFB 物理地址（PCI BAR0）。成功返回 true。
+ */
+bool bga_locate_and_set(uint32_t width, uint32_t height, uint64_t *out_phys);
 
 /* 控制台状态 */
 static struct {
@@ -74,12 +82,16 @@ bool fb_init(const boot_info_t *bi)
         g_fb.ready = false;
         return false;
     }
+
+    /* 先用 GRUB/Multiboot2 转交的硬件帧缓冲（可能是默认 1024x768 等）初始化，
+     * 保证即使后续 BGA 自定义模式失败也有可用画布。 */
     g_fb.base   = (volatile uint8_t *)PHYS_TO_VIRT(bi->fb_addr);
     g_fb.pitch  = bi->fb_pitch;
     g_fb.width  = bi->fb_width;
     g_fb.height = bi->fb_height;
     g_fb.bpp    = bi->fb_bpp;
     g_fb.ready  = true;
+
     /* 诊断：报告 GRUB 实际转交的硬件帧缓冲分辨率（可能因 QEMU/VBE 不支持
      * 而回退，未必等于配置里请求的 1280x720）。验证显示服务真实画布尺寸。 */
     serial_writestr("[fb] real framebuffer: ");
@@ -91,6 +103,36 @@ bool fb_init(const boot_info_t *bi)
     serial_writestr(" bpp=");
     serial_write_dec(g_fb.bpp);
     serial_writestr("\n");
+
+    /*
+     * 关键增强：Bochs VBE（BGA）自定义模式。
+     * GRUB/Multiboot2 无法把分辨率设到 1024x768 之外，但 QEMU `-vga std`
+     * 实现的 BGA 设备支持通过 IO 端口设置任意分辨率（含 1280x720）的 32bpp
+     * 线性帧缓冲（见 osdev_wiki Bochs_VBE_extensions）。我们用它把屏幕真正
+     * 设到 display.cfg 声明的 1280x720，并从 PCI BAR0 重新取 LFB 物理地址。
+     * 失败则保持 GRUB 给的分辨率（不破坏启动）。
+     */
+    uint64_t lfb_phys = 0;
+    if (bga_locate_and_set(g_display.width, g_display.height, &lfb_phys)
+        && lfb_phys != 0) {
+        g_fb.base   = (volatile uint8_t *)PHYS_TO_VIRT(lfb_phys);
+        g_fb.pitch  = g_display.width * 4;   /* 32bpp 线性，无对齐填充 */
+        g_fb.width  = g_display.width;
+        g_fb.height = g_display.height;
+        g_fb.bpp    = 32;
+        g_fb.ready  = true;
+        serial_writestr("[fb] switched to BGA ");
+        serial_write_dec(g_fb.width);
+        serial_writestr("x");
+        serial_write_dec(g_fb.height);
+        serial_writestr("@32 LFB @ phys 0x");
+        serial_write_hex((uint64_t)lfb_phys);
+        serial_writestr("\n");
+    } else {
+        serial_writestr("[fb] BGA custom mode unavailable; keeping GRUB "
+                        "framebuffer (may be 1024x768)\n");
+    }
+
     return true;
 }
 

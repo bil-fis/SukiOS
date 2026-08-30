@@ -24,6 +24,27 @@ void user_puts(const char *s);
  * Ring3 shell，避免按键时被 [ipc]/[sched] 等调试日志刷屏。 */
 void console_set_fb_diag(bool on);
 
+/*
+ * 早期控制台环形管道（early-console ring pipe）。
+ * ---------------------------------------------------------------------------
+ * 设计（用户需求）：显示服务接管帧缓冲后，内核诊断（原写 fbcon 的内容）
+ * 不再直接写屏（否则覆盖显示服务合成桌面），而是被「捕获」进此内核环形
+ * 缓冲，保留完整启动日志，供后续用户态 shell 经 SYS_CONSOLE_READ 读回
+ * （类似 Unix dmesg / 内核 ring buffer）。
+ *
+ * 生产关系：
+ *   - 生产者：kputc() 在 g_display_active 为真时，把本来要送 fbcon 的字符
+ *     额外写入 g_console_pipe（串口始终照常输出，便于无图形调试）。
+ *   - 消费者：sys_console_read()（SYS_CONSOLE_READ 处理体）把管道内累积的
+ *     字符拷贝到用户态缓冲（user_ptr 经 copy_to_user 校验），供 shell 显示。
+ *   - 环形缓冲用独立自旋锁 g_pipe_lock 保护（与 kprintf 的 g_kp_lock 解耦，
+ *     避免 syscall 路径与 kprintf 路径互相死锁）。
+ */
+#define CONSOLE_PIPE_SIZE  16384   /* 16KB 环形缓冲，足够容纳启动期全部日志 */
+
+size_t console_pipe_read(char *dst, size_t max);   /* 返回实际拷贝字节数 */
+size_t console_pipe_avail(void);                    /* 当前可读取字节数 */
+
 /* 致命错误：输出诊断信息到串口与显示，随后停机（手册 8.1） */
 __attribute__((noreturn)) void panic(const char *fmt, ...);
 

@@ -742,8 +742,9 @@ static uint64_t sys_framebuffer_map(uint64_t a1)
         return (uint64_t)-1;   /* 纯文本模式：无 FB 映射 */
     }
 
-    /* 帧缓冲物理地址：g_fb.base 是内核线性映射虚拟地址，还原物理地址 */
-    uint64_t fb_phys = (uint64_t)g_fb.base - 0xFFFF800000000000ULL;
+    /* 帧缓冲物理地址：g_fb.base 是内核线性映射虚拟地址，经 VIRT_TO_PHYS 还原
+     * （运行期 g_virt_base，不硬编码常量，兼容内核重定位/KASLR）。 */
+    uint64_t fb_phys = VIRT_TO_PHYS(g_fb.base);
     uint64_t fb_bytes = (uint64_t)g_fb.pitch * (uint64_t)g_fb.height;
     uint64_t npages = (fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -769,6 +770,45 @@ static uint64_t sys_framebuffer_map(uint64_t a1)
     if (!copy_to_user((void *)a1, &res, sizeof(res)))
         return (uint64_t)-1;
     return 0;
+}
+
+/*
+ * sys_console_read —— SYS_CONSOLE_READ 实现。
+ * ---------------------------------------------------------------------------
+ * 读取「早期控制台环形管道」（详见 kernel/console.c、console.h）中累积的内核
+ * 启动日志。显示服务接管帧缓冲后，内核诊断不再直接写屏，而是被捕获进该环形
+ * 管道；本调用让后续用户态 shell（或任意进程）取回这些日志用于显示/调试
+ * （类似 Unix dmesg）。
+ *
+ *   参数 a1 = 用户态缓冲指针，a2 = 缓冲字节数上限；
+ *   返回实际拷贝字节数（0=暂无数据），非法指针返回 (uint64_t)-1。
+ *
+ * 安全性：用户指针 a1 经 user_access_ok 校验（写权限、不越界、页存在），
+ * 绝不直解引用。管道读取本身由 g_pipe_lock 自旋锁保护（见 console.c）。
+ */
+static uint64_t sys_console_read(uint64_t a1, uint64_t a2)
+{
+    void *ubuf = (void *)a1;
+    size_t max = (size_t)a2;
+    if (max == 0) {
+        return 0;
+    }
+    if (!user_access_ok(ubuf, max, true)) {
+        return (uint64_t)-1;
+    }
+    char *kbuf = kmalloc(max);
+    if (!kbuf) {
+        return (uint64_t)-1;
+    }
+    size_t n = console_pipe_read(kbuf, max);
+    if (n > 0) {
+        if (!copy_to_user(ubuf, kbuf, n)) {
+            kfree(kbuf);
+            return (uint64_t)-1;
+        }
+    }
+    kfree(kbuf);
+    return (uint64_t)n;
 }
 
 
@@ -822,6 +862,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_SERIAL_READ: return sys_serial_read();
     case SYS_FRAMEBUFFER_MAP: return sys_framebuffer_map(a1);
     case SYS_DISPLAY_READY:   display_set_active(); return 0;
+    case SYS_CONSOLE_READ:    return sys_console_read(a1, a2);
     default: {
         /* 其余全部交给 POSIX 层（进程/文件/内存/时间/系统/网络号区） */
         int64_t r = 0;

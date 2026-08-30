@@ -341,7 +341,7 @@ static void ata_select_lba(uint64_t lba, uint8_t count, bool use48)
  * 都已停掉总线主控（Start=0），不会留下悬空的 DMA 引擎。 */
 static bool __attribute__((noinline)) ata_dma_xfer(uint64_t lba, uint8_t count, bool write)
 {
-    kprintf("[ata] dbg: dma_xfer enter lba=%lu cnt=%u write=%u bm=0x%x\n",
+    dbg_printf("[ata] dbg: dma_xfer enter lba=%lu cnt=%u write=%u bm=0x%x\n",
             (unsigned long)lba, (unsigned)count, (unsigned)write,
             (unsigned)g_bm_base);
     if (g_bm_base == 0 || count == 0 || count > ATA_DMA_MAX_SECTORS) {
@@ -367,7 +367,7 @@ static bool __attribute__((noinline)) ata_dma_xfer(uint64_t lba, uint8_t count, 
 
     /* 4. 选盘并下发 DMA 命令 */
     if (!ata_wait_not_busy()) {
-        kprintf("[ata] dbg: dma pre-busy timeout\n");
+        dbg_printf("[ata] dbg: dma pre-busy timeout\n");
         return false;
     }
     bool use48 = g_lba48 && (lba + count) > 0x0FFFFFFFULL;
@@ -432,7 +432,7 @@ static bool __attribute__((noinline)) ata_dma_xfer(uint64_t lba, uint8_t count, 
     if (inb(ATA_STATUS) & ST_ERR) {
         return false;
     }
-    kprintf("[ata] dbg: dma xfer done write=%u ok=%u bmst=0x%x devst=0x%x\n",
+    dbg_printf("[ata] dbg: dma xfer done write=%u ok=%u bmst=0x%x devst=0x%x\n",
             (unsigned)write, (unsigned)ok,
             (unsigned)inb(g_bm_base + BM_STATUS), (unsigned)inb(ATA_STATUS));
     return ok;
@@ -440,7 +440,7 @@ static bool __attribute__((noinline)) ata_dma_xfer(uint64_t lba, uint8_t count, 
 
 bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
 {
-    kprintf("[ata] read_sectors enter lba=%lu cnt=%u present=%u total=%lu\n",
+    dbg_printf("[ata] read_sectors enter lba=%lu cnt=%u present=%u total=%lu\n",
             (unsigned long)lba, (unsigned)count, (unsigned)g_disk_present,
             (unsigned long)g_total_sectors);
     if (!g_disk_present || count == 0) {
@@ -452,7 +452,7 @@ bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
     /* M10 修复：读路径补上越界读盘防护（此前仅写路径有）。lba+count 越过
      * 卷尾会令控制器读无效扇区/越界 DMA；无符号回绕一并防范。 */
     if ((uint64_t)lba + count > g_total_sectors || (uint64_t)lba + count < lba) {
-        kprintf("[ata] read_sectors OOB reject: lba+count=%lu total=%lu\n",
+        dbg_printf("[ata] read_sectors OOB reject: lba+count=%lu total=%lu\n",
                 (unsigned long)((uint64_t)lba + count),
                 (unsigned long)g_total_sectors);
         spin_unlock_irqrestore(&g_ata_lock, ata_flags);
@@ -461,7 +461,7 @@ bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
     /* 优先走 Bus Master DMA：按 ATA_DMA_MAX_SECTORS 分块，经反弹缓冲拷出。
      * 任一块 DMA 失败则整体回退 PIO 重做（保证数据正确性优先于速度）。 */
     if (g_bm_base != 0) {
-        kprintf("[ata] write_sectors: DMA path, lba=%lu cnt=%u\n",
+        dbg_printf("[ata] write_sectors: DMA path, lba=%lu cnt=%u\n",
                 (unsigned long)lba, (unsigned)count);
         uint8_t done = 0;
         bool dma_ok = true;
@@ -485,7 +485,7 @@ bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
     }
 
     if (!ata_wait_not_busy()) {
-        kprintf("[ata] PIO read lba=%lu: not-busy timeout\n",
+        dbg_printf("[ata] PIO read lba=%lu: not-busy timeout\n",
                 (unsigned long)lba);
         spin_unlock_irqrestore(&g_ata_lock, ata_flags);
         return false;
@@ -498,7 +498,7 @@ bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
     uint16_t *out = (uint16_t *)buf;
     for (uint8_t s = 0; s < count; s++) {
         if (!ata_wait_drq()) {
-            kprintf("[ata] PIO read lba=%lu: drq timeout sec=%u\n",
+            dbg_printf("[ata] PIO read lba=%lu: drq timeout sec=%u\n",
                     (unsigned long)lba, (unsigned)s);
             spin_unlock_irqrestore(&g_ata_lock, ata_flags);
             return false;
@@ -508,7 +508,7 @@ bool ata_read_sectors(uint64_t lba, uint8_t count, void *buf)
         }
         ata_delay400();
     }
-    kprintf("[ata] PIO read lba=%lu done (cpu=%u)\n",
+    dbg_printf("[ata] PIO read lba=%lu done (cpu=%u)\n",
             (unsigned long)lba, (unsigned)cpu_index());
     spin_unlock_irqrestore(&g_ata_lock, ata_flags);
     return true;
@@ -533,7 +533,7 @@ bool ata_write_sectors(uint64_t lba, uint8_t count, const void *buf)
     /* DMA 写路径：分块拷入反弹缓冲后由总线主控写盘，最后 FLUSH CACHE 落盘。
      * 失败时回退下方 PIO 重试逻辑。 */
     if (g_bm_base != 0) {
-        kprintf("[ata] write_sectors: DMA path, lba=%lu cnt=%u\n",
+        dbg_printf("[ata] write_sectors: DMA path, lba=%lu cnt=%u\n",
                 (unsigned long)lba, (unsigned)count);
         uint8_t done = 0;
         bool dma_ok = true;
@@ -611,7 +611,7 @@ uint64_t ata_total_sectors(void)
  * disk-srv 及其 IPC 协议完全不感知底层是哪条路径。 */
 static bool blk_read(uint64_t lba, uint8_t count, void *buf)
 {
-    kprintf("[ata] blk_read lba=%lu cnt=%u bm=0x%x present=%u ahci=%u\n",
+    dbg_printf("[ata] blk_read lba=%lu cnt=%u bm=0x%x present=%u ahci=%u\n",
             (unsigned long)lba, (unsigned)count, (unsigned)g_bm_base,
             (unsigned)g_disk_present, (unsigned)ahci_present());
     if (ahci_present()) {

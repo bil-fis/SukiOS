@@ -54,6 +54,13 @@ CONFIG_SMP := $(if $(filter 1,$(SMP)),1,0)
 DBG                  ?= 0
 CONFIG_DEBUG_SERIAL  := $(if $(filter 1,$(DBG)),1,0)
 
+# ---- 运行超时（秒）----
+# 默认 0：qemu 持续运行（前台需手动 Ctrl-C / 后台用 -no-shutdown 等信号退出）。
+# 设为正整数时，用 coreutils `timeout` 包裹 qemu，到时自动 SIGTERM 退出，
+# 便于自动化验证（无头跑 N 秒后落盘串口日志，再 grep 判断结果）。
+# 例：make run-headless RUN_TIMEOUT=20
+RUN_TIMEOUT         ?= 0
+
 # 配置注入载体：由本 Makefile 生成，经 `-include` 插入到每个内核编译单元的
 # 最前面。它被 -MMD 记录进 .d 依赖文件，因此 SMP 开关一改，全部 .o 自动
 # 重编，绝不会出现「一半单核对象 + 一半多核对象」的混链。
@@ -143,6 +150,14 @@ DISK := $(BUILD)/disk.img
 # 注意：-machine pc (i440FX) 提供传统 IDE (PIIX3, PIO 0x1F0)；
 #       q35 只有 AHCI，ATA PIO 驱动无法使用。
 QEMU        := qemu-system-x86_64
+# 运行超时包装：RUN_TIMEOUT=0（默认）时直接用 $(QEMU)；设为正整数时以
+# coreutils `timeout` 包裹，到时自动 SIGTERM 退出（便于无头自动化验证）。
+# 必须用 `=` 递归展开，确保引用到已定义的 $(QEMU)/$(RUN_TIMEOUT)。
+ifeq ($(RUN_TIMEOUT),0)
+QEMU_RUN    := $(QEMU)
+else
+QEMU_RUN    := timeout $(RUN_TIMEOUT) $(QEMU)
+endif
 # 注意：-no-reboot 会让 QEMU 把 8042 复位脉冲当作"关机"处理，配合
 #       -no-shutdown 会进入 paused 状态而非真正重启。故移除 -no-reboot，
 #       使内核的 sys_reboot()（8042 0xFE 脉冲）可触发真正的机器重启。
@@ -384,11 +399,11 @@ $(DISK): $(APP_ELFS) others_tests/moonhalo.mp3
 # 若不指定 -boot d，-machine pc 会优先尝试硬盘导致无法启动。
 # 这样 `make run` 即可直接拉起一个完整可启动的 SukiOS 模拟环境。
 run: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
 
 # ---- 无头运行 (仅串口，用于自动化验证) ----
 run-headless: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
 
 # ---- 调试运行（带全部串口冗长诊断） ----
 # 通过递归子 make 把 DBG=1 作为全局变量传入，确保 build/config.h 生成
@@ -400,10 +415,10 @@ run-dbg:
 
 # P0-7：磁盘挂 AHCI（DMA+中断），验证 kernel/drivers/ahci.c
 run-ahci: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 run-ahci-headless: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 # ---- P0-6 UEFI：OVMF 启动（GRUB-EFI -> multiboot2 -> 同一 kernel.elf） ----
 # VARS 每次从模板复制（保持只读模板干净；EFI 变量写入进副本）。
@@ -414,10 +429,10 @@ $(OVMF_VARS): $(OVMF_VARS_SRC)
 	cp $< $@
 
 run-uefi: $(ISO) $(DISK) $(OVMF_VARS)
-	$(QEMU) $(QEMU_FLAGS) $(QEMU_UEFI) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_UEFI) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 run-uefi-headless: $(ISO) $(DISK) $(OVMF_VARS)
-	$(QEMU) $(QEMU_FLAGS) $(QEMU_UEFI) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_UEFI) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 # ---- GDB 调试 (配合 .gdbinit) ----
 debug: $(ISO) $(DISK)
@@ -427,12 +442,12 @@ debug: $(ISO) $(DISK)
 # 不经 ISO/GRUB；-kernel 扫描 ELF SHT_NOTE 段的 Xen PVH note 取得入口。
 # -append "pvh" 仅作标识（PVH 下 EAX!=MULTIBOOT2_MAGIC，内核据此分派）。
 run-q: $(KERNEL) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) \
+	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) \
 		-kernel $(KERNEL) -append "pvh" $(QEMU_DISK)
 
 # PVH 直启 + 异常日志（qemu -d int 捕获 #GP/#PF 精确 RIP/error code 到 qemu.int.log）
 run-q-debug: $(KERNEL) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) \
+	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) \
 		-kernel $(KERNEL) -append "pvh" $(QEMU_DISK) \
 		-d int -D qemu.int.log -no-reboot
 

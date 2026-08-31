@@ -1,11 +1,15 @@
 /*
  * kernel/arch/x86_64/mouse.c
  * -----------------------------------------------------------------------------
- * 内核态 PS/2 鼠标采集（IRQ12，与键盘共用 PS/2 控制器）。
+ * 内核态 PS/2 鼠标采集（IRQ12，辅助设备，与键盘共用 8042 控制器）。
  *
  * 参考 OSDev「PS/2 Mouse」「8042 PS/2 Controller」条目标准做法：
- *   - 0x64=命令/状态，0x60=数据。
+ *   - 0x64=命令/状态端口，0x60=数据端口。
  *   - 向辅助设备(鼠标)发命令：先写 0x64=0xD4，再写 0x60=命令/参数。
+ *   - 状态寄存器 STS_AUX(bit5, 0x20)：置位表示输出缓冲中的数据来自辅助设备
+ *     （鼠标）；清零表示来自主设备（键盘）。在键盘/鼠标 IRQ 分离拓扑（QEMU 默认：
+ *     键盘 IRQ1 + 鼠标 IRQ12）下，IRQ12 处理程序收到的数据**必带 STS_AUX**，
+ *     即 IRQ12 只投递鼠标数据，键盘数据走 IRQ1，两者互不干扰。
  *   - 标准 3 字节包：YO XO YS XS 1 M R L | dx | dy。
  *     YO/XO=溢出，YS/XS=符号位，M/R/L=中/右/左键。
  *   - 滚轮鼠标(ID=3)扩展为 4 字节包，第 4 字节为滚轮增量(补码)。
@@ -167,6 +171,15 @@ static void mse_parse(void)
     }
 }
 
+/*
+ * IRQ12 处理程序（鼠标）。
+ * OSDev《8042 PS/2 Controller》"Keyboard/Auxiliary Device Data"：IRQ12 仅在
+ * 辅助设备(鼠标)有数据可输出时触发，且此时 STS_AUX 必置位。键盘数据走 IRQ1，
+ * 不会经 IRQ12 投递，故此处**不**需要把非 AUX 数据转交键盘（键盘由 keyboard.c
+ * 的 IRQ1 handler 独立处理）。仅当 STS_AUX 置位时按鼠标包处理；若因 rare 残留
+ * （如非 AUX 残留字节）收到 STS_AUX=0 的数据，则读取并丢弃以防输出缓冲卡满，
+ * 不影响键盘（键盘不依赖此路径）。
+ */
 static void mouse_irq_handler(registers_t *r)
 {
     (void)r;
@@ -174,17 +187,18 @@ static void mouse_irq_handler(registers_t *r)
     if (!(st & STS_OUT_FULL)) {
         return;                 /* 无数据（ spurious，忽略） */
     }
+    uint8_t b = inb(MSE_DATA);
     if (st & STS_AUX) {
-        /* 数据来自鼠标 */
-        uint8_t b = inb(MSE_DATA);
+        /* 数据来自鼠标：拼包 */
         g_pkt[g_pkt_idx++] = b;
         if (g_pkt_idx >= g_pkt_len) {
             mse_parse();
             g_pkt_idx = 0;
         }
     } else {
-        /* 键盘数据（STS_AUX=0）：本 IRQ 不应收到，但为安全吞掉避免死锁 */
-        inb(MSE_DATA);
+        /* 非 AUX 残留字节（正常分离 IRQ 拓扑下不会发生）：读取丢弃，避免
+         * 输出缓冲永远非空导致后续真实鼠标包被淹没。 */
+        (void)b;
     }
 }
 
@@ -208,16 +222,32 @@ bool mouse_init(void)
 
     uint8_t resp;
 
-    /* 确保端口2（鼠标）已使能（kbd_controller_init 已设，但防御性再设） */
+    /* 确保端口2（鼠标）已使能。kbd_controller_init() 在初始化时曾禁用两个端口，
+     * 随后只使能端口1；此处显式 0xA8 重新使能端口2（鼠标）。 */
     mse_ctrl_cmd(CC_ENABLE_P2, NULL);
 
-    /* 复位鼠标，冲刷其所有回应字节 */
+    /* 确保 PS/2 配置字节已使能 IRQ12（bit1）且取消「禁用端口2时钟」(bit5)。
+     * 读-改-写配置字节是 OSDev 推荐的可靠使能 IRQ12 方法；此处保留其它位
+     * （含翻译位 bit6，由 keyboard.c 开启），仅保证鼠标所需的 bit1 与 bit5。
+     * 若读配置失败（极老控制器），则依赖上面 0xA8 命令已然使能端口2。 */
+    if (mse_ctrl_cmd(CC_READ_CFG, &resp)) {
+        uint8_t cfg = resp;
+        cfg |= 0x02;    /* 使能端口2中断（IRQ12 投递） */
+        cfg &= ~0x20;   /* 取消「禁用端口2时钟」位，确保鼠标时钟运行 */
+        mse_wait_input();
+        outb(MSE_CMD, CC_WRITE_CFG);
+        mse_wait_input();
+        outb(MSE_DATA, cfg);
+        kprintf("[mouse] controller cfg updated = 0x%02x (IRQ12 enabled)\n", cfg);
+    }
+
+    /* 复位鼠标，冲刷其所有回应字节（0xFA ACK 后 0xAA BAT，可能还有多余字节） */
     if (!mse_dev_cmd(MSE_RESET, &resp)) {
         kprintf("[mouse] no response to reset (no mouse?)\n");
         return false;
     }
     if (resp == MSE_ACK) {
-        /* 冲刷 0xAA(BAT) 后续字节 */
+        /* 冲刷 0xAA(BAT) 及后续字节，避免残留字节被当作包数据 */
         uint8_t t;
         for (int i = 0; i < 4; i++) {
             mse_read_byte(&t);
@@ -226,7 +256,7 @@ bool mouse_init(void)
         kprintf("[mouse] reset ack=0x%02x (unexpected)\n", resp);
     }
 
-    /* 设默认值 */
+    /* 设默认值（采样率/分辨率/缩放恢复出厂；停止流模式以便识别） */
     mse_dev_cmd(MSE_SET_DEFAULTS, &resp);
 
     /* 识别设备类型（读 ID 决定是否滚轮/5键） */
@@ -245,7 +275,7 @@ bool mouse_init(void)
         kprintf("[mouse] standard mouse detected (ID=%u, 3-byte packets)\n", id);
     }
 
-    /* 启用数据报告 */
+    /* 启用数据报告（0xF4 后鼠标在移动时经 IRQ12 发原始包） */
     mse_dev_cmd(MSE_ENABLE, &resp);
     if (resp != MSE_ACK) {
         kprintf("[mouse] WARN: enable report ack=0x%02x\n", resp);

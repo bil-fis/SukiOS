@@ -39,9 +39,6 @@
 #include <sukios/posix.h>
 #include "ff.h"            /* FatFs 类型与 API */
 
-/* 本地 OOL 描述符（布局与内核 port.h 的 mach_ool_desc_t 一致，避免重定义冲突） */
-typedef struct { uint64_t address; uint64_t size; } ool_desc_t;
-
 /* 应答/整文件缓冲（所有输出写入此处，杜绝外部指针写） */
 #define RESP_DATA_MAX    FS_DATA_MAX            /* 内联应答数据上限 (3500) */
 #define FILEBUF_SIZE     (16u * 4096u)          /* 16 KiB×16 = 256 KiB：整文件读上限（与内核 OOL 16 页一致） */

@@ -45,6 +45,14 @@ typedef struct mach_msg_header {
     uint32_t msgh_reserved;
 } mach_msg_header_t;
 
+/* OOL 描述符（布局与内核 port.h 的 mach_ool_desc_t 一致）：当 msgh_bits 含
+ * MACH_MSGH_BITS_OOL 时，紧跟消息头的是此描述符，address 为接收方用户 VA，
+ * size 为 OOL 数据字节数。消费完数据后须调 mach_msg_destroy 释放窗口。 */
+typedef struct ool_desc {
+    uint64_t address;
+    uint64_t size;
+} ool_desc_t;
+
 /* ---- syscall 原语 ----
  * 注意 clobber 列表须覆盖编译器可能借用的所有调用者保存寄存器：syscall 指令
  * 本身改 rcx/r11/rax/flags；若省略 r9/rbx，编译器可能把循环不变量（如恒定的
@@ -263,6 +271,13 @@ static inline uint64_t mach_msg_recv(void *buf, uint32_t limit, uint32_t port)
 {
     return suki_syscall5(SYS_MACH_MSG, (uint64_t)buf, MACH_RECV_MSG,
                          0, limit, port);
+}
+
+/* 释放经 mach_msg_recv 收到的 OOL 接收窗口（消费完 OOL 数据后必须调用，否则
+ * OOL 映射窗口单调增长直至耗尽，后续所有 OOL 接收失败）。va 为 ool_desc_t.address。 */
+static inline uint64_t mach_msg_destroy(uint64_t ool_va)
+{
+    return suki_syscall1(SYS_OOL_UNMAP, ool_va);
 }
 
 /* ---- 最小工具函数（user/lib/suki.c） ---- */

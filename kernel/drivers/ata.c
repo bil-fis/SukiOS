@@ -734,12 +734,215 @@ static bool blk_write(uint64_t lba, uint8_t count, const void *buf)
     return ata_write_sectors(lba, count, buf);
 }
 
+/* ---- DISK 块缓存（内核态，消除大文件/元数据重复落盘） ----
+ *
+ * 为什么需要：FatFs 读一个大文件时要反复读 FAT 表、目录项、以及文件数据本身；
+ * 原设计每次 disk_read 都发 IPC 落盘，重复读同一扇区（如 FAT 表）被多次搬运。
+ * 本缓存在 disk-srv 进程内拦截所有读请求，命中则直接复用已读物理页（免 IPC 落盘
+ * 与 PIO 等待），大幅提升大文件与随机小读性能。
+ *
+ * 设计（单核单线程 disk-srv，访问无需加锁）：
+ *   - 缓存块单位 = 1 个物理页（4KiB = 8 扇区），键 = lba / 8（8 扇区对齐）。
+ *   - 哈希表（直接取模）+ LRU 双向链表；容量 CACHE_ENTS，超限回收链表尾。
+ *   - 每个表项持有物理页的 1 个引用计数（缓存持有）；OOL 回传时再 +1 交给传输。
+ *   - 写请求不进缓存（保持简单，写场景非优化重点，且需回写一致性）。
+ */
+#define CACHE_BLOCK_SECTORS 8            /* 每缓存块 8 扇区 = 1 页 */
+#define CACHE_ENTS          256          /* 256 * 4KiB = 1MiB 缓存 */
+#define CACHE_HASH          CACHE_ENTS
+
+typedef struct cache_ent {
+    uint64_t  block_lba;        /* = 请求 lba 向下对齐到 8 扇区 */
+    uint64_t  page_pa;          /* 物理页（缓存持有 1 引用） */
+    bool      valid;
+    struct cache_ent *lru_prev, *lru_next;      /* LRU 双向链表 */
+    struct cache_ent *lru_next_in_bucket;       /* 哈希桶链表（开放寻址辅助） */
+} cache_ent_t;
+
+static cache_ent_t  g_cache_ents[CACHE_ENTS];
+static cache_ent_t *g_cache_hash[CACHE_HASH];
+static cache_ent_t *g_lru_head, *g_lru_tail;
+static uint32_t     g_cache_used = 0;
+
+static void cache_lru_remove(cache_ent_t *e)
+{
+    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+    else g_lru_head = e->lru_next;
+    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+    else g_lru_tail = e->lru_prev;
+    e->lru_prev = e->lru_next = NULL;
+}
+static void cache_lru_push_front(cache_ent_t *e)
+{
+    e->lru_prev = NULL;
+    e->lru_next = g_lru_head;
+    if (g_lru_head) g_lru_head->lru_prev = e;
+    else g_lru_tail = e;
+    g_lru_head = e;
+}
+/* 把表项从哈希桶摘除 */
+static void cache_hash_unlink(cache_ent_t *e)
+{
+    uint32_t h = (uint32_t)(e->block_lba / CACHE_BLOCK_SECTORS) % CACHE_HASH;
+    cache_ent_t **pp = &g_cache_hash[h];
+    while (*pp) {
+        if (*pp == e) { *pp = e->lru_next_in_bucket; break; }
+        pp = &(*pp)->lru_next_in_bucket;
+    }
+}
+/* 把表项链入哈希桶 */
+static void cache_hash_link(cache_ent_t *e)
+{
+    uint32_t h = (uint32_t)(e->block_lba / CACHE_BLOCK_SECTORS) % CACHE_HASH;
+    e->lru_next_in_bucket = g_cache_hash[h];
+    g_cache_hash[h] = e;
+}
+
+/* 查找缓存块；命中返回表项（已置于 LRU 头），否则 NULL */
+static cache_ent_t *cache_lookup(uint64_t block_lba)
+{
+    uint32_t h = (uint32_t)(block_lba / CACHE_BLOCK_SECTORS) % CACHE_HASH;
+    for (cache_ent_t *e = g_cache_hash[h]; e; e = e->lru_next_in_bucket) {
+        if (e->valid && e->block_lba == block_lba) {
+            cache_lru_remove(e);
+            cache_lru_push_front(e);
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* 分配/复用一个缓存表项（可能回收 LRU 尾），写入新块内容，返回表项（已置 LRU 头
+ * 且已在哈希中）。新块内容由调用方负责写入 page_pa 对应内核虚拟地址。 */
+static cache_ent_t *cache_alloc_ent(uint64_t block_lba)
+{
+    cache_ent_t *e;
+    if (g_cache_used < CACHE_ENTS) {
+        e = &g_cache_ents[g_cache_used++];
+        e->valid = false;
+    } else {
+        /* 回收 LRU 尾 */
+        e = g_lru_tail;
+        if (!e) return NULL;
+        cache_lru_remove(e);
+        cache_hash_unlink(e);
+        pmm_decref((void *)e->page_pa);   /* 释放被回收块的引用 */
+    }
+    e->block_lba = block_lba;
+    e->valid = true;
+    cache_hash_link(e);
+    cache_lru_push_front(e);
+    return e;
+}
+
+/* 把一个 8 扇区块读入缓存（miss 时调用），返回其物理页。
+ * 若已存在则直接返回缓存页（引用 +1 交给调用方用于 OOL）。 */
+static uint64_t cache_read_block(uint64_t block_lba)
+{
+    cache_ent_t *e = cache_lookup(block_lba);
+    if (e) {
+        pmm_incref((void *)e->page_pa);   /* OOL 传输会 decref，缓存自身引用保留 */
+        return e->page_pa;
+    }
+    e = cache_alloc_ent(block_lba);
+    if (!e) return 0;
+    void *pa = pmm_alloc_page();
+    if (!pa) return 0;
+    e->page_pa = (uint64_t)pa;
+    pmm_incref((void *)pa);               /* 缓存自身持有 1 引用 */
+    /* 物理读：把该 8 扇区块读入页内 */
+    bool ok = blk_read(block_lba, CACHE_BLOCK_SECTORS,
+                       (void *)PHYS_TO_VIRT(pa));
+    if (!ok) {
+        pmm_decref((void *)pa);
+        e->valid = false;
+        return 0;
+    }
+    pmm_incref((void *)pa);               /* OOL 传输引用（共 2：缓存+传输） */
+    return (uint64_t)pa;
+}
+
+/* 把一个读请求拆成 8 扇区块，逐块经缓存取物理页，填入 out_pages[]（最多
+ * DISK_OOL_MAX_PAGES），返回填充页数。返回 0 表示分配失败。 */
+static uint32_t disk_srv_gather_pages(uint64_t lba, uint32_t count,
+                                      uint64_t *out_pages)
+{
+    uint64_t first = lba / CACHE_BLOCK_SECTORS;
+    uint64_t last  = (lba + count - 1) / CACHE_BLOCK_SECTORS;
+    uint32_t idx = 0;
+    for (uint64_t blk = first; blk <= last; blk++) {
+        if (idx >= DISK_OOL_MAX_PAGES) break;
+        uint64_t pa = cache_read_block(blk * CACHE_BLOCK_SECTORS);
+        if (!pa) return 0;
+        out_pages[idx++] = pa;
+    }
+    return idx;
+}
+
+/* 使一段 LBA 范围对应的缓存块失效（写回后调用，保证缓存一致性）。 */
+/* 写穿越（write-through）：disk-srv 处理写请求成功后调用，保证块缓存与磁盘一致。
+ * 对每个被写覆盖的 8 扇区块：
+ *   - 若缓存命中该块：把写入数据中属于本块的部分精确 memcpy 进缓存页对应扇区
+ *     偏移（不触碰同块内未被覆盖的扇区，也不影响相邻块），实现缓存与磁盘同步；
+ *   - 若未命中：令该块失效，强制后续读重新落盘。
+ * 采用 write-through 而非简单失效，可避免"写 A 块、读相邻 B 块命中旧缓存"的跨块
+ * 污染（原 cache_invalidate_range 按写请求 lba/count 算出块区间，但读可能命中同
+ * 块内另一扇区或相邻块，导致目录/FAT 元数据读到写前旧值，表现为文件写后读回失败）。 */
+static void cache_write_through(uint64_t lba, uint32_t count, const uint8_t *data)
+{
+    uint64_t first = lba / CACHE_BLOCK_SECTORS;
+    uint64_t last  = (lba + count - 1) / CACHE_BLOCK_SECTORS;
+    for (uint64_t blk = first; blk <= last; blk++) {
+        uint64_t block_lba = blk * CACHE_BLOCK_SECTORS;
+        cache_ent_t *e = cache_lookup(block_lba);   /* 命中则移至 LRU 头 */
+        /* 本块内属于 [lba, lba+count) 的扇区区间 */
+        uint64_t seg_start = (block_lba < lba) ? lba : block_lba;
+        uint64_t seg_end   = (block_lba + CACHE_BLOCK_SECTORS > lba + count)
+                                 ? (lba + count) : (block_lba + CACHE_BLOCK_SECTORS);
+        uint32_t off_sectors = (uint32_t)(seg_start - block_lba);   /* 块内偏移 */
+        uint32_t n_sectors   = (uint32_t)(seg_end - seg_start);
+        if (e && e->valid) {
+            uint8_t *dst = (uint8_t *)PHYS_TO_VIRT(e->page_pa) + off_sectors * 512;
+            const uint8_t *src = data + (seg_start - lba) * 512;
+            for (uint32_t i = 0; i < n_sectors * 512; i++) dst[i] = src[i];
+        } else {
+            /* 未命中：失效该块（摘除并释放引用），下次读强制重读磁盘新值 */
+            uint32_t h = (uint32_t)blk % CACHE_HASH;
+            cache_ent_t **pp = &g_cache_hash[h];
+            while (*pp) {
+                cache_ent_t *x = *pp;
+                if (x->valid && x->block_lba == blk) {
+                    cache_lru_remove(x);
+                    *pp = x->lru_next_in_bucket;
+                    pmm_decref((void *)x->page_pa);
+                    x->valid = false;
+                    break;
+                }
+                pp = &x->lru_next_in_bucket;
+            }
+    }   /* end else */
+    }   /* end for blk */
+}       /* end cache_write_through */
+
 /* ---- DISK_PORT 内核服务任务 ----
  * 消息循环：RECV DISK_PORT -> blk_read/blk_write -> SEND 应答到请求方端口。 */
 static void disk_srv_task(void *arg)
 {
     (void)arg;
     port_set_owner(DISK_PORT, sched_current());
+
+    /* 启动自检：验证块缓存 + OOL 回传闭环（读 LBA0 两次，第二次应命中缓存，
+     * 且两次返回同一物理页）。release 自检分配的 OOL 引用，避免泄漏。 */
+    {
+        uint64_t p1[DISK_OOL_MAX_PAGES], p2[DISK_OOL_MAX_PAGES];
+        uint32_t n1 = disk_srv_gather_pages(0, 8, p1);
+        uint32_t n2 = disk_srv_gather_pages(0, 8, p2);
+        bool hit = (n1 == 1 && n2 == 1 && p1[0] == p2[0]);
+        kprintf("[disk-srv] self-test: read=%u cache_hit=%s page=0x%lx\n",
+                n1, hit ? "yes" : "no", (unsigned long)(n1 ? p1[0] : 0));
+        for (uint32_t i = 0; i < n1; i++) pmm_decref((void *)p1[i]);
+        for (uint32_t i = 0; i < n2; i++) pmm_decref((void *)p2[i]);
+    }
 
     /* 请求缓冲须容纳写请求（头 + write_req + 7*512 数据）；
      * 应答最大 = 头 + status + 7*512 */
@@ -771,39 +974,49 @@ static void disk_srv_task(void *arg)
             disk_read_req_t *r =
                 (disk_read_req_t *)(req + sizeof(mach_msg_header_t));
             uint32_t count = r->count;
+            if (count < 1) count = 1;
             if (count > DISK_MAX_SECTORS) {
                 count = DISK_MAX_SECTORS;
             }
 
             mach_msg_header_t *h = (mach_msg_header_t *)resp;
             disk_read_resp_t *rr = (disk_read_resp_t *)(resp + sizeof(*h));
-            uint8_t *data = resp + sizeof(*h) + sizeof(*rr);
-            dbg_printf("[disk-srv] dbg: READ branch lba=%lu count=%u -> calling blk_read\n",
-                    (unsigned long)r->lba, (unsigned)count);
 
-            bool ok = blk_read(r->lba, (uint8_t)count, data);
+            /* 经块缓存逐 8 扇区块取物理页，填入 OOL 页数组。
+             * OOL 回传以"整页(8 扇区)"对齐，接收方按请求在首块内的偏移截取。 */
+            uint64_t ool_pages[DISK_OOL_MAX_PAGES];
+            uint32_t npages = disk_srv_gather_pages(r->lba, count, ool_pages);
+            bool ok = (npages > 0);
+
             rr->status = ok ? 0 : 1;
 
-            uint32_t total = sizeof(*h) + sizeof(*rr)
-                           + (ok ? count * ATA_SECTOR_SIZE : 0);
+            uint32_t total = sizeof(*h) + sizeof(*rr);
             h->msgh_bits = 0;
             h->msgh_size = total;
             h->msgh_remote_port = reply;
             h->msgh_local_port = DISK_PORT;
             h->msgh_id = DISK_MSG_READ;
             h->msgh_reserved = 0;
-            dbg_printf("[disk-srv] dbg: sending reply id=DISK_MSG_READ ok=%u to port=%u\n",
-                    (unsigned)ok, (unsigned)reply);
-            ipc_send_kernel(reply, resp, total);
-            dbg_printf("[disk-srv] dbg: reply sent to port=%u\n", (unsigned)reply);
+
+            dbg_printf("[disk-srv] dbg: READ lba=%lu count=%u -> npages=%u ool\n",
+                    (unsigned long)r->lba, (unsigned)count, (unsigned)npages);
+            if (ok) {
+                uint64_t ool_size = (uint64_t)npages * PAGE_SIZE;
+                /* OOL 回传：inline 仅含状态头，数据走物理页（接收方负责 decref） */
+                ipc_send_ool_kernel(reply, resp, total,
+                                    ool_pages, npages, ool_size);
+            } else {
+                ipc_send_kernel(reply, resp, total);
+            }
+            dbg_printf("[disk-srv] dbg: reply(ool) sent to port=%u\n", (unsigned)reply);
         } else if (rh->msgh_id == DISK_MSG_WRITE &&
                    n >= sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)) {
             disk_write_req_t *w =
                 (disk_write_req_t *)(req + sizeof(mach_msg_header_t));
             uint32_t count = w->count;
             bool ok = false;
-            /* 数据长度必须与 count 一致，防止越界读取请求缓冲 */
-            if (count >= 1 && count <= DISK_MAX_SECTORS &&
+            /* 数据长度必须与 count 一致，防止越界读取请求缓冲；写上限保持 7 扇区（内联安全） */
+            if (count >= 1 && count <= DISK_MAX_WRITE_SECTORS &&
                 n >= sizeof(mach_msg_header_t) + sizeof(disk_write_req_t)
                      + count * ATA_SECTOR_SIZE) {
                 const uint8_t *data = req + sizeof(mach_msg_header_t)
@@ -811,7 +1024,11 @@ static void disk_srv_task(void *arg)
                 dbg_printf("[disk-srv] dbg: write lba=%u count=%u\n",
                         (unsigned)w->lba, (unsigned)count);
                 ok = blk_write(w->lba, (uint8_t)count, data);
-                dbg_printf("[disk-srv] dbg: write done ok=%u\n", (unsigned)ok);
+                dbg_printf("[disk-srv] dbg: write lba=%u count=%u ok=%u\n",
+                        (unsigned)w->lba, (unsigned)count, (unsigned)ok);
+                /* 写穿越：把写入同步进块缓存（命中则更新对应扇区，未命中则失效），
+                 * 保证缓存与磁盘一致，避免写后读回得到陈旧数据。 */
+                if (ok) cache_write_through(w->lba, count, data);
             }
 
             mach_msg_header_t *h = (mach_msg_header_t *)resp;

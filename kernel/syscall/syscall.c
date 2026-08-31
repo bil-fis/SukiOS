@@ -953,6 +953,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_DISPLAY_READY:   display_set_active(); return 0;
     case SYS_CONSOLE_READ:    return sys_console_read(a1, a2);
     case SYS_DISPLAY_BLIT:    return sys_display_blit(a1, a2, a3, a4, a5);
+    case SYS_OOL_UNMAP:       return ipc_ool_unmap_user(a1);
     default: {
         /* 其余全部交给 POSIX 层（进程/文件/内存/时间/系统/网络号区） */
         int64_t r = 0;

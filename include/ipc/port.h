@@ -132,6 +132,20 @@ uint64_t  ipc_recv_ool_kernel(uint32_t port_name, void *inline_buf,
                               uint32_t inline_cap, uint32_t *inline_out,
                               void *ool_buf, uint32_t ool_cap,
                               uint32_t *ool_out, bool block);
+
+/* 内核侧发送 OOL 消息（供内核服务线程，如 disk-srv，回传大块磁盘数据）。
+ * 与用户态 ool_capture 不同：发送方是内核任务，数据位于内核直接映射区/已分配的
+ * 物理页，调用方直接提供物理页号数组（ool_pages[]），本函数仅做引用计数 +1 并
+ * 挂到 kernel_msg_t，零拷贝；接收方（fs-server 等内核态客户端）用
+ * ipc_recv_ool_kernel 消费，结束 pmm_decref 递减引用。inline 部分（含头/状态）
+ * 仍走现有 inline 拷贝路径。 */
+uint64_t  ipc_send_ool_kernel(uint32_t dest, const void *inline_msg,
+                              uint32_t inline_size, const uint64_t *ool_pages,
+                              uint32_t ool_page_count, uint64_t ool_size);
+
+/* 用户态释放单个 OOL 接收窗口（SYS_OOL_UNMAP）：消费完 OOL 数据后调用，回收
+ * 映射 VA 区间并递减 OOL 物理页引用计数，使窗口可被后续 OOL 接收复用。 */
+uint64_t  ipc_ool_unmap_user(uint64_t va);
 /* 释放一个动态分配的端口（execve 临时申请的应答端口用完即释放） */
 void      port_free(uint32_t name);
 

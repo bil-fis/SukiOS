@@ -420,6 +420,57 @@ uint64_t ipc_send_kernel(uint32_t dest, const void *msg, uint32_t size)
     return deliver(dest, m);
 }
 
+/* 内核态 OOL 发送：发送方（如 disk-srv）已持有数据的物理页号数组，本函数仅
+ * 把物理页号挂到 kernel_msg_t 并引用计数 +1（零拷贝），inline 部分照常拷贝。
+ * 接收方用 ipc_recv_ool_kernel 消费（按其 ool_cap 把内容 memcpy 到内核缓冲，
+ * 并 pmm_decref 回收引用）。此函数与用户态 ool_capture 方向相反：后者从发送方
+ * 用户 VA 翻译出 PA，这里调用方直接给 PA，免去 cr3 翻译（disk-srv 是内核任务、
+ * 数据可能在内核直接映射区，无需用户页表）。 */
+uint64_t ipc_send_ool_kernel(uint32_t dest, const void *inline_msg,
+                             uint32_t inline_size, const uint64_t *ool_pages,
+                             uint32_t ool_page_count, uint64_t ool_size)
+{
+    if (inline_size < sizeof(mach_msg_header_t) ||
+        inline_size > MACH_MSG_INLINE_MAX + sizeof(mach_msg_header_t)) {
+        return MACH_SEND_TOO_LARGE;
+    }
+    if (ool_page_count == 0 || ool_page_count > MACH_MSG_OOL_MAX_PAGES ||
+        ool_size == 0 || ool_size > (uint64_t)ool_page_count * PAGE_SIZE) {
+        return MACH_SEND_TOO_LARGE;
+    }
+    kernel_msg_t *m = (kernel_msg_t *)kmalloc(sizeof(kernel_msg_t)
+                                              + sizeof(mach_ool_desc_t)
+                                              + inline_size);
+    if (!m) {
+        return MACH_SEND_NO_BUFFER;
+    }
+    memset(m, 0, sizeof(kernel_msg_t));
+    /* 重新布局 inline 为 [header][ool_desc 占位 16B][原 inline 数据(除 header)]，
+     * 与接收方 sys_mach_msg -> ool_map_into_receiver 的解析对称：后者把 ool_desc
+     * 置于 header 后、把 m->data[sizeof(header)..] 整段（ool_desc + 余下 inline）
+     * 拷到用户缓冲的 [header+ool_desc] 处。故发送方必须把原 inline(除 header) 后移
+     * 16 字节，腾出 ool_desc 占位，否则接收方会把 disk_read_resp_t 误当 ool_desc。 */
+    memcpy(m->data, inline_msg, sizeof(mach_msg_header_t));
+    memcpy(m->data + sizeof(mach_msg_header_t) + sizeof(mach_ool_desc_t),
+           (const uint8_t *)inline_msg + sizeof(mach_msg_header_t),
+           inline_size - sizeof(mach_msg_header_t));
+    m->size = sizeof(mach_msg_header_t) + sizeof(mach_ool_desc_t)
+              + (inline_size - sizeof(mach_msg_header_t));
+    for (uint32_t i = 0; i < ool_page_count; i++) {
+        /* 防御性校验：物理页号非零（避免把空帧当合法页引用） */
+        if (!ool_pages[i]) {
+            kfree(m);
+            return MACH_INVALID_ARGUMENT;
+        }
+        pmm_incref((void *)ool_pages[i]);
+        m->ool_pages[i] = ool_pages[i];
+    }
+    m->ool_page_count = ool_page_count;
+    m->ool_size = ool_size;
+    m->has_ool = true;
+    return deliver(dest, m);
+}
+
 uint64_t ipc_recv_kernel(uint32_t port_name, void *buf, uint32_t buf_size,
                          uint32_t *out_size, bool block)
 {
@@ -797,4 +848,41 @@ uint64_t sys_mach_msg(uint64_t msg_uptr, uint64_t option,
         kfree(m);
     }
     return MACH_MSG_SUCCESS;
+}
+
+/* 用户态释放单个 OOL 接收窗口（SYS_OOL_UNMAP）。用法：mach_msg_recv 收到含 OOL
+ * 的消息、消费完数据后调用，以便该窗口被回收复用（否则 OOL 窗口单调增长直至耗尽
+ * OOL_RECV_LIMIT，后续所有 OOL 接收都失败）。
+ *
+ * 物理页引用：接收时 ool_map_into_receiver 已把 OOL 页映射进用户空间，但引用计数
+ * 的回收归属在接收方——用户态消费完数据后由本函数统一 pmm_decref（与
+ * vmm_destroy_address_space 仅在任务退出时兜底对称；正常路径必须显式释放，否则
+ * 引用计数泄漏）。映射 VA 区间归还 g_ool_free 空闲链表供后续复用。 */
+uint64_t ipc_ool_unmap_user(uint64_t va)
+{
+    task_t *t = sched_current();
+    ool_map_node_t **pp = (ool_map_node_t **)&t->ool_maps;
+    while (*pp) {
+        ool_map_node_t *n = *pp;
+        if (n->va == va) {
+            uint64_t cr3 = t->cr3;
+            for (uint32_t i = 0; i < n->count; i++) {
+                vmm_unmap_page(cr3, va + (uint64_t)i * PAGE_SIZE);
+                pmm_decref((void *)n->pages[i]);   /* 释放接收方持有的引用 */
+            }
+            /* 区间归还空闲链表 */
+            ool_free_t *fr = kmalloc(sizeof(ool_free_t));
+            if (fr) {
+                fr->base = va;
+                fr->size = (uint64_t)(n->count + 1) * PAGE_SIZE;
+                fr->next = g_ool_free;
+                g_ool_free = fr;
+            }
+            *pp = n->next;
+            kfree(n);
+            return 0;
+        }
+        pp = &n->next;
+    }
+    return (uint64_t)-1;   /* 未找到该窗口（可能已释放或非法 VA） */
 }

@@ -20,7 +20,10 @@
 /* 物理驱动器编号：SukiOS 仅一块固定磁盘，映射为 pdrv 0。 */
 #define DEV_DISK   0
 
-/* ---- 私有：经 DISK_PORT 读最多 DISK_MAX_SECTORS 扇区 ---- */
+/* ---- 私有：经 DISK_PORT 读最多 DISK_MAX_SECTORS 扇区 ----
+ * 应答走 OOL 物理页（最多 64 扇区/32KiB），突破原内联 7 扇区上限，大幅减少大文件
+ * 读取 IPC 往返。OOL 数据以「8 扇区(4KiB) 整页」对齐回传；本函数在首块内按
+ * lba%8 偏移截取所需 count*512 字节。每批收完须 mach_msg_destroy 释放 OOL 窗口。 */
 static int suki_disk_read_sectors(uint32_t lba, uint32_t count, void *out)
 {
     if (count == 0 || count > DISK_MAX_SECTORS) return -1;
@@ -36,24 +39,40 @@ static int suki_disk_read_sectors(uint32_t lba, uint32_t count, void *out)
 
     if (mach_msg_send(req, h->msgh_size) != MACH_MSG_SUCCESS) return -1;
 
-    static uint8_t s_resp[sizeof(mach_msg_header_t) + sizeof(disk_read_resp_t) +
-                          DISK_MAX_SECTORS * 512];
+    /* 仅接收内联头 + OOL 描述符（数据在 OOL 窗口，不在内联缓冲）。
+     * 注意：OOL 消息的 inline 部分 = 消息头 + mach_ool_desc_t(16B)，故接收缓冲
+     * 必须容纳 header + ool_desc_t，否则 sys_mach_msg 会因 recv_limit 不足返回
+     * MACH_RCV_TOO_LARGE，导致 f_mount 等早期读取整体失败。 */
+    static uint8_t s_resp[sizeof(mach_msg_header_t) + sizeof(ool_desc_t) + 16];
     if (mach_msg_recv(s_resp, (uint32_t)sizeof(s_resp), FS_REPLY_PORT) != MACH_MSG_SUCCESS)
         return -1;
-    mach_msg_header_t *rh = (mach_msg_header_t *)s_resp;
-    uint32_t need = (uint32_t)(sizeof(mach_msg_header_t) +
-                               sizeof(disk_read_resp_t) + count * 512);
-    if (rh->msgh_size < need || rh->msgh_size > (uint32_t)sizeof(s_resp)) return -1;
-    disk_read_resp_t *pr = (disk_read_resp_t *)(s_resp + sizeof(mach_msg_header_t));
+    /* OOL 消息 inline 布局：[header][ool_desc_t][disk_read_resp_t]。
+     * status 紧跟 ool_desc 之后，不能从 header 后直接读（那是 ool_desc）。 */
+    disk_read_resp_t *pr =
+        (disk_read_resp_t *)(s_resp + sizeof(mach_msg_header_t) + sizeof(ool_desc_t));
     if (pr->status != 0) return -1;
-    u_memcpy(out, (uint8_t *)(pr + 1), count * 512);
+
+    /* OOL 描述符紧跟消息头（与内核 port.h 的 mach_ool_desc_t 布局一致） */
+    ool_desc_t *d = (ool_desc_t *)(s_resp + sizeof(mach_msg_header_t));
+    if (d->address == 0 || d->size == 0) return -1;
+
+    /* 首块内偏移：请求 lba 可能落在 8 扇区块的非边界处，OOL 数据是整页对齐的
+     * 8 扇区块序列，需跳过前导的 (lba%8)*512 字节，再取 count*512 字节。 */
+    uint32_t skip = (lba % 8) * 512;
+    uint64_t need = (uint64_t)skip + (uint64_t)count * 512;
+    if (d->size < need) { mach_msg_destroy(d->address); return -1; }
+
+    u_memcpy(out, (const uint8_t *)(uintptr_t)(d->address + skip), count * 512);
+
+    /* 释放 OOL 接收窗口（必须，否则窗口泄漏耗尽） */
+    mach_msg_destroy(d->address);
     return 0;
 }
 
-/* ---- 私有：经 DISK_PORT 写最多 DISK_MAX_SECTORS 扇区 ---- */
+/* ---- 私有：经 DISK_PORT 写最多 DISK_MAX_WRITE_SECTORS 扇区（内联，≤3968B） ---- */
 static int suki_disk_write_sectors(uint32_t lba, uint32_t count, const void *in)
 {
-    if (count == 0 || count > DISK_MAX_SECTORS) return -1;
+    if (count == 0 || count > DISK_MAX_WRITE_SECTORS) return -1;
     uint8_t req[sizeof(mach_msg_header_t) + sizeof(disk_write_req_t) +
                 DISK_MAX_SECTORS * 512];
     mach_msg_header_t *h = (mach_msg_header_t *)req;

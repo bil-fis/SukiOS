@@ -573,7 +573,7 @@ typedef struct suki_fd_set {
 #define SYS_SETPRIORITY     122
 #define SYS_SCHED_GETPID    123
 #define SYS_MPROTECT_KEY    124
-
+#define SYS_OOL_UNMAP       125   /* 释放 mach_msg OOL 接收窗口（va） */
 /* ---- G. 网络（130..149）：号位预留 ---- */
 #define SYS_SOCKET          130
 #define SYS_BIND            131

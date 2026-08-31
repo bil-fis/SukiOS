@@ -146,3 +146,19 @@ make run   # 或 qemu-system-x86_64 ... -vga std -display gtk  不带 -display n
   - 回退显示服务于 74a4d25 视觉基线（单层快照法 + 12x18 箭头光标）；
   - 鼠标事件 msgh_id 对齐 101/102/103 + 坐标 clamp；
   - 清除 keyboard.c / mouse.c 的 `[kbd-diag]` / `[mouse-diag]` 调试残留打印。
+
+## 八、补充修复：鼠标 Y 轴反向（用户实测"上移光标下移"）
+- 现象：移动鼠标向上，光标反而向下移动；X 轴正常。
+- 根因：`user/mouse_server.c` 第 146-147 行 `g_cy = clamp_i32(g_cy + pkt.dy, ...)`。
+  本硬件/模拟器（QEMU 标准鼠标）上报的 `dy` 符号与 OSDev 标准 PS/2 描述**相反**
+  （实测上移 dy 为正、下移 dy 为负），导致累加后"上移→屏幕 Y 增大→光标下移"。
+- 修复：Y 轴累加对 dy 取反：
+  ```c
+  g_cx = clamp_i32(g_cx + pkt.dx, SCREEN_W_DEFAULT);
+  g_cy = clamp_i32(g_cy - pkt.dy, SCREEN_H_DEFAULT);
+  ```
+  使"上移 → g_cy 减小 → 帧缓冲行号减小 → 光标上移"，符合直觉。
+- 验证：`make iso` 通过；QEMU headless 回归零 panic、display active、鼠标首事件
+  `dx=12 dy=-7 buttons=1` 正常上报（Y 翻转不影响 X/按钮逻辑，display_server 端
+  clamp 到 1280x720 仍正确）。
+- 注：X 轴保持 `g_cx += pkt.dx`（右移为正），用户未反馈 X 异常，故未改动。

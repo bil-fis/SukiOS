@@ -141,10 +141,12 @@ int main(void)
             u_print("\n");
         }
 
-        /* 累计位移 -> 绝对坐标（屏幕 Y 轴通常向下为正，dy 已按 PS/2 语义，
-         * OSDev 规定 dy 向下为正；此处直接累加作为"屏幕坐标向下"） */
+        /* 累计位移 -> 绝对坐标。
+         * X：dx 右移为正，直接累加（向右光标 X 增大）。
+         * Y：本硬件/模拟器上报的 dy 符号与标准 PS/2 描述相反（实测"上移光标
+         * 反而下移"），故此处对 dy 取反，使"上移 -> 屏幕 Y 减小 -> 光标上移"。 */
         g_cx = clamp_i32(g_cx + pkt.dx, SCREEN_W_DEFAULT);
-        g_cy = clamp_i32(g_cy + pkt.dy, SCREEN_H_DEFAULT);
+        g_cy = clamp_i32(g_cy - pkt.dy, SCREEN_H_DEFAULT);
 
         uint8_t prev = g_buttons;
         g_buttons = pkt.buttons & 0x07;

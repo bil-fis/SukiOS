@@ -177,3 +177,242 @@ void abort(void)
     suki_syscall1(SYS_EXIT_GROUP, 134);
     for (;;) { }
 }
+
+/* ===========================================================================
+ * 环境变量（进程内维护）
+ *   environ 指向一个 NULL 结尾的 char* 数组，每项形如 "NAME=VALUE"。
+ *   初始 environ 由 crt0 通过 SYS_GETARGS 的 envp 设置；此处提供 CRUD 接口。
+ *   注：内核当前没有 getenv/setenv syscall，环境变量完全在用户态维护，
+ *   子进程（spawn）需要 env 时由调用方把 environ 显式传入。
+ * =========================================================================== */
+char **environ = NULL;
+
+/* 惰性初始化 environ 为空数组（首次 setenv/putenv 时调用）。
+ * 必须保证 environ 非空再进入涉及 environ[k] 遍历的逻辑，否则 NULL 解引用。 */
+static void environ_init(void)
+{
+    if (environ) return;
+    environ = (char **)malloc(sizeof(char *) * 2);
+    if (environ) { environ[0] = NULL; environ[1] = NULL; }
+}
+
+static int env_find(const char *name, size_t *idx)
+{
+    if (!environ || !name) return 0;
+    size_t nlen = strchr(name, '=') ? (size_t)(strchr(name, '=') - name)
+                                    : strlen(name);
+    for (size_t i = 0; environ[i]; i++) {
+        const char *e = environ[i];
+        size_t elen = strchr(e, '=') ? (size_t)(strchr(e, '=') - e) : strlen(e);
+        if (elen == nlen && strncmp(e, name, nlen) == 0) {
+            if (idx) *idx = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+char *getenv(const char *name)
+{
+    size_t i;
+    if (!name || !env_find(name, &i)) return NULL;
+    const char *e = strchr(environ[i], '=');
+    return e ? (char *)(e + 1) : (char *)"";
+}
+
+int setenv(const char *name, const char *value, int overwrite)
+{
+    if (!name || !*name || strchr(name, '=')) { errno = EINVAL; return -1; }
+    environ_init();
+    if (!environ) { errno = ENOMEM; return -1; }
+    size_t i;
+    if (env_find(name, &i)) {
+        if (!overwrite) return 0;
+        /* 覆盖已有项 */
+        size_t need = strlen(name) + 1 + (value ? strlen(value) : 0) + 1;
+        char *buf = (char *)malloc(need);
+        if (!buf) { errno = ENOMEM; return -1; }
+        snprintf(buf, need, "%s=%s", name, value ? value : "");
+        free(environ[i]);
+        environ[i] = buf;
+        return 0;
+    }
+    /* 追加新项：重新分配 environ 数组（+2：新项 + NULL 哨兵，并保留已分配余量） */
+    size_t count = 0;
+    while (environ[count]) count++;
+    char **ne = (char **)malloc(sizeof(char *) * (count + 2));
+    if (!ne) { errno = ENOMEM; return -1; }
+    for (size_t k = 0; k < count; k++) ne[k] = environ[k];
+    size_t need = strlen(name) + 1 + (value ? strlen(value) : 0) + 1;
+    ne[count] = (char *)malloc(need);
+    if (!ne[count]) { free(ne); errno = ENOMEM; return -1; }
+    snprintf(ne[count], need, "%s=%s", name, value ? value : "");
+    ne[count + 1] = NULL;
+    free(environ);
+    environ = ne;
+    return 0;
+}
+
+int unsetenv(const char *name)
+{
+    if (!name || !*name || strchr(name, '=')) { errno = EINVAL; return -1; }
+    size_t i;
+    if (!env_find(name, &i)) return 0;  /* 不存在不算错误 */
+    free(environ[i]);
+    size_t count = 0;
+    while (environ[count]) count++;
+    for (size_t k = i; k < count; k++) environ[k] = environ[k + 1];
+    environ[count - 1] = NULL;
+    return 0;
+}
+
+int putenv(char *string)
+{
+    if (!string || !strchr(string, '=')) { errno = EINVAL; return -1; }
+    environ_init();
+    if (!environ) { errno = ENOMEM; return -1; }
+    size_t i;
+    if (env_find(string, &i)) {
+        environ[i] = string;   /* 直接接管调用方字符串 */
+        return 0;
+    }
+    size_t count = 0;
+    while (environ[count]) count++;
+    char **ne = (char **)malloc(sizeof(char *) * (count + 2));
+    if (!ne) { errno = ENOMEM; return -1; }
+    for (size_t k = 0; k < count; k++) ne[k] = environ[k];
+    ne[count] = string;
+    ne[count + 1] = NULL;
+    free(environ);
+    environ = ne;
+    return 0;
+}
+
+/* ===========================================================================
+ * getopt / getopt_long  —— 命令行选项解析（bash/util-linux 语义子集）
+ *   支持：短选项 -a -abc -aARG -a ARG；长选项 --long / --long=ARG；
+ *   未知选项 opterr=1 时打印 "?unknown" 并返回 '?'；opterr=0 时静默返回 '?'；
+ *   缺少必填参数返回 ':'（optstring 以 ':' 开头时）或 '?'；
+ *   解析结束（遇到非选项参数或 "--"）返回 -1 且 optind 指向首个非选项参数。
+ * =========================================================================== */
+char *optarg = NULL;
+int   optind = 1;
+int   opterr = 1;
+int   optopt = 0;
+
+static const struct option *g_longopts = NULL;
+static int  g_optpos = 0;   /* 当前 argv[optind] 内已解析到的字符偏移（支持 -abc 捆绑） */
+
+static void getopt_err(const char *argv0, char ch, const char *msg)
+{
+    if (opterr) {
+        char buf[128];
+        size_t n = 0;
+        const char *p = argv0 ? argv0 : "getopt";
+        while (*p && n + 1 < sizeof(buf)) buf[n++] = *p++;
+        const char *q = msg;
+        while (*q && n + 1 < sizeof(buf)) buf[n++] = *q++;
+        if (ch) {
+            if (n + 4 < sizeof(buf)) {
+                buf[n++] = ':'; buf[n++] = ' '; buf[n++] = '-'; buf[n++] = ch;
+            }
+        }
+        if (n + 1 < sizeof(buf)) buf[n++] = '\n';
+        buf[n] = '\0';
+        u_print(buf);
+    }
+}
+
+int getopt(int argc, char *const argv[], const char *optstring)
+{
+    g_longopts = NULL;
+    if (optind >= argc) return -1;
+    const char *arg = argv[optind];
+    if (!arg || arg[0] != '-' || arg[1] == '\0')
+        return -1;                       /* 非选项参数 */
+    if (arg[1] == '-' && arg[2] == '\0') {
+        optind++; g_optpos = 0;          /* "--" 结束符 */
+        return -1;
+    }
+    if (arg[1] == '-') {
+        /* 长选项（getopt 裸调用不处理长选项） */
+        if (opterr) u_print("getopt: unexpected long option\n");
+        optopt = 0;
+        optind++; g_optpos = 0;
+        return '?';
+    }
+    /* 处理 -abc 捆绑：g_optpos 指向下一个待解析字符 */
+    if (g_optpos == 0) g_optpos = 1;
+    char c = arg[g_optpos];
+    if (c == '\0') { optind++; g_optpos = 0; return -1; }
+    const char *p = strchr(optstring, c);
+    if (!p) {
+        optopt = c;
+        getopt_err(argc > 0 ? argv[0] : "getopt", c, "invalid option");
+        g_optpos++;
+        if (arg[g_optpos] == '\0') { optind++; g_optpos = 0; }
+        return '?';
+    }
+    if (p[1] == ':') {                    /* 需要参数 */
+        if (arg[g_optpos + 1]) {
+            optarg = (char *)(arg + g_optpos + 1);   /* -aARG 紧贴 */
+            optind++; g_optpos = 0;
+        } else if (optind + 1 < argc) {
+            optind += 2; g_optpos = 0;      /* 跨过选项及其参数两个元素 */
+            optarg = argv[optind - 1];
+        } else {
+            optopt = c;
+            getopt_err(argc > 0 ? argv[0] : "getopt", c, "option requires an argument");
+            optind++; g_optpos = 0;
+            return (optstring[0] == ':') ? ':' : '?';
+        }
+        return c;
+    }
+    /* 无参数选项，可能粘多个：-abc */
+    g_optpos++;
+    if (arg[g_optpos] == '\0') { optind++; g_optpos = 0; }
+    return c;
+}
+
+int getopt_long(int argc, char *const argv[], const char *optstring,
+                const struct option *longopts, int *longindex)
+{
+    g_longopts = longopts;
+    if (optind >= argc) return -1;
+    const char *arg = argv[optind];
+    if (!arg || arg[0] != '-' || arg[1] == '\0') return -1;
+    if (arg[1] == '-' && arg[2] == '\0') { optind++; return -1; }  /* "--" */
+
+    if (arg[1] == '-') {
+        /* 长选项：--name 或 --name=VAL */
+        const char *name = arg + 2;
+        const char *eq = strchr(name, '=');
+        size_t nlen = eq ? (size_t)(eq - name) : strlen(name);
+        for (int i = 0; longopts && longopts[i].name; i++) {
+            if (strncmp(longopts[i].name, name, nlen) == 0 &&
+                strlen(longopts[i].name) == nlen) {
+                if (longindex) *longindex = i;
+                if (longopts[i].has_arg == required_argument) {
+                    if (eq) optarg = (char *)(eq + 1);
+                    else if (optind + 1 < argc) { optind++; optarg = argv[optind]; }
+                    else {
+                        if (opterr) { char b[160]; size_t n=0; const char*m="getopt_long: option '--"; while(*m&&n+1<sizeof(b))b[n++]=*m++; const char*nm=name; while(*nm&&n+1<sizeof(b))b[n++]=*nm++; const char*m2="' requires an argument\n"; while(*m2&&n+1<sizeof(b))b[n++]=*m2++; b[n]='\0'; u_print(b); }
+                        optind++; optopt = longopts[i].val; return '?';
+                    }
+                } else if (eq && longopts[i].has_arg == no_argument) {
+                    if (opterr) { char b[160]; size_t n=0; const char*m="getopt_long: option '--"; while(*m&&n+1<sizeof(b))b[n++]=*m++; const char*nm=name; while(*nm&&n+1<sizeof(b))b[n++]=*nm++; const char*m2="' doesn't allow an argument\n"; while(*m2&&n+1<sizeof(b))b[n++]=*m2++; b[n]='\0'; u_print(b); }
+                    optind++; optopt = longopts[i].val; return '?';
+                } else {
+                    optarg = NULL;
+                }
+                optind++;
+                if (longopts[i].flag) { *longopts[i].flag = longopts[i].val; return 0; }
+                return longopts[i].val;
+            }
+        }
+        if (opterr) { char b[140]; size_t n=0; const char*m="getopt_long: unrecognized option '--"; while(*m&&n+1<sizeof(b))b[n++]=*m++; const char*nm=name; while(*nm&&n+1<sizeof(b))b[n++]=*nm++; const char*m2="'\n"; while(*m2&&n+1<sizeof(b))b[n++]=*m2++; b[n]='\0'; u_print(b); }
+        optind++; optopt = 0; return '?';
+    }
+    /* 退化为短选项解析（复用 getopt 主体） */
+    return getopt(argc, argv, optstring);
+}

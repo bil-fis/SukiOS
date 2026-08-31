@@ -1,0 +1,274 @@
+# =============================================================================
+# SukiOS 交叉编译器构建脚本 (cross/Makefile.gcc)
+# -----------------------------------------------------------------------------
+# 目标：从源码构建 x86_64-sukios-elf 专属交叉工具链（Binutils + GCC），供 SukiOS 使用。
+#   * 调用方式：  make -f cross/Makefile.gcc            # 构建全部
+#                 make -f cross/Makefile.gcc gcc        # 仅构建 GCC
+#                 make -f cross/Makefile.gcc binutils   # 仅构建 Binutils
+#                 make -f cross/Makefile.gcc clean      # 清理源码/构建目录
+#   顶层 Makefile 也提供 `make gcc` 转发到本文件。
+#
+# 源码获取：
+#   * 所有源码 URL 在 Makefile 中【保持原始 github.com 地址】（见 GCC_URL /
+#     BINUTILS_URL），不硬编码代理。
+#   * 下载时通过 GITHUB_PROXY 前缀走镜像加速：
+#         https://gh.dl.ifiss.eu.org/https://github.com/...
+#     若代理不可用则自动回退到原始 github 直连。
+#   * 仓库镜像选用官方 GitHub 镜像（gcc-mirror / bminor），保证 tarball 与
+#     上游一致且可被代理正确缓存。
+#
+# 产物：
+#   * 安装前缀 PREFIX = $(CROSS_ROOT)/opt
+#   * 工具名形如 x86_64-sukios-elf-gcc / x86_64-sukios-elf-ld / x86_64-sukios-elf-as ...
+#   * 可用后加入 PATH： export PATH="$(CROSS_ROOT)/opt/bin:$PATH"
+#
+# 说明：SukiOS 自带 freestanding libc（user/lib），因此 GCC 以 --without-headers
+#   构建，仅产出自由环境交叉编译器（不编译目标端 glibc/newlib）。
+# =============================================================================
+
+# ---- 目标三元组 / 安装前缀 ----
+# SukiOS 专属工具链三元组：x86_64-sukios-elf
+#   * config.sub 识别为 x86_64-sukios-elf（"sukios" 作为 vendor/OS 标识，
+#     "elf" 作为 OS 类别，均被 binutils/gcc 接受），可与其它 x86_64-elf 工具链
+#     明确区分开，避免与系统已有的 x86_64-elf-gcc 等混淆。
+#   * 产出的工具名为 x86_64-sukios-elf-gcc / -ld / -as ...，专供 SukiOS 使用。
+#   * 顶层 Makefile 的 CC 探测同步改为 x86_64-sukios-elf-gcc 以对接。
+TARGET   := x86_64-sukios-elf
+CROSS_ROOT := $(CURDIR)
+PREFIX   := $(CROSS_ROOT)/opt
+PATH    := $(PREFIX)/bin:$(PATH)
+
+# ---- 并行编译并行度 ----
+JOBS     := $(shell nproc 2>/dev/null || echo 4)
+
+# ---- 源码版本（可改）----
+GCC_VER      := 14.2.0
+BINUTILS_VER := 2.43
+
+# ---- 国内/海外自动识别与镜像选择 ----
+# 若出口位于中国大陆，则优先使用国内镜像（清华 TUNA）加速下载；否则用
+# 官方 GNU FTP / github 直连。识别方式：快速 HEAD 探测清华镜像，可达即判
+# 定国内。可用 IN_CHINA=1 / IN_CHINA=0 强制覆盖自动探测结果。
+ifeq ($(IN_CHINA),)
+  # 自动探测：清华镜像 5s 内可达（HTTP 2xx）即视为国内
+  AUTO_CN := $(shell curl -fsI --connect-timeout 5 -m 8 https://mirrors.tuna.tsinghua.edu.cn/gnu/binutils/ >/dev/null 2>&1 && echo 1 || echo 0)
+  IN_CHINA := $(AUTO_CN)
+endif
+
+# ---- 镜像源定义 ----
+# 官方源（海外直连，最权威）
+GNU_FTP      := https://ftp.gnu.org/gnu
+GITHUB_RAW   := https://github.com
+# 国内镜像（清华 TUNA，gnu 全量同步，已验证 binutils/gcc 完整）
+TUNA         := https://mirrors.tuna.tsinghua.edu.cn
+
+# 根据网络位置拼出实际使用的源 URL：
+#   binutils: 国内=清华TUNA，海外=GNU FTP（最稳）
+#   gcc:      国内=清华TUNA(/gnu/gcc)，海外=gcc-mirror github 原始归档
+# 原始 github 地址仍保留在脚本（注释/回退），符合"保持原始 URL"约定。
+ifeq ($(IN_CHINA),1)
+  BINUTILS_URL     := $(TUNA)/gnu/binutils/binutils-$(BINUTILS_VER).tar.gz
+  GCC_URL          := $(TUNA)/gnu/gcc/gcc-$(GCC_VER)/gcc-$(GCC_VER).tar.gz
+  # 回退：国内若 TUNA 抖动，回退官方源
+  BINUTILS_FB      := $(GNU_FTP)/binutils/binutils-$(BINUTILS_VER).tar.gz
+  GCC_FB           := $(GITHUB_RAW)/gcc-mirror/gcc/archive/refs/tags/releases/gcc-$(GCC_VER).tar.gz
+  MIRROR_TAG       := "[mirror] 国内网络 -> 清华 TUNA 加速"
+else
+  BINUTILS_URL     := $(GNU_FTP)/binutils/binutils-$(BINUTILS_VER).tar.gz
+  GCC_URL          := $(GITHUB_RAW)/gcc-mirror/gcc/archive/refs/tags/releases/gcc-$(GCC_VER).tar.gz
+  # 回退：海外若直连慢，可走代理镜像（注意代理对 github tag 有截断风险，仅作末位）
+  BINUTILS_FB      := $(GITHUB_RAW)/bminor/binutils-gdb/archive/refs/tags/binutils-$(BINUTILS_VER).tar.gz
+  GCC_FB           := $(GNU_FTP)/gcc/gcc-$(GCC_VER)/gcc-$(GCC_VER).tar.gz
+  MIRROR_TAG       := "[mirror] 海外网络 -> 官方 GNU/github 直连"
+endif
+
+# ---- 代理前缀（仅海外回退 github 类源时可能使用）----
+GITHUB_PROXY := https://gh.dl.ifiss.eu.org/
+
+# ---- 目录布局 ----
+SRC      := $(CROSS_ROOT)/src
+# 注意：交叉工具链的构建目录必须与主 Makefile 的 build/ 分开，避免混用冲突。
+BUILD    := $(CROSS_ROOT)/cross-build
+GCC_SRC      := $(SRC)/gcc-$(GCC_VER)
+BINUTILS_SRC := $(SRC)/binutils-$(BINUTILS_VER)
+GCC_BUILD      := $(BUILD)/gcc
+BINUTILS_BUILD := $(BUILD)/binutils
+
+# ---- 下载工具探测：优先 curl，回退 wget，再回退 none ----
+ifeq ($(shell command -v curl >/dev/null 2>&1 && echo 1),1)
+  FETCH := curl
+else ifeq ($(shell command -v wget >/dev/null 2>&1 && echo 1),1)
+  FETCH := wget
+else
+  FETCH := none
+endif
+
+# 下载函数：$(call fetch,<url>,<out-file>[,<fallback-url>])
+#   依次尝试：① <url>；② 可选 <fallback-url>；③ 若 <url> 是 github 原始地址，
+#   再尝试 GITHUB_PROXY 前缀镜像。
+#   关键防护：每下载完都做【完整性校验】——gzip 包用 `gzip -t`，否则用
+#   `test -s`（非空）。校验失败则删除残包、继续下一个源；所有源都失败才报错。
+#   这避免了"代理返回 200 但被截断"的残包被误认为成功（旧版 bug）。
+define fetch
+	@mkdir -p $(dir $(2))
+	@rm -f "$(2)"
+	@try_one() { \
+	    local url="$$1"; \
+	    echo "[fetch] $$url"; \
+	    if [ "$(FETCH)" = "curl" ]; then \
+	        curl -fL --retry 3 --connect-timeout 30 -o "$(2)" "$$url" || return 1; \
+	    elif [ "$(FETCH)" = "wget" ]; then \
+	        wget -q --tries=3 -O "$(2)" "$$url" || return 1; \
+	    else \
+	        echo "ERROR: need curl or wget"; return 1; \
+	    fi; \
+	    if [ ! -s "$(2)" ]; then echo "[fetch] empty file, retry"; return 1; fi; \
+	    case "$(2)" in \
+	        *.tar.gz|*.tgz) gzip -t "$(2)" 2>/dev/null || { echo "[fetch] gzip corrupt, retry"; return 1; } ;; \
+	        *.tar.xz)      xz -t "$(2)" 2>/dev/null    || { echo "[fetch] xz corrupt, retry"; return 1; } ;; \
+	        *.tar.bz2)     bzip2 -t "$(2)" 2>/dev/null  || { echo "[fetch] bz2 corrupt, retry"; return 1; } ;; \
+	    esac; \
+	    echo "[fetch] OK: $(2)"; return 0; \
+	}; \
+	ok=0; \
+	try_one "$(1)" && ok=1 || true; \
+	if [ $$ok -ne 1 ] && [ -n "$(3)" ]; then \
+	    try_one "$(3)" && ok=1 || true; \
+	fi; \
+	if [ $$ok -ne 1 ]; then \
+	    case "$(1)" in \
+	        *github.com*) \
+	            if try_one "$(GITHUB_PROXY)$(1)"; then ok=1; fi ;; \
+	    esac; \
+	fi; \
+	if [ $$ok -ne 1 ]; then \
+	    echo "[fetch] ALL SOURCES FAILED for $(1)"; rm -f "$(2)"; exit 1; \
+	fi
+endef
+
+# ============================ 顶层目标 ============================
+.PHONY: all gcc binutils clean
+
+all: binutils gcc
+
+# 打印当前选用的镜像策略（国内/海外自动识别结果）
+$(info $(MIRROR_TAG))
+
+# ============================ Binutils ============================
+$(SRC)/gcc-$(GCC_VER).tar.gz:
+	$(call fetch,$(GCC_URL),$@,$(GCC_FB))
+
+$(SRC)/binutils-$(BINUTILS_VER).tar.gz:
+	$(call fetch,$(BINUTILS_URL),$@,$(BINUTILS_FB))
+
+# 解包（strip 顶层目录差异：镜像 tarball 顶层为 gcc-<ver> / binutils-<ver>）
+# 使用 -v 实时打印文件名，并将进度重定向到日志；同时用 pv（若可用）显示吞吐量，
+# 便于观察大包（gcc ~160MB）解压是否在进行而非卡死。
+# 守卫：若目标 configure 已存在（之前解压过且完好），直接跳过解压，避免跨卷
+# 上重复解压浪费时间。仅当 configure 不存在时才真正解压。
+$(GCC_SRC)/configure: $(SRC)/gcc-$(GCC_VER).tar.gz
+	@if [ -f "$@" ]; then \
+	    echo "[extract] gcc: 已解压，跳过 ($@ 存在)"; \
+	else \
+	    echo "[extract] gcc (size: $(shell du -h $< | cut -f1)) -> $(SRC)"; \
+	    mkdir -p $(SRC); \
+	    echo "[extract] gcc: 正在解压（详细日志 -> $(SRC)/gcc.extract.log），请稍候..."; \
+	    tar -xzvf $< -C $(SRC) > $(SRC)/gcc.extract.log 2>&1 || { echo "[extract] gcc FAILED, tail of log:"; tail -n 20 $(SRC)/gcc.extract.log; exit 1; }; \
+	    echo "[extract] gcc: 解压完成，共 $$(wc -l < $(SRC)/gcc.extract.log) 个条目"; \
+	fi
+	@touch $@
+
+$(BINUTILS_SRC)/configure: $(SRC)/binutils-$(BINUTILS_VER).tar.gz
+	@if [ -f "$@" ]; then \
+	    echo "[extract] binutils: 已解压，跳过 ($@ 存在)"; \
+	else \
+	    echo "[extract] binutils (size: $(shell du -h $< | cut -f1)) -> $(SRC)"; \
+	    mkdir -p $(SRC); \
+	    echo "[extract] binutils: 正在解压（详细日志 -> $(SRC)/binutils.extract.log），请稍候..."; \
+	    tar -xzvf $< -C $(SRC) > $(SRC)/binutils.extract.log 2>&1 || { echo "[extract] binutils FAILED, tail of log:"; tail -n 20 $(SRC)/binutils.extract.log; exit 1; }; \
+	    echo "[extract] binutils: 解压完成，共 $$(wc -l < $(SRC)/binutils.extract.log) 个条目"; \
+	fi
+	@touch $@
+
+# 构建 binutils
+$(BINUTILS_BUILD)/Makefile: $(BINUTILS_SRC)/configure
+	@echo "[configure] binutils -> $(TARGET)"
+	@mkdir -p $(BINUTILS_BUILD)
+	@cd $(BINUTILS_BUILD) && \
+	  $(BINUTILS_SRC)/configure \
+	    --target=$(TARGET) \
+	    --prefix=$(PREFIX) \
+	    --disable-nls \
+	    --disable-werror \
+	    --enable-deterministic-archives
+
+binutils: $(BINUTILS_BUILD)/Makefile
+	@echo "[build] binutils"
+	@$(MAKE) -C $(BINUTILS_BUILD) -j$(JOBS)
+	@$(MAKE) -C $(BINUTILS_BUILD) install
+	@echo "[done] binutils installed: $(PREFIX)/bin/$(TARGET)-*"
+
+# ============================ GCC ============================
+# GCC 第一阶段（freestanding，--without-headers）。SukiOS 自带 libc，
+# 无需构建目标端 C 库；仅产出交叉 gcc/cc1 与 libgcc 自由环境子集。
+# 注意：gcc configure 只需 binutils 工具（ld/as）已【安装】到 PREFIX/bin（在 PATH 中），
+# 不需要 binutils 的 build 目录存在。故依赖改为「安装检查」而非 build 目录，避免
+# 在 build/ 被 make clean 清空后被迫重建 binutils 而触发 config.cache 污染报错。
+$(GCC_BUILD)/Makefile: $(GCC_SRC)/configure
+	@echo "[configure] gcc -> $(TARGET)"
+	@mkdir -p $(GCC_BUILD)
+	@cd $(GCC_BUILD) && \
+	  $(GCC_SRC)/configure \
+	    --target=$(TARGET) \
+	    --prefix=$(PREFIX) \
+	    --disable-nls \
+	    --enable-languages=c,c++ \
+	    --without-headers \
+	    --disable-libssp \
+	    --disable-libquadmath \
+	    --disable-libsanitizer \
+	    --disable-libstdcxx \
+	    --disable-shared \
+	    --with-newlib
+	@# --with-newlib 让 gcc 把目标视为无宿主 C 库环境，匹配 SukiOS freestanding libc
+
+# gcc 构建：仅依赖 gcc 的 configure 产物（binutils 工具需已装且在 PATH）。
+# 若 binutils 未装，先 make binutils；已装则直接构建 gcc，不再强制重建 binutils。
+gcc: $(GCC_BUILD)/Makefile
+	@echo "[build] gcc"
+	@$(MAKE) -C $(GCC_BUILD) -j$(JOBS) all-gcc
+	@$(MAKE) -C $(GCC_BUILD) install-gcc
+	@echo "[done] gcc installed: $(PREFIX)/bin/$(TARGET)-gcc"
+	@echo "[note] 若需目标端 libgcc 完整支持，可再运行: make -f cross/Makefile.gcc libgcc"
+	@echo "[note] 将 $(PREFIX)/bin 加入 PATH 后即可使用 $(TARGET)-gcc 编译 SukiOS 用户态程序"
+
+# 可选：构建并安装目标端 libgcc（SukiOS freestanding libc 已覆盖大部分场景，
+# 但某些 __builtin 与异常处理符号需要 libgcc）。依赖 gcc 已 configure 并安装。
+libgcc: $(GCC_BUILD)/Makefile
+	@echo "[build] libgcc -> $(TARGET)"
+	@$(MAKE) -C $(GCC_BUILD) -j$(JOBS) all-target-libgcc
+	@$(MAKE) -C $(GCC_BUILD) install-target-libgcc
+	@echo "[done] libgcc installed for $(TARGET)"
+
+# ============================ 清理 ============================
+clean:
+	@echo "[clean] removing build/ and src/ (keep installed toolchain in opt/)"
+	@rm -rf $(BUILD) $(SRC)
+
+distclean: clean
+	@echo "[distclean] also removing installed toolchain"
+	@rm -rf $(PREFIX)
+
+help:
+	@echo "Targets:"
+	@echo "  all       - build binutils + gcc (default)"
+	@echo "  binutils  - build only binutils"
+	@echo "  gcc       - build only gcc (requires binutils)"
+	@echo "  libgcc    - build/install target libgcc (optional)"
+	@echo "  clean     - remove src/ and build/"
+	@echo "  distclean - clean + remove installed toolchain"
+	@echo ""
+	@echo "Proxy: downloads use $(GITHUB_PROXY) in front of original github URLs."
+	@echo "Source URLs (original, kept in Makefile):"
+	@echo "  GCC      = $(GCC_URL)"
+	@echo "  Binutils = $(BINUTILS_URL)"

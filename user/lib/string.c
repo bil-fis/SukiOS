@@ -182,3 +182,72 @@ int islower(int c) { return c >= 'a' && c <= 'z'; }
 int isprint(int c) { return c >= 0x20 && c <= 0x7e; }
 int toupper(int c) { return islower(c) ? c - 'a' + 'A' : c; }
 int tolower(int c) { return isupper(c) ? c - 'a' + 'A' : c; }
+
+/* ---- 错误号 -> 可读字符串（用于 shell/程序诊断输出） ---- */
+const char *strerror(int errnum)
+{
+    switch (errnum) {
+        case 0:   return "Success";
+        case EPERM:    return "Operation not permitted";
+        case ENOENT:   return "No such file or directory";
+        case ESRCH:    return "No such process";
+        case EINTR:    return "Interrupted system call";
+        case EIO:      return "I/O error";
+        case ENXIO:    return "No such device or address";
+        case E2BIG:    return "Argument list too long";
+        case ENOEXEC:  return "Exec format error";
+        case EBADF:    return "Bad file number";
+        case ECHILD:   return "No child processes";
+        case EAGAIN:   return "Try again";
+        case ENOMEM:   return "Out of memory";
+        case EACCES:   return "Permission denied";
+        case EFAULT:    return "Bad address";
+        case EBUSY:    return "Device or resource busy";
+        case EEXIST:   return "File exists";
+        case EXDEV:    return "Cross-device link";
+        case ENODEV:   return "No such device";
+        case ENOTDIR:  return "Not a directory";
+        case EISDIR:   return "Is a directory";
+        case EINVAL:   return "Invalid argument";
+        case ENFILE:   return "File table overflow";
+        case EMFILE:   return "Too many open files";
+        case ENOTTY:   return "Not a typewriter";
+        case EFBIG:    return "File too large";
+        case ENOSPC:   return "No space left on device";
+        case ESPIPE:   return "Illegal seek";
+        case EROFS:    return "Read-only file system";
+        case EMLINK:   return "Too many links";
+        case EPIPE:    return "Broken pipe";
+        case ENOTEMPTY:return "Directory not empty";
+        case ENAMETOOLONG: return "File name too long";
+        case ENOSYS:   return "Function not implemented";
+        case ELOOP:    return "Too many symbolic links";
+        case EDOM:     return "Numerical argument out of domain";
+        case ERANGE:   return "Numerical result out of range";
+        case EILSEQ:   return "Illegal byte sequence";
+        default:       return "Unknown error";
+    }
+}
+
+/* ---- 信号号 -> 可读字符串（集成到 errno 段，避免额外文件） ---- */
+const char *strsignal(int sig)
+{
+    switch (sig) {
+        case 1:  return "SIGHUP: Hangup";
+        case 2:  return "SIGINT: Interrupt";
+        case 3:  return "SIGQUIT: Quit";
+        case 4:  return "SIGILL: Illegal instruction";
+        case 5:  return "SIGTRAP: Trace/breakpoint trap";
+        case 6:  return "SIGABRT: Aborted";
+        case 7:  return "SIGBUS: Bus error";
+        case 8:  return "SIGFPE: Floating point exception";
+        case 9:  return "SIGKILL: Killed";
+        case 11: return "SIGSEGV: Segmentation fault";
+        case 13: return "SIGPIPE: Broken pipe";
+        case 14: return "SIGALRM: Alarm clock";
+        case 15: return "SIGTERM: Terminated";
+        case 17: return "SIGSTOP: Stopped (signal)";
+        case 19: return "SIGCONT: Continued";
+        default: return "Unknown signal";
+    }
+}

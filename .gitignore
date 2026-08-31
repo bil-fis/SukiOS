@@ -6,6 +6,14 @@
 # ---- 构建产物（build/ 下全部生成物：.o/.elf/.bin/.iso/.img/.log/.map）----
 /build/
 
+# ---- 交叉工具链（从源码构建，不入库）----
+# src/      : gcc/binutils 源码包与解压目录
+# opt/      : 安装的工具链（opt/bin 下的 x86_64-sukios-elf-*）
+# cross-build/ : 交叉工具链构建中间目录
+/src/
+/opt/
+/cross-build/
+
 # 若将来有散落在源码树内的产物，也一并忽略（保险）
 *.o
 *.elf

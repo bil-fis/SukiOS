@@ -1,0 +1,37 @@
+/*
+ * user/lib/shims/dirent.h
+ * -----------------------------------------------------------------------------
+ * SukiOS 用户态标准 <dirent.h> 实现头。
+ *
+ * 实现归属：user/lib/dirent.c（opendir/readdir/closedir/telldir/seekdir/rewinddir），
+ * 后端为内核 SYS_OPENDIR/READDIR/CLOSEDIR/TELLDIR/SEEKDIR。struct dirent 布局与
+ * 内核 suki_dirent_t 一致（user/lib/libc.h 中定义），此处 reuse 同一结构。
+ */
+#ifndef _SUKI_SHIM_DIRENT_H
+#define _SUKI_SHIM_DIRENT_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* 目录项结构（与内核 IPC 返回的 suki_dirent_t 布局一致） */
+struct dirent {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    uint8_t  _pad[5];
+    char     d_name[256];
+};
+
+/* 目录流句柄（不透明，后端为内核 opendir fd） */
+typedef struct DIR DIR;
+
+/* ---- 目录遍历接口（user/lib/dirent.c） ---- */
+DIR           *opendir(const char *name);
+struct dirent *readdir(DIR *dirp);
+int            closedir(DIR *dirp);
+long           telldir(DIR *dirp);
+void           seekdir(DIR *dirp, long loc);
+void           rewinddir(DIR *dirp);
+
+#endif /* _SUKI_SHIM_DIRENT_H */

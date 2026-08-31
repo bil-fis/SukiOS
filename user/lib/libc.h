@@ -1,16 +1,16 @@
 /*
  * user/lib/libc.h
  * -----------------------------------------------------------------------------
- * SukiOS 用户态 C 库（libc）内部汇总头。
+ * SukiOS 用户态 C 库（libc）汇总头。
  *
- * 本库是「对接 SukiOS 自有 syscall 号表（include/sukios/posix.h）」的完整 C
- * 运行库，供用户态程序（含后续从 Linux 迁移、经重新编译的程序）静态链接使用。
- * 设计参照 newlib 的 libc/syscalls 模式：库函数最终经 suki.h 的 syscall 封装
- * 落到内核；标准 C 与 POSIX 名字（printf/open/fork/malloc...）全部在此提供，
- * 使程序无需区分「裸 syscall」与「libc 包装」。
+ * 设计：标准 C / POSIX 函数的「声明」统一放在 user/lib/shims/ 下的标准头
+ * （<string.h>/<stdlib.h>/<stdio.h>/<unistd.h>/<errno.h>/<ctype.h>/<time.h>/
+ * <dirent.h>），由 freestanding 交叉编译器经 -I user/lib/shims 找到；本文件
+ * 只在标准头基础上补充 SukiOS 特有的【类型/结构体/常量宏/errno 映射/getopt】，
+ * 避免重复声明（单一真相源原则）。
  *
- * freestanding 安全：仅依赖编译器内置 <stdarg.h>/<stddef.h>/<stdint.h>，不依赖
- * 任何外部 libc。
+ * 所有 syscall 号、errno 码、POSIX 常量均取自 <sukios/posix.h>（内核/用户共享，
+ * 唯一真相源），本文件与 suki.h 均不各自硬编码。
  */
 #ifndef _SUKI_USER_LIBC_H
 #define _SUKI_USER_LIBC_H
@@ -19,37 +19,23 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdbool.h>
-#include "suki.h"
 
-/* ---- errno（单线程用户态：每个任务独立镜像，进程内全局即可） ---- */
-extern int errno;
-int *__errno_location(void);
+/* ---- 标准 C / POSIX 函数声明（shims 下完整标准头，与 libc 实现一致） ---- */
+#include <errno.h>     /* errno 外部变量 + E* 错误码宏 */
+#include <string.h>    /* mem* / str* + strerror/strsignal */
+#include <stdlib.h>    /* malloc/free/exit/getenv/... + atexit */
+#include <stdio.h>     /* printf/puts/... */
+#include <unistd.h>    /* open/read/write/fork/... + POSIX 常量 */
+#include <ctype.h>     /* isalpha/toupper/... */
+#include <time.h>      /* time/gettimeofday/clock_gettime/... */
+#include <dirent.h>    /* DIR/struct dirent/opendir/... */
+
+#include "suki.h"      /* syscall 封装、mach_msg、端口号等 SukiOS 专有 API */
 
 /* ========================================================================== */
-/*  标准 C / POSIX 类型与结构体（必须在函数声明之前定义）                       */
+/*  SukiOS 特有结构体（标准头未覆盖；time/dirent/pid_t 等基础类型已由对应       */
+/*  标准头 <time.h>/<dirent.h>/<unistd.h> 提供，此处不再重复定义以免冲突）        */
 /* ========================================================================== */
-typedef suki_pid_t    pid_t;
-typedef suki_off_t    off_t;
-typedef suki_ssize_t  ssize_t;
-typedef suki_mode_t   mode_t;
-typedef suki_uid_t    uid_t;
-typedef suki_gid_t    gid_t;
-typedef suki_clockid_t clockid_t;
-typedef suki_time_t   time_t;
-typedef suki_dev_t    dev_t;
-typedef suki_ino_t    ino_t;
-typedef suki_nlink_t  nlink_t;
-typedef long          blksize_t;
-typedef long          blkcnt_t;
-
-struct timeval {
-    int64_t tv_sec;
-    int64_t tv_usec;
-};
-struct timespec {
-    int64_t tv_sec;
-    int64_t tv_nsec;
-};
 struct timezone {
     int32_t tz_minuteswest;
     int32_t tz_dsttime;
@@ -90,21 +76,10 @@ struct rlimit {
     uint64_t rlim_cur;
     uint64_t rlim_max;
 };
-struct dirent {
-    uint64_t d_ino;
-    int64_t  d_off;
-    uint16_t d_reclen;
-    uint8_t  d_type;
-    uint8_t  _pad[5];
-    char     d_name[256];
-};
-typedef struct timeval  timeval;
-typedef struct timespec timespec;
 typedef struct stat     stat;
 typedef struct utsname  utsname;
 typedef struct tms      tms;
 typedef struct rlimit   rlimit;
-typedef struct dirent   dirent;
 
 /* 把内核返回的 -errno 转成「设置 errno 并返回 -1」的标准 POSIX 语义 */
 static inline long libc_ret(long r)
@@ -116,147 +91,25 @@ static inline long libc_ret(long r)
     return r;
 }
 
-/* ---- 堆（sys_brk 后端） ---- */
-void  *malloc(size_t size);
-void  *calloc(size_t nmemb, size_t size);
-void  *realloc(void *ptr, size_t size);
-void   free(void *ptr);
+/* ---- 堆（sys_brk 后端，声明见 <stdlib.h>） ---- */
 
-/* ---- 字符串 ---- */
-size_t strlen(const char *s);
-int    strcmp(const char *a, const char *b);
-int    strncmp(const char *a, const char *b, size_t n);
-char  *strcpy(char *d, const char *s);
-char  *strncpy(char *d, const char *s, size_t n);
-size_t strlcpy(char *d, const char *s, size_t n);
-char  *strcat(char *d, const char *s);
-char  *strncat(char *d, const char *s, size_t n);
-char  *strdup(const char *s);
-char  *strndup(const char *s, size_t n);
-/* 注意：strchr/strrchr 的底层实现在 suki.c（供 FatFs 等使用），声明见 suki.h，
- * 本头不再重复声明以避免重复定义。 */
-char  *strrchr(const char *s, int c);
-char  *strstr(const char *hay, const char *needle);
-char  *strtok_r(char *s, const char *sep, char **save);
-char  *strtok(char *s, const char *sep);
-long   strtol(const char *s, char **end, int base);
-long long strtoll(const char *s, char **end, int base);
-unsigned long strtoul(const char *s, char **end, int base);
-int    atoi(const char *s);
-long   atol(const char *s);
-int    isalpha(int c);
-int    isdigit(int c);
-int    isalnum(int c);
-int    isspace(int c);
-int    isupper(int c);
-int    islower(int c);
-int    isprint(int c);
-int    toupper(int c);
-int    tolower(int c);
+/* ---- 进程 / 文件（POSIX 名字，声明见 <unistd.h>/<stdlib.h>） ---- */
 
-/* ---- 标准输出/格式化 ---- */
-int putchar(int c);
-int puts(const char *s);
-int printf(const char *fmt, ...);
-int fprintf(int fd, const char *fmt, ...);
-int snprintf(char *buf, size_t size, const char *fmt, ...);
-int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap);
+/* ---- 目录流（声明见 <dirent.h>） ---- */
 
-/* ---- 进程 / 文件（POSIX 名字，内核 fd 层后端） ---- */
-int   open(const char *path, int flags, ...);
-int   close(int fd);
-ssize_t read(int fd, void *buf, size_t count);
-ssize_t write(int fd, const void *buf, size_t count);
-off_t lseek(int fd, off_t off, int whence);
-int   unlink(const char *path);
-int   mkdir(const char *path, int mode);
-int   rename(const char *oldp, const char *newp);
-int   access(const char *path, int mode);
-int   chmod(const char *path, int mode);
-int   chdir(const char *path);
-char *getcwd(char *buf, size_t size);
-int   dup(int fd);
-int   dup2(int oldfd, int newfd);
-int   pipe(int fds[2]);
-int   fork(void);
-int   waitpid(int pid, int *status, int options);
-int   kill(int pid, int sig);
-int   getpid(void);
-int   getppid(void);
-void  _exit(int code);
-void  exit(int code);
+/* ---- 环境变量（进程内维护，声明见 <stdlib.h>） ---- */
 
-/* ---- 时间 ---- */
-time_t    time(time_t *tloc);
-int       gettimeofday(struct timeval *tv, void *tz);
-int       clock_gettime(int clk, struct timespec *tp);
-int       nanosleep(const struct timespec *req, struct timespec *rem);
-unsigned int sleep(unsigned int sec);
-int       usleep(unsigned int usec);
+/* ---- 时间（声明见 <time.h>） ---- */
 
 /* ---- 系统 ---- */
 int uname(struct utsname *buf);
 
-/* 标准 errno 错误码名（映射到 <sukios/posix.h> 的 SUKI_E*，值一致） */
-#define EPERM     SUKI_EPERM
-#define ENOENT    SUKI_ENOENT
-#define ESRCH     SUKI_ESRCH
-#define EINTR     SUKI_EINTR
-#define EIO       SUKI_EIO
-#define ENXIO     SUKI_ENXIO
-#define E2BIG     SUKI_E2BIG
-#define ENOEXEC   SUKI_ENOEXEC
-#define EBADF     SUKI_EBADF
-#define ECHILD    SUKI_ECHILD
-#define EAGAIN    SUKI_EAGAIN
-#define ENOMEM    SUKI_ENOMEM
-#define EACCES    SUKI_EACCES
-#define EFAULT    SUKI_EFAULT
-#define EBUSY     SUKI_EBUSY
-#define EEXIST    SUKI_EEXIST
-#define EXDEV     SUKI_EXDEV
-#define ENODEV    SUKI_ENODEV
-#define ENOTDIR   SUKI_ENOTDIR
-#define EISDIR    SUKI_EISDIR
-#define EINVAL    SUKI_EINVAL
-#define ENFILE    SUKI_ENFILE
-#define EMFILE    SUKI_EMFILE
-#define ENOTTY    SUKI_ENOTTY
-#define EFBIG     SUKI_EFBIG
-#define ENOSPC    SUKI_ENOSPC
-#define ESPIPE    SUKI_ESPIPE
-#define EROFS     SUKI_EROFS
-#define EMLINK    SUKI_EMLINK
-#define EPIPE     SUKI_EPIPE
-#define EDOM      SUKI_EDOM
-#define ERANGE    SUKI_ERANGE
-#define EDEADLK   SUKI_EDEADLK
-#define ENAMETOOLONG SUKI_ENAMETOOLONG
-#define ENOLCK    SUKI_ENOLCK
-#define ENOSYS    SUKI_ENOSYS
-#define ENOTEMPTY SUKI_ENOTEMPTY
-#define ELOOP     SUKI_ELOOP
-#define ENOSR     SUKI_ENOSR
-#define EILSEQ    SUKI_EILSEQ
-#define ENOTSOCK  SUKI_ENOTSOCK
-#define EMSGSIZE  SUKI_EMSGSIZE
-#define EPROTONOSUPPORT SUKI_EPROTONOSUPPORT
-#define EOPNOTSUPP SUKI_EOPNOTSUPP
-#define ECONNREFUSED SUKI_ECONNREFUSED
-#define ETIMEDOUT SUKI_ETIMEDOUT
-#define EHOSTUNREACH SUKI_EHOSTUNREACH
-#define EALREADY  SUKI_EALREADY
-#define EINPROGRESS SUKI_EINPROGRESS
-#define ECANCELED SUKI_ECANCELED
+/* 标准 errno 错误码名已在 <errno.h> 提供，此处不再重复定义。 */
 
-/* 常量宏（POSIX 程序直接用） */
+/* 常量宏（POSIX 程序直接用；值取自 sukios/posix.h 唯一真相源） */
 #define STDIN_FILENO   0
 #define STDOUT_FILENO  1
 #define STDERR_FILENO  2
-
-#ifndef NULL
-#define NULL ((void *)0)
-#endif
 
 #define O_RDONLY   SUKI_O_RDONLY
 #define O_WRONLY   SUKI_O_WRONLY
@@ -291,9 +144,6 @@ int uname(struct utsname *buf);
 
 #define WNOHANG  SUKI_WNOHANG
 
-#define CLOCK_REALTIME        SUKI_CLOCK_REALTIME
-#define CLOCK_MONOTONIC       SUKI_CLOCK_MONOTONIC
-
 #define S_IFMT   SUKI_S_IFMT
 #define S_IFDIR  SUKI_S_IFDIR
 #define S_IFREG  SUKI_S_IFREG
@@ -317,5 +167,25 @@ int uname(struct utsname *buf);
 
 #define PATH_MAX  SUKI_PATH_MAX
 #define NAME_MAX  SUKI_NAME_MAX
+
+/* ---- getopt / getopt_long（命令行参数解析，bash 风格） ---- */
+struct option {
+    const char *name;     /* 长选项名（不含前导 --） */
+    int         has_arg;  /* no_argument / required_argument / optional_argument */
+    int        *flag;     /* 非 NULL 时把 val 写入 *flag 并返回 0，否则返回 val */
+    int         val;      /* flag==NULL 时作为返回值 */
+};
+#define no_argument       0
+#define required_argument 1
+#define optional_argument 2
+
+extern char *optarg;
+extern int   optind;
+extern int   opterr;
+extern int   optopt;
+
+int getopt(int argc, char *const argv[], const char *optstring);
+int getopt_long(int argc, char *const argv[], const char *optstring,
+                const struct option *longopts, int *longindex);
 
 #endif /* _SUKI_USER_LIBC_H */

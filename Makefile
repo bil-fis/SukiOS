@@ -1,21 +1,49 @@
 # =============================================================================
 # SukiOS 顶层 Makefile
 # -----------------------------------------------------------------------------
-# 工具链自动探测：若系统已安装 x86_64-elf-gcc 交叉编译器则优先使用，
-# 否则回退到原生 gcc（配合 -ffreestanding -nostdlib，x86_64 主机可正常产出
-# 自由环境内核）。安装交叉工具链后无需改动本文件即可无缝切换。
+# 工具链自动探测：若系统已安装 SukiOS 专属交叉编译器 x86_64-sukios-elf-gcc 则优先
+# 使用（由 make gcc 构建并装到 cross/opt/bin），否则回退到原生 gcc（配合
+# -ffreestanding -nostdlib，x86_64 主机可正常产出自由环境内核）。安装专属交叉
+# 工具链后无需改动本文件即可无缝切换。
 # =============================================================================
 
 ARCH := x86_64
 
+# ---- 工具链安装前缀（与 cross/Makefile.gcc 的 PREFIX 保持一致）----
+# cross/Makefile.gcc 中 CROSS_ROOT=$(CURDIR)、PREFIX=$(CROSS_ROOT)/opt，
+# 故工具装在 $(CURDIR)/opt/bin。
+CROSS_OPT := $(CURDIR)/opt
+
 # ---- 工具链探测 ----
-ifneq (,$(shell command -v x86_64-elf-gcc 2>/dev/null))
-  CC := x86_64-elf-gcc
-  TOOLCHAIN := cross (x86_64-elf)
+# 架构约定（重要）：
+#   * 内核（kernel/*.c/.S）由【宿主原生 gcc】编译——内核是 freestanding、自带实现，
+#     且需要宿主系统头文件（如 <string.h> 来自宿主 libc 头，内核仅用于编译期，
+#     运行期不链接 libc）。绝不能用 x86_64-sukios-elf-gcc 编内核（它无宿主系统头）。
+#   * 用户态程序（user/、apps/）由【SukiOS 专属交叉编译器 x86_64-sukios-elf-gcc】
+#     编译，链接 SukiOS 自带 libc（user/lib），生成目标端 ELF。
+# 因此：
+#   CC      = 内核编译器 = 宿主 gcc（固定）
+#   USER_CC = 用户态编译器 = 优先 x86_64-sukios-elf-gcc，未装则回退宿主 gcc
+# 注意：Make 的 $(shell ...) 不继承 makefile 内 export 的 PATH，探测必须用绝对
+# 路径 wildcard，而非依赖 command -v。
+SUKIOS_CC := $(CROSS_OPT)/bin/x86_64-sukios-elf-gcc
+ELF_CC    := $(CROSS_OPT)/bin/x86_64-elf-gcc
+# 内核：固定宿主 gcc
+CC        := gcc
+TOOLCHAIN := native (host gcc, freestanding)
+# 用户态：优先专属工具链，回退宿主 gcc
+ifeq ($(wildcard $(SUKIOS_CC)),$(SUKIOS_CC))
+  USER_CC := x86_64-sukios-elf-gcc
+  USER_TOOLCHAIN := cross (x86_64-sukios-elf)
+else ifeq ($(wildcard $(ELF_CC)),$(ELF_CC))
+  USER_CC := x86_64-elf-gcc
+  USER_TOOLCHAIN := cross (x86_64-elf)
 else
-  CC := gcc
-  TOOLCHAIN := native (host gcc, freestanding)
+  USER_CC := gcc
+  USER_TOOLCHAIN := native (host gcc, freestanding)
 endif
+# 将专属工具链目录加入 PATH（供后续 recipe 中的 ld/as/objcopy 等被找到）
+export PATH := $(CROSS_OPT)/bin:$(PATH)
 
 # ---- 目录 ----
 BUILD  := build
@@ -107,11 +135,13 @@ USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
+                -I user/lib/shims \
                 -include $(CONFIG_H)
 USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/errno.c.o $(BUILD)/user/lib/string.c.o \
                   $(BUILD)/user/lib/stdlib.c.o $(BUILD)/user/lib/stdio.c.o \
                   $(BUILD)/user/lib/unistd.c.o $(BUILD)/user/lib/time.c.o \
+                  $(BUILD)/user/lib/dirent.c.o \
                   $(BUILD)/user/lib/syscalls.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o
 
@@ -208,7 +238,7 @@ QEMU_AUDIODRV ?= pa
 QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
                -device intel-hda -device hda-duplex,audiodev=snd0
 
-.PHONY: all iso run run-headless run-dbg run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk FORCE
+.PHONY: all iso run run-headless run-dbg run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk gcc FORCE
 
 all: $(KERNEL)
 
@@ -221,46 +251,58 @@ info:
 	@echo "QEMU smp  : $(QEMU_SMP)"
 	@echo "Objects   : $(OBJS)"
 
+# ---- 交叉编译器：构建 x86_64-sukios 工具链（Binutils + GCC） ----
+# 转发到 cross/Makefile.gcc，源码下载走 gh.dl.ifiss.eu.org 代理，
+# 但 Makefile 内仍保持原始 github.com 地址。
+gcc:
+	$(MAKE) -f cross/Makefile.gcc all
+
+gcc-only:
+	$(MAKE) -f cross/Makefile.gcc gcc
+
+cross-clean:
+	$(MAKE) -f cross/Makefile.gcc clean
+
 # ---- 用户程序编译规则（必须先于内核通配规则） ----
 $(BUILD)/user/%.S.o: user/%.S
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 # L5：用户态栈金丝雀提供文件必须以 -fno-stack-protector 编译（理由同内核）。
 $(BUILD)/user/lib/stack_canary.c.o: user/lib/stack_canary.c
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -fno-stack-protector -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) -fno-stack-protector -c $< -o $@
 
 # FatFs 核心用 freestanding 编译，并包含 drivers/FatFs 头路径（ff.h/ffconf.h）。
 # 注意 -Wno-unused-parameter/-Wno-implicit-fallthrough 屏蔽 FatFs 自身体积较大
 # 的告警（不影响正确性）；仍保留 -Wall -Wextra 其余项做防御性检查。
 $(BUILD)/fatfs/%.c.o: drivers/FatFs/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -I drivers/FatFs -Wno-unused-parameter \
+	$(USER_CC) $(USER_CFLAGS) -I drivers/FatFs -Wno-unused-parameter \
 		-Wno-implicit-fallthrough -c $< -o $@
 
 # fs_server 需要 FatFs 头路径（ff.h/ffconf.h 在 drivers/FatFs/）。
 $(BUILD)/user/fs_server.c.o: user/fs_server.c
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -I drivers/FatFs -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) -I drivers/FatFs -c $< -o $@
 
 $(BUILD)/user/%.c.o: user/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(USER_CFLAGS) -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 # 链接为独立 ELF（固定基址 0x400000，由 user/user.ld 决定；PIE 亦可）
 # fs_server 额外链接 FatFs 核心（ff.o + ffunicode.o）。
 $(BUILD)/user/%.elf: $(BUILD)/user/%.c.o $(USER_LIB_OBJS) user/user.ld
-	$(CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--no-warn-rwx-segments -T user/user.ld \
-		-o $@ $< $(USER_LIB_OBJS)
+		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # fs_server 专用：追加 FatFs 核心对象
 $(BUILD)/user/fs_server.elf: $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS) user/user.ld
-	$(CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--no-warn-rwx-segments -T user/user.ld \
-		-o $@ $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS)
+		-o $@ $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # 把 ELF 文件作为原始字节流嵌入内核镜像（objcopy -I binary 生成
@@ -286,12 +328,12 @@ $(BUILD)/user/%.ssvc.blob.o: $(BUILD)/user/%.elf
 # ---- 独立程序编译规则（user/apps/*.c，启用 SSE，链接为独立 ELF） ----
 $(BUILD)/apps/%.o: user/apps/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(APP_CFLAGS) -c $< -o $@
+	$(USER_CC) $(APP_CFLAGS) -c $< -o $@
 
 $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(USER_LIB_OBJS) user/user.ld
-	$(CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -T user/user.ld \
-		-o $@ $< $(USER_LIB_OBJS)
+		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> standalone app $@ ($$(stat -c%s $@) bytes)"
 
 # ---- 编译期配置头（SMP 开关的注入载体）----

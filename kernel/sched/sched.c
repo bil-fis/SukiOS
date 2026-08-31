@@ -651,6 +651,28 @@ void schedule(void)
     }
     next->state = RUNNING;
     next->ticks_remaining = TIME_SLICE_TICKS;
+
+    /* ============================================================
+     * P0 生产就绪度修复：Round-Robin 轮转（关键！）
+     *
+     * 历史故障：原 schedule() 选中 next 后【未将其旋转到队尾】，导致运行队列
+     * 顺序固定不变。pick_next 永远从 rq_head 开始挑第一个「就绪且非当前」任务，
+     * 于是排在前部的就绪任务（如 input-server）被反复优先选中，排在尾部、本也
+     * 处于 READY 态的任务（如 display-server，因创建顺序靠后而位于队尾）【永远
+     * 轮不到】，表现为启动卡死、显示服务永不被调度、g_display_active 永不置位、
+     * shell 等依赖显示的服务全部 hang（与用户报告的「启用 mouse-server 后内核
+     * 卡死、无任何调试输出」同源——根因是单核 RR 饥饿，而非 PS/2 驱动本身）。
+     *
+     * 修复：选中 next 后，将其从运行队列摘除并重新追加到【队尾】，实现真正的 RR
+     * 轮转——本轮被选中的任务下次排到最后，下一轮调度从它之后的任务开始，保证
+     * 所有 READY 任务（含 display-server / mouse-server / shell）都能被公平调度。
+     * 注意只对仍在队列里的 next 做轮转；正在退出（已从队列摘除）的任务不操作。
+     * ========================================================== */
+    if (next->in_rq) {
+        rq_unlink_cpu(next, cpu);
+        rq_push_cpu(next, cpu);
+    }
+
     if (next->is_user && next != cur) {
         g_percpu[cpu].user_switches++;   /* 负载均衡观测：本核跑了一次 Ring3 任务 */
     }

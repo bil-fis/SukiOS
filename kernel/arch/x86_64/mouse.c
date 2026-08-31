@@ -74,6 +74,9 @@ static bool g_have_wheel = false;
 static mouse_packet_t g_last;
 static volatile bool g_have_last = false;
 
+/* 诊断计数（轻量，仅供串口观测运行期 PS/2 包拼装；不影响逻辑） */
+static volatile uint32_t g_mirq_pktdone = 0;    /* 完成拼包次数 */
+
 static void mse_wait_input(void)
 {
     for (int i = 0; i < 100000; i++) {
@@ -188,39 +191,17 @@ void mouse_feed_byte(uint8_t b)
     if (g_pkt_idx >= g_pkt_len) {
         mse_parse();
         g_pkt_idx = 0;
+        g_mirq_pktdone++;
+        if ((g_mirq_pktdone & 0xFF) == 0) {
+            kprintf("[mouse-diag] pktdone=%u (dx=%d dy=%d btn=%u)\n",
+                    g_mirq_pktdone, g_last.dx, g_last.dy, g_last.buttons);
+        }
     }
 }
 
-/* 键盘字节经统一分发转交键盘状态机（由 kbd_irq_handler 在 STS_AUX=0 时调用）。
- * 声明在此处以避免头文件循环依赖；实现位于 keyboard.c。 */
-extern void kbd_feed_byte(uint8_t sc);
-
-/*
- * IRQ12 处理程序（鼠标）。
- * OSDev《8042 PS/2 Controller》"Keyboard/Auxiliary Device Data"：状态寄存器 STS_AUX
- * (bit5) 标记输出缓冲数据来源——置位=辅助设备(鼠标)，清零=主设备(键盘)。
- * 标准 PC 下鼠标数据只触发 IRQ12 且必带 STS_AUX；但部分固件/模拟器下键盘数据可能
- * 误经 IRQ12 投递（STS_AUX=0），此时若不转交键盘状态机会被吞掉导致键盘无响应。
- * 故此处统一按 STS_AUX 分流：AUX -> mouse_feed_byte（鼠标）；非 AUX ->
- * kbd_feed_byte（键盘，绝不丢弃）。每个字节只被读一次，另一 IRQ handler 跑时缓冲
- * 已空自然 return，不会重复消费。
- */
-static void mouse_irq_handler(registers_t *r)
-{
-    (void)r;
-    uint8_t st = inb(MSE_STATUS);
-    if (!(st & STS_OUT_FULL)) {
-        return;                 /* 无数据（ spurious，忽略） */
-    }
-    uint8_t b = inb(MSE_DATA);
-    if (st & STS_AUX) {
-        /* 数据来自鼠标：拼包 */
-        mouse_feed_byte(b);
-    } else {
-        /* 键盘数据（STS_AUX=0）：转交键盘状态机，绝不丢弃（统一 PS/2 分发） */
-        kbd_feed_byte(b);
-    }
-}
+/* 键盘与鼠标统一由 kbd_irq_handler(IRQ1 向量) 按 STS_AUX 分流处理，详见 keyboard.c。
+ * 鼠标 IRQ(GSI12) 在 mouse_init 中经 ioapic_route(12, IRQ1,...) 路由到同一向量，
+ * 故此处不再注册独立 IRQ12 handler，彻底避免两个 handler 争抢读 0x60 导致的字节吞没。 */
 
 bool mouse_get_packet(mouse_packet_t *out)
 {
@@ -301,9 +282,10 @@ bool mouse_init(void)
         kprintf("[mouse] WARN: enable report ack=0x%02x\n", resp);
     }
 
-    /* 注册 IRQ12 处理程序 + IOAPIC 路由（GSI12 -> IRQ12，边沿触发） */
-    register_interrupt_handler(IRQ12, mouse_irq_handler);
-    ioapic_route(12, IRQ12, false, false, 0);
+    /* 关键：把 PS/2 鼠标 IRQ(GSI12) 路由到与键盘相同的 IRQ1 向量，由 kbd_irq_handler
+     * 统一按 STS_AUX 分流。这样无论鼠标数据经 IRQ1 还是 IRQ12 投递，都进同一 handler
+     * 顺序读取，绝不被两个 handler 争抢读 0x60（那是之前键盘无输入/屏幕乱码的根因）。 */
+    ioapic_route(12, IRQ1, false, false, 0);
 
     /*
      * 启动自测注入（不依赖物理鼠标）：向解析缓冲注入一个合成包，使 Ring3 鼠标驱动
@@ -321,7 +303,7 @@ bool mouse_init(void)
     kprintf("[mouse] injected self-test packet (dx=12 dy=-7 btn=1); "
             "Ring3 driver should report it via SYS_MOUSE_READ\n");
 
-    kprintf("[mouse] PS/2 mouse ready (IOAPIC GSI12 -> IRQ12, %s)\n",
+    kprintf("[mouse] PS/2 mouse ready (IOAPIC GSI12 -> IRQ1 unified w/ kbd, %s)\n",
             g_have_wheel ? "wheel" : "std");
     return true;
 }

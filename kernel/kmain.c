@@ -394,14 +394,57 @@ static void boot_late_init(void *arg)
     task_create_user(user_display_server_start,
                      (size_t)(user_display_server_end - user_display_server_start),
                      "display-server");
+
+    /* ============================================================
+     * 启动屏障（关键修复）：必须先等【显示服务完全就绪】再挂载后续服务。
+     *
+     * 历史故障：此前 display-server 与 mouse-server / shell 被并发 spawn。
+     * 单核下三者在同优先级轮转，mouse-server 一旦启动就进入
+     *   sys_mouse_read() + mach_msg_send(DISPLAY_PORT) 的紧凑循环，疯狂抢占
+     * CPU，导致 display-server 迟迟拿不到足够的运行时间推进到 SYS_DISPLAY_READY
+     * （即 g_display_active 置位、真正接管帧缓冲、进入 mach_msg_recv 消息循环）。
+     * 后果：
+     *   - 显示服务从未接管，内核 fbcon 仍处于「直接写屏」态；
+     *   - 鼠标/键盘产生的字符经 fbcon 直接落在屏幕上、满屏后滚屏；
+     *   - 因为显示服务没进入接收循环，mouse-server 发往 DISPLAY_PORT 的消息
+     *     堆积、shell 也无显示出口，整体表现为「内核卡死、无任何调试输出」。
+     *
+     * 修复：spawn display-server 后，本引导线程主动让出（task_yield）自旋等待
+     * g_display_active 置位（显示服务调用 SYS_DISPLAY_READY 的握手即刻位），
+     * 确认其已合成桌面并进入消息循环、能立即接收后续服务的 IPC，再 spawn
+     * mouse-server 与 shell。这与上方 disk-srv 的 port_has_waiter 等待同构，
+     * 并加足够大的轮数上限（单核下每轮 yield 都会切换到 display-server 推进
+     * 其初始化；实测 display-server 完成 fb map + 桌面合成需要若干万轮 yield，
+     * 故上限取 200000，约数十秒；若仍异常未就绪则放行并告警，绝不无限自旋
+     * 挂死引导）。
+     * ========================================================== */
+    bool display_ready = false;
+    uint32_t waited = 0;
+    for (uint32_t i = 0; i < 20000; i++)
+    {
+        if (g_display_active)
+        {
+            display_ready = true;
+            break;
+        }
+        waited = i;
+        task_yield();   /* 让出 CPU（配合调度器 RR 轮转），使 display-server 运行到 SYS_DISPLAY_READY */
+    }
+    if (display_ready)
+        kprintf("[boot] display-server ready (g_display_active=1, waited=%u yield rounds); "
+                "mounting dependent services...\n", waited);
+    else
+        kprintf("[boot] WARN: display-server did NOT become ready within "
+                "timeout; spawning services anyway (UI may be degraded)\n");
+
     /* Ring3 鼠标驱动（.kdr 形态，待 kdr 加载器就绪后改由加载器动态装载）。
      * 经 SYS_MOUSE_READ 拉取内核 IRQ12 采集的鼠标包，把光标事件经 DISPLAY_PORT
-     * 发给 display-server 渲染。 */
+     * 发给 display-server 渲染。须在显示服务就绪后挂载，确保其消息能被立即接收。 */
     task_create_user(user_mouse_server_start,
                      (size_t)(user_mouse_server_end - user_mouse_server_start),
                      "mouse-server");
-    /* TODO(P0 后续里程碑)：显示层就绪后，再 spawn shell；届时 shell 可经
-     * SYS_CONSOLE_READ 取回内核启动日志并渲染到显示服务的终端窗口。*/
+    /* 显示层就绪后再 spawn shell；shell 可经 SYS_CONSOLE_READ 取回内核启动日志
+     * 并渲染到显示服务的终端窗口。 */
     task_create_user(user_shell_start,
                      (size_t)(user_shell_end - user_shell_start), "shell");
 

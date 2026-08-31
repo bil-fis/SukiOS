@@ -65,6 +65,11 @@ static volatile uint32_t g_rhead = 0, g_rtail = 0;
 static bool g_shift = false;
 static bool g_caps  = false;
 
+/* 诊断计数（轻量，仅供串口观测运行期 IRQ 路由；不影响逻辑） */
+static volatile uint32_t g_kirq_cnt = 0;        /* kbd IRQ 触发次数 */
+static volatile uint32_t g_kirq_aux = 0;        /* 其中 STS_AUX=1 的次数 */
+static volatile uint32_t g_kirq_to_mouse = 0;   /* 转交鼠标的次数 */
+
 static void kbd_push(char c)
 {
     uint32_t next = (g_head + 1) % KBD_BUF_SIZE;
@@ -125,20 +130,19 @@ void kbd_feed_byte(uint8_t sc)
     kbd_push(c);
 }
 
-/* 鼠标字节经统一分发转交键盘状态机（由 mouse_irq_handler 在 STS_AUX=0 时调用）。
+/* 鼠标字节经统一 PS/2 分发转交鼠标状态机（kbd_irq_handler 在 STS_AUX=1 时调用）。
  * 声明在此处以避免头文件循环依赖；实现位于 mouse.c。 */
 extern void mouse_feed_byte(uint8_t b);
 
 /*
- * IRQ1 处理程序（键盘）。
- * OSDev《8042 PS/2 Controller》"Keyboard/Auxiliary Device Data"：状态寄存器 STS_AUX
- * (bit5) 标记输出缓冲中的数据来源——置位=辅助设备(鼠标)，清零=主设备(键盘)。
- * 在部分固件/模拟器下，鼠标数据落到输出缓冲时可能同时拉 IRQ1（与 IRQ12 并存），
- * 此时若不加 STS_AUX 检查直接读 0x60，会把鼠标包首字节当扫描码解析成乱码字符
- * （现象：移动鼠标在屏幕上产生键盘字符、光标不动）。故此处统一按 STS_AUX 分流：
- *   非 AUX -> kbd_feed_byte (键盘)；AUX -> mouse_feed_byte (鼠标，绝不消费键盘路径)。
- * 每个字节只被读一次（inb 清 STS_OUT_FULL），后续另一个 IRQ handler 跑时缓冲已空
- * 自然 return，不会重复消费。
+ * IRQ1 处理程序（键盘 + 鼠标统一入口）。
+ * 设计：把 PS/2 鼠标(GSI12)也路由到本向量（见 mouse_init 的 ioapic_route(12, IRQ1)），
+ * 由单一 handler 按状态寄存器 STS_AUX 分流，彻底消除「键盘/鼠标两个 IRQ handler 争抢
+ * 读 0x60」导致的字节被吞/包错位（现象：移动鼠标光标不动、屏幕冒键盘乱码、键盘无输入）。
+ * OSDev《8042 PS/2 Controller》"Keyboard/Auxiliary Device Data"：STS_AUX(bit5) 标记输出
+ * 缓冲数据来源——置位=辅助设备(鼠标)，清零=主设备(键盘)。
+ *   STS_AUX=0 -> kbd_feed_byte（键盘）；STS_AUX=1 -> mouse_feed_byte（鼠标）。
+ * 每个字节只被读一次（inb 清 STS_OUT_FULL）。
  */
 static void kbd_irq_handler(registers_t *r)
 {
@@ -148,11 +152,17 @@ static void kbd_irq_handler(registers_t *r)
         return;                 /* 无数据（spurious，忽略） */
     }
     uint8_t sc = inb(KBD_DATA);
+    g_kirq_cnt++;
     if (st & STS_AUX) {
-        /* 数据来自鼠标：转交鼠标状态机，绝不吞掉（统一 PS/2 分发） */
-        mouse_feed_byte(sc);
+        g_kirq_aux++;
+        g_kirq_to_mouse++;
+        mouse_feed_byte(sc);    /* 鼠标 */
     } else {
-        kbd_feed_byte(sc);
+        kbd_feed_byte(sc);      /* 键盘 */
+    }
+    if ((g_kirq_cnt & 0xFF) == 0) {
+        kprintf("[kbd-diag] irq=%u aux=%u to_mouse=%u\n",
+                g_kirq_cnt, g_kirq_aux, g_kirq_to_mouse);
     }
 }
 

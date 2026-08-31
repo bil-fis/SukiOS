@@ -7,9 +7,11 @@
  *   - 0x64=命令/状态端口，0x60=数据端口。
  *   - 向辅助设备(鼠标)发命令：先写 0x64=0xD4，再写 0x60=命令/参数。
  *   - 状态寄存器 STS_AUX(bit5, 0x20)：置位表示输出缓冲中的数据来自辅助设备
- *     （鼠标）；清零表示来自主设备（键盘）。在键盘/鼠标 IRQ 分离拓扑（QEMU 默认：
- *     键盘 IRQ1 + 鼠标 IRQ12）下，IRQ12 处理程序收到的数据**必带 STS_AUX**，
- *     即 IRQ12 只投递鼠标数据，键盘数据走 IRQ1，两者互不干扰。
+ *     （鼠标）；清零表示来自主设备（键盘）。标准 PC 下鼠标数据只经 IRQ12 且必带
+ *     STS_AUX、键盘数据只经 IRQ1 且 STS_AUX=0；但部分固件/模拟器下两个 IRQ 可能
+ *     互相误投（鼠标字节出现在 IRQ1、键盘字节出现在 IRQ12）。因此键盘与鼠标 IRQ
+ *     处理程序均按 STS_AUX 统一分流：AUX 数据喂鼠标状态机，非 AUX 喂键盘状态机，
+ *     任何一方都不丢弃对方数据，确保每个字节只被读一次且路由正确。
  *   - 标准 3 字节包：YO XO YS XS 1 M R L | dx | dy。
  *     YO/XO=溢出，YS/XS=符号位，M/R/L=中/右/左键。
  *   - 滚轮鼠标(ID=3)扩展为 4 字节包，第 4 字节为滚轮增量(补码)。
@@ -172,13 +174,36 @@ static void mse_parse(void)
 }
 
 /*
+ * 喂一个鼠标字节（来自 IRQ12 处理程序或 kbd_irq_handler 统一分发）给鼠标包拼装
+ * 状态机。累积到 g_pkt_len 个字节后调用 mse_parse 解析为事件。由 mouse_irq_handler
+ * 与 kbd_irq_handler（统一 PS/2 分发）共用。
+ */
+void mouse_feed_byte(uint8_t b)
+{
+    /* 防御性：g_pkt_idx 越界（如异常重入）时先丢弃当前包，避免写越界。 */
+    if (g_pkt_idx >= MSE_PKT4) {
+        g_pkt_idx = 0;
+    }
+    g_pkt[g_pkt_idx++] = b;
+    if (g_pkt_idx >= g_pkt_len) {
+        mse_parse();
+        g_pkt_idx = 0;
+    }
+}
+
+/* 键盘字节经统一分发转交键盘状态机（由 kbd_irq_handler 在 STS_AUX=0 时调用）。
+ * 声明在此处以避免头文件循环依赖；实现位于 keyboard.c。 */
+extern void kbd_feed_byte(uint8_t sc);
+
+/*
  * IRQ12 处理程序（鼠标）。
- * OSDev《8042 PS/2 Controller》"Keyboard/Auxiliary Device Data"：IRQ12 仅在
- * 辅助设备(鼠标)有数据可输出时触发，且此时 STS_AUX 必置位。键盘数据走 IRQ1，
- * 不会经 IRQ12 投递，故此处**不**需要把非 AUX 数据转交键盘（键盘由 keyboard.c
- * 的 IRQ1 handler 独立处理）。仅当 STS_AUX 置位时按鼠标包处理；若因 rare 残留
- * （如非 AUX 残留字节）收到 STS_AUX=0 的数据，则读取并丢弃以防输出缓冲卡满，
- * 不影响键盘（键盘不依赖此路径）。
+ * OSDev《8042 PS/2 Controller》"Keyboard/Auxiliary Device Data"：状态寄存器 STS_AUX
+ * (bit5) 标记输出缓冲数据来源——置位=辅助设备(鼠标)，清零=主设备(键盘)。
+ * 标准 PC 下鼠标数据只触发 IRQ12 且必带 STS_AUX；但部分固件/模拟器下键盘数据可能
+ * 误经 IRQ12 投递（STS_AUX=0），此时若不转交键盘状态机会被吞掉导致键盘无响应。
+ * 故此处统一按 STS_AUX 分流：AUX -> mouse_feed_byte（鼠标）；非 AUX ->
+ * kbd_feed_byte（键盘，绝不丢弃）。每个字节只被读一次，另一 IRQ handler 跑时缓冲
+ * 已空自然 return，不会重复消费。
  */
 static void mouse_irq_handler(registers_t *r)
 {
@@ -190,15 +215,10 @@ static void mouse_irq_handler(registers_t *r)
     uint8_t b = inb(MSE_DATA);
     if (st & STS_AUX) {
         /* 数据来自鼠标：拼包 */
-        g_pkt[g_pkt_idx++] = b;
-        if (g_pkt_idx >= g_pkt_len) {
-            mse_parse();
-            g_pkt_idx = 0;
-        }
+        mouse_feed_byte(b);
     } else {
-        /* 非 AUX 残留字节（正常分离 IRQ 拓扑下不会发生）：读取丢弃，避免
-         * 输出缓冲永远非空导致后续真实鼠标包被淹没。 */
-        (void)b;
+        /* 键盘数据（STS_AUX=0）：转交键盘状态机，绝不丢弃（统一 PS/2 分发） */
+        kbd_feed_byte(b);
     }
 }
 

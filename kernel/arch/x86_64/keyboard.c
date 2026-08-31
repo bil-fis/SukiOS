@@ -74,11 +74,14 @@ static void kbd_push(char c)
     }
 }
 
-static void kbd_irq_handler(registers_t *r)
+/*
+ * 喂一个键盘字节（扫描码，集1）给内核键盘状态机：写入原始缓冲供 Ring3
+ * INPUT_SERVER 取用，并维护救援终端的 ASCII 后备解析（shift/caps/break）。
+ * 由 kbd_irq_handler 与 mouse_irq_handler（统一 PS/2 分发）共用，确保键盘
+ * 数据无论经 IRQ1 还是误经 IRQ12 都能正确送达，绝不被鼠标 handler 吞掉。
+ */
+void kbd_feed_byte(uint8_t sc)
 {
-    (void)r;
-    uint8_t sc = inb(KBD_DATA);
-
     /* 红线（手册 6.3）：内核只采集原始扫描码；解析由 Ring3 INPUT_SERVER
      * 完成。以下 ASCII 解析仅作为救援终端的后备路径保留。 */
     uint32_t rnext = (g_rhead + 1) % KBD_BUF_SIZE;
@@ -120,6 +123,37 @@ static void kbd_irq_handler(registers_t *r)
         c = (char)(c - 'A' + 'a');
     }
     kbd_push(c);
+}
+
+/* 鼠标字节经统一分发转交键盘状态机（由 mouse_irq_handler 在 STS_AUX=0 时调用）。
+ * 声明在此处以避免头文件循环依赖；实现位于 mouse.c。 */
+extern void mouse_feed_byte(uint8_t b);
+
+/*
+ * IRQ1 处理程序（键盘）。
+ * OSDev《8042 PS/2 Controller》"Keyboard/Auxiliary Device Data"：状态寄存器 STS_AUX
+ * (bit5) 标记输出缓冲中的数据来源——置位=辅助设备(鼠标)，清零=主设备(键盘)。
+ * 在部分固件/模拟器下，鼠标数据落到输出缓冲时可能同时拉 IRQ1（与 IRQ12 并存），
+ * 此时若不加 STS_AUX 检查直接读 0x60，会把鼠标包首字节当扫描码解析成乱码字符
+ * （现象：移动鼠标在屏幕上产生键盘字符、光标不动）。故此处统一按 STS_AUX 分流：
+ *   非 AUX -> kbd_feed_byte (键盘)；AUX -> mouse_feed_byte (鼠标，绝不消费键盘路径)。
+ * 每个字节只被读一次（inb 清 STS_OUT_FULL），后续另一个 IRQ handler 跑时缓冲已空
+ * 自然 return，不会重复消费。
+ */
+static void kbd_irq_handler(registers_t *r)
+{
+    (void)r;
+    uint8_t st = inb(KBD_STATUS);
+    if (!(st & STS_OUT_FULL)) {
+        return;                 /* 无数据（spurious，忽略） */
+    }
+    uint8_t sc = inb(KBD_DATA);
+    if (st & STS_AUX) {
+        /* 数据来自鼠标：转交鼠标状态机，绝不吞掉（统一 PS/2 分发） */
+        mouse_feed_byte(sc);
+    } else {
+        kbd_feed_byte(sc);
+    }
 }
 
 /* 等待输入缓冲空（写前）。带超时，避免死锁（红线：不信任硬件响应）。 */

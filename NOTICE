@@ -137,7 +137,49 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
 
 
 ------------------------------------------------------------------------------
-5. Resource Han Rounded（资源圆体）/ ResourceHanRoundedCN-Medium.ttf
+5. FreeType
+   路径:      lib/freetype-2.14.3/  (全部源码：include/, src/, docs/,
+              README, LICENSE.TXT 等；详见 lib/freetype-2.14.3/ 目录)
+   上游:      https://www.freetype.org/   (git: https://gitlab.freedesktop.org/
+              freetype/freetype.git)
+   版本:      2.14.3
+   作者:      David Turner, Robert Wilhelm, Werner Lemberg 及 FreeType 项目组
+   许可证:    FreeType License (FTL，亦称 FTL/BSD 风格) + 部分文件 GPLv2
+   版权声明 (取自 lib/freetype-2.14.3/LICENSE.TXT 摘要):
+       Portions of this software are copyright (c) 2015-2024 The FreeType
+       Project (www.freetype.org).  All rights reserved.
+
+       This software, and all works of authorship, including source code,
+       documentation, and related files, are licensed under the FreeType
+       License (FTL), a BSD-style license.  Redistribution and use in source
+       and binary forms, with or without modification, are permitted provided
+       that the following conditions are met:
+
+         - Redistributions of source code must retain the above copyright
+           notice, this list of conditions and the following disclaimer.
+         - Redistributions in binary form must reproduce the above copyright
+           notice, this list of conditions and the following disclaimer in the
+           documentation and/or other materials provided with the distribution.
+         - Neither the name of the FreeType Project nor the names of its
+           contributors may be used to endorse or promote products derived from
+           this software without specific prior written permission.
+
+       THIS SOFTWARE IS PROVIDED "AS IS" AND ANY WARRANTIES ARE DISCLAIMED.
+       See lib/freetype-2.14.3/LICENSE.TXT for the full FTL text and the list
+       of files covered by the GPLv2 exception.
+
+   附加说明:
+       SukiOS 将 FreeType 作为 Ring3 字体服务的字形光栅化引擎，从内存中
+       直接加载字体文件（FT_Open_Face + FT_OPEN_MEMORY 自定义 FT_Stream），
+       不依赖标准 I/O 库。FreeType 的 FTL 许可证与 GPL-3.0 兼容，可随本仓库
+       的二进制形式一并再分发；再分发时须保留上述版权声明与 FTL 许可条款。
+       lib/freetype-2.14.3/ 整个目录已纳入版本控制（非 .gitignore 忽略），
+       属于本仓库聚合分发的第三方组件。
+------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------
+6. Resource Han Rounded（资源圆体）/ ResourceHanRoundedCN-Medium.ttf
    路径:      resources/ResourceHanRoundedCN-Medium.ttf
    上游:      https://github.com/CyanoHao/Resource-Han-Rounded
    作者:      Cyano Hao（基于 Source Han Sans / 思源黑体 改造）

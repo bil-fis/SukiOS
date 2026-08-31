@@ -23,6 +23,19 @@ struct dirent {
     char     d_name[256];
 };
 
+/* d_type 取值（与 POSIX <dirent.h> 一致） */
+#define DT_UNKNOWN 0
+#define DT_FIFO    1
+#define DT_CHR     2
+#define DT_DIR     4
+#define DT_BLK     6
+#define DT_REG     8
+#define DT_LNK     10
+#define DT_SOCK    12
+
+/* 把 d_type 当成目录判断 */
+#define DT_ISDIR(t) ((t) == DT_DIR)
+
 /* 目录流句柄（不透明，后端为内核 opendir fd） */
 typedef struct DIR DIR;
 

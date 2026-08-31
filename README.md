@@ -38,7 +38,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **架构目标**：x86_64 物理机 / QEMU 虚拟机，64 位 long mode，4 级分页。
 - **稳定基线**：单核（`CONFIG_SMP=0`，默认）已被确立为主验证形态。所有功能开发与回归均以单核为准，确保「生产场景零 panic」。
 - **安全地基**：SMAP/SMEP、NX、UMIP、KPTI、栈金丝雀、用户指针 `copy_from_user`/`copy_to_user` 围栏、KASLR、IST 守卫栈均在启动早期装配。
-- **GUI 起点**：已实现 display_server（帧缓冲独占 + 终端栅格化 + 鼠标光标绘制），界面字体将采用 `ResourceHanRoundedCN-Medium.ttf`（资源圆体，OFL-1.1）。
+- **GUI 起点**：已实现 display_server（帧缓冲独占 + 终端栅格化 + 鼠标光标绘制）。TTF 字形渲染由 **FreeType 字体服务**（`lib/freetype-2.14.3`，FTL 许可）承担，界面字体采用 `ResourceHanRoundedCN-Medium.ttf`（资源圆体，OFL-1.1）。
 
 **硬件 / 架构约定：**
 
@@ -115,7 +115,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **input-server**：转发键盘输入。
 - **display-server**：**已实现**。独占帧缓冲、栅格化终端文本（内嵌 8x8 字体）、绘制鼠标光标（像素快照法）；内核经 `SYS_DISPLAY_READY`/IPC 转发控制台输出避免覆盖桌面。后续界面字体将采用 `ResourceHanRoundedCN-Medium.ttf`。
 - **mouse-server**：Ring3 鼠标驱动（`.kdr` 形态，临时内嵌 spawn），经 `SYS_MOUSE_READ` 拉包、累计坐标、发光标事件到 display-server。
-- **shell**：交互式命令行（`ls`/`cat`/`write`/`mkdir`/`exec` 等）。
+- **shell**：bash 风格交互式命令行。已实现：历史记录（**内存环形缓冲，最多 100 条，超出丢弃最旧，不落盘**；↑/↓ 滚动）、**Tab 文件名补全**（唯一匹配直接补全、目录补 `/`、多匹配补公共前缀并列出候选）、**行内光标编辑**（←/→ 移动光标、Home/End 跳行首行尾、Backspace 删前、Delete 删后、Enter 提交）、管道 `|` 与重定向 `>`、`$VAR`/`$?` 变量展开、内建命令（`help`/`echo`/`cat`/`ls`/`cd`/`pwd`/`mkdir`/`touch`/`rm`/`write`/`date`/`whoami`/`ps`/`ports`/`portclaim`/`exec`/`spawn`/`clear`/`reboot`）。方向键由 input_server 把 PS/2 扫描码（e0 前缀）编码为 ANSI 转义序列送达。
 - **BMP 加载器**（`user/apps/bmploader.c`）：流式读取 BMP 并经内核 `SYS_DISPLAY_BLIT` 通道 blit 到帧缓冲。
 - **独立用户程序**（FAT32 磁盘 `::BIN/`）：`hello`、`playaudio`（minimp3 MP3 解码）、`audiotest`。
 - **posixtest**：POSIX 系统调用层自检程序。
@@ -142,7 +142,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 > 以下为当前明确**未实现 / 早期**的部分，列出以避免误用。
 
 - **网络栈**：完全未实现。无 virtio-net / Intel 网卡驱动，无 TCP/IP、UDP、socket。
-- **真正的 GUI 应用框架**：已有 display-server 基础（终端栅格化 + 光标），但**无窗口系统 / 合成器 / 应用离屏 Buffer 合成管线**；TTF 字形渲染（资源圆体）尚未接入渲染路径（字体文件已就位，渲染代码待做）。
+- **真正的 GUI 应用框架**：已有 display-server 基础（终端栅格化 + 光标），但**无窗口系统 / 合成器 / 应用离屏 Buffer 合成管线**；TTF 字形渲染已接入：由 `fontsrv` 字体服务加载 FreeType 渲染字形位图，经 IPC 供 `pchfnt` 等程序绘制到帧缓冲（详见 `results/step53.md`）。
 - **存储**：仅 FAT32 经 FatFs；无 ext2/3/4、exFAT、NTFS、ISO9660（除引导 ISO 外）。
 - **多文件系统 / 多磁盘 / GPT**：仅识别首个磁盘首分区 FAT32。
 - **完整 POSIX 语义**：无 fork（仅有 spawn/execve 模型）、无信号、无 pthread、无 swap、无 huge page、无 NUMA。
@@ -230,7 +230,7 @@ SukiOS>
 5. **headless 下鼠标不移动**：QEMU `-display none` 不向 PS/2 鼠标投递物理移动（monitor `mouse_move` 依赖图形后端），故真实鼠标移动的图形验证须在 `make run` 图形窗口人工操作。
 6. **构建需完整链路**：`make iso` 须配合 `make disk` 才有 FAT32 磁盘；改源码后若异常，先 `make clean && make iso && make disk` 全量重建。
 7. **KASLR 两阶段链接**：若 `tools/gen_relk.py` 或 Python 缺失，链接阶段会失败。
-8. **第三方库**：`minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`resources/ResourceHanRoundedCN-Medium.ttf` 等均为第三方组件，版权见 `NOTICE`。
+8. **第三方库**：`minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`lib/freetype-2.14.3/`、`resources/ResourceHanRoundedCN-Medium.ttf` 等均为第三方组件，版权见 `NOTICE`。
 
 ---
 
@@ -339,7 +339,7 @@ tail -8 /tmp/sukios.log
 
 ### 6.5 第三方组件贡献边界
 
-- `minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`resources/ResourceHanRoundedCN-Medium.ttf` 为上游第三方组件，**一般不要在其内部做功能修改**；如需修复优先以上游 PR 方式进行，并在 `NOTICE` 记录偏差。
+- `minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`lib/freetype-2.14.3/`、`resources/ResourceHanRoundedCN-Medium.ttf` 为上游第三方组件，**一般不要在其内部做功能修改**；如需修复优先以上游 PR 方式进行，并在 `NOTICE` 记录偏差。
 - 内核为 freestanding，用户态为自供桩；不要把 newlib 整体编入内核。
 
 ---
@@ -351,6 +351,7 @@ tail -8 /tmp/sukios.log
 - **lieff** —— minimp3（CC0 公共领域），MP3 解码能力。
 - **Rich Geldreich / RAD Game Tools / Valve** —— miniz（zlib 风格许可）。
 - **Cyano Hao** —— Resource Han Rounded（资源圆体，OFL-1.1），界面字体。
+- **FreeType Project** —— FreeType 字体光栅化引擎（FTL 许可），`lib/freetype-2.14.3/`，驱动 TTF 字形渲染。
 - **newlib 贡献者**（Red Hat、UC Berkeley 等）—— freestanding 用户态实现参考。
 - **GRUB / SeaBIOS / OVMF / QEMU** —— 可引导固件与验证环境。
 - **CodeBuddy** —— 代码生成与调试支持。

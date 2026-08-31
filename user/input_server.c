@@ -50,6 +50,23 @@ static const char t_shift[128] = {
     '*', 0,  ' ',
 };
 
+/* 扩展键：e0 前缀后的第二字节 -> ANSI 转义序列（发往 shell 逐字节解析）。
+ * 注意 PS/2 set1 扫描码：Up=0x48 Down=0x50 Left=0x4B Right=0x4D
+ *                       Home=0x47 End=0x4F Delete=0x53 */
+static const char *e0_seq(uint8_t c2)
+{
+    switch (c2) {
+        case 0x48: return "\x1b[A";   /* Up    */
+        case 0x50: return "\x1b[B";   /* Down  */
+        case 0x4B: return "\x1b[D";   /* Left  */
+        case 0x4D: return "\x1b[C";   /* Right */
+        case 0x47: return "\x1b[H";   /* Home  */
+        case 0x4F: return "\x1b[F";   /* End   */
+        case 0x53: return "\x1b[3~";  /* Delete */
+        default:   return NULL;
+    }
+}
+
 static void send_char(char c)
 {
     struct {
@@ -67,10 +84,17 @@ static void send_char(char c)
     mach_msg_send(&msg, sizeof(msg));
 }
 
+/* 发送一个多字节转义序列（逐字节发，shell 端状态机会重新拼装） */
+static void send_escape(const char *s)
+{
+    for (; *s; s++) send_char(*s);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
     bool shift = false, caps = false;
+    bool e0 = false;                 /* 是否处于 e0 扩展前缀 */
 
     u_print("[input] INPUT_SERVER online (Ring3 scancode parser)\n");
     sys_port_claim(INPUT_PORT);    /* A2 项：认领输入接收端口 */
@@ -83,6 +107,18 @@ int main(int argc, char **argv)
             continue;
         }
         uint8_t sc = (uint8_t)v;
+
+        if (sc == 0xE0) {              /* 扩展键前缀：下一字节决定方向键等 */
+            e0 = true;
+            continue;
+        }
+        if (e0) {
+            e0 = false;
+            if (sc & 0x80) continue;   /* e0 扩展键的 break 帧忽略 */
+            const char *seq = e0_seq(sc);
+            if (seq) send_escape(seq); /* 把方向键/Tab 等编码为转义序列发给 shell */
+            continue;
+        }
 
         if (sc & 0x80) {               /* break（松开） */
             uint8_t code = sc & 0x7F;

@@ -33,7 +33,7 @@
 
 #define MSG_ID_KEYCHAR 100   /* 与 input_server 一致；避开 FS_MSG_* */
 #define LINE_MAX 256
-#define HIST_MAX 32
+#define HIST_MAX 100   /* 内存历史最大条数（环形 FIFO，超出丢旧；不落盘） */
 #define ARG_MAX  32
 
 static uint8_t g_rx[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + FS_DATA_MAX + 16];
@@ -46,14 +46,217 @@ static char g_hist[HIST_MAX][LINE_MAX];
 static int  g_hist_count = 0;
 static int  g_hist_idx = 0;           /* 上/下浏览游标（=g_hist_count 表示新行） */
 
+/* 行内编辑状态：当前行缓冲 + 光标下标（支持任意位置插入/删除，bash 风格） */
+static char g_line[LINE_MAX];
+static int  g_len = 0;    /* 已输入字符数 */
+static int  g_cur = 0;    /* 光标下标 0..g_len */
+
 /* 前向声明 */
 static int run_builtin_raw(char *line);
+static void prompt(void);
+
+/* ============ 行内编辑（光标感知） ============ */
+/* 把光标移回行首并重绘整行（用于历史切换/补全后） */
+static void redraw_full(void)
+{
+    char seq[16]; int k = 0;
+    if (g_cur > 0) {                       /* 先左移光标到行首 */
+        seq[k++] = '\x1b'; seq[k++] = '[';
+        if (g_cur >= 10) seq[k++] = '0' + (g_cur / 10);
+        seq[k++] = '0' + (g_cur % 10);
+        seq[k++] = 'D';
+    }
+    u_printn(seq, k);
+    u_print("\x1b[K");                     /* 清到行尾 */
+    u_print(g_line);                       /* 重印整行 */
+    /* 光标应位于行尾（重印后 g_cur==g_len） */
+    g_cur = g_len;
+}
+
+/* 从光标处起重绘（保持光标位置） */
+static void redraw_from_cursor(void)
+{
+    u_print("\x1b[K");                     /* 清到行尾 */
+    u_print(g_line + g_cur);               /* 打印光标后内容 */
+    int back = g_len - g_cur;              /* 把光标移回正确位置 */
+    if (back > 0) {
+        char seq[16]; int k = 0;
+        seq[k++] = '\x1b'; seq[k++] = '[';
+        if (back >= 10) seq[k++] = '0' + (back / 10);
+        seq[k++] = '0' + (back % 10);
+        seq[k++] = 'D';
+        u_printn(seq, k);
+    }
+}
+
+/* 在光标处插入一个字符（bash 风格：把右侧字符右推） */
+static void edit_insert(char c)
+{
+    if (g_len >= LINE_MAX - 1) return;
+    if (g_cur < g_len)
+        memmove(g_line + g_cur + 1, g_line + g_cur, g_len - g_cur);
+    g_line[g_cur] = c;
+    g_len++; g_cur++;
+    u_printn(&c, 1);                       /* 打印新字符 */
+    redraw_from_cursor();                  /* 重绘余下并移回光标 */
+}
+
+static void edit_backspace(void)           /* 删光标前一个字符 */
+{
+    if (g_cur <= 0) return;
+    g_cur--;
+    memmove(g_line + g_cur, g_line + g_cur + 1, g_len - g_cur);
+    g_len--;
+    redraw_from_cursor();
+}
+
+static void edit_delete(void)              /* 删光标后一个字符 (Del) */
+{
+    if (g_cur >= g_len) return;
+    memmove(g_line + g_cur, g_line + g_cur + 1, g_len - g_cur);
+    g_len--;
+    redraw_from_cursor();
+}
+
+static void edit_left(void)  { if (g_cur > 0)  { g_cur--; u_print("\x1b[D"); } }
+static void edit_right(void) { if (g_cur < g_len) { g_cur++; u_print("\x1b[C"); } }
+static void edit_home(void)
+{
+    if (g_cur > 0) {
+        char seq[16]; int k = 0;
+        seq[k++] = '\x1b'; seq[k++] = '[';
+        if (g_cur >= 10) seq[k++] = '0' + (g_cur / 10);
+        seq[k++] = '0' + (g_cur % 10);
+        seq[k++] = 'D';
+        u_printn(seq, k);
+        g_cur = 0;
+    }
+}
+static void edit_end(void)
+{
+    if (g_cur < g_len) {
+        char seq[16]; int k = 0;
+        int d = g_len - g_cur;
+        seq[k++] = '\x1b'; seq[k++] = '[';
+        if (d >= 10) seq[k++] = '0' + (d / 10);
+        seq[k++] = '0' + (d % 10);
+        seq[k++] = 'C';
+        u_printn(seq, k);
+        g_cur = g_len;
+    }
+}
+
+/* 载入历史第 idx 条到编辑行（idx 0..count-1，0=最旧） */
+static void hist_load(int idx)
+{
+    const char *hs = g_hist[idx];
+    int i = 0;
+    while (hs[i] && i < LINE_MAX - 1) { g_line[i] = hs[i]; i++; }
+    g_line[i] = '\0';
+    g_len = i; g_cur = i;
+}
+
+/* 载入“当前新行”（清空） */
+static void hist_load_new(void)
+{
+    g_line[0] = '\0'; g_len = 0; g_cur = 0;
+}
+
+/* Tab 补全：对当前光标所在词的目录/基础名前缀做文件名匹配。
+ * 唯一匹配直接补全（目录补 '/'）；多匹配先补公共前缀再列出候选。 */
+static void edit_tab_complete(void)
+{
+    /* 取当前词（光标前的最后一段，按空格/重定向/管道切分） */
+    int ws = g_cur;
+    while (ws > 0 &&
+           g_line[ws-1] != ' ' && g_line[ws-1] != '>' &&
+           g_line[ws-1] != '|' && g_line[ws-1] != '\n')
+        ws--;
+    int fraglen = g_cur - ws;
+    if (fraglen == 0) return;
+
+    char frag[LINE_MAX];
+    memcpy(frag, g_line + ws, fraglen); frag[fraglen] = 0;
+
+    /* 拆目录部分与基础名 */
+    char dir[PATH_MAX]; char base[LINE_MAX];
+    const char *slash = strrchr(frag, '/');
+    if (slash) {
+        int dlen = (int)(slash - frag);
+        memcpy(dir, frag, dlen); dir[dlen] = 0;
+        strcpy(base, slash + 1);
+        if (dir[0] != '/') {
+            /* 相对路径：基于 g_cwd 拼接 */
+            snprintf(dir, sizeof dir, "%s%s", g_cwd,
+                     (g_cwd[0] && g_cwd[strlen(g_cwd)-1] != '/') ? "/" : "");
+            strncat(dir, frag, sizeof(dir) - strlen(dir) - 1);
+        }
+    } else {
+        strncpy(dir, g_cwd, sizeof dir); dir[sizeof(dir)-1] = 0;
+        strcpy(base, frag);
+    }
+
+    /* 枚举目录匹配项 */
+    char matches[64][LINE_MAX];
+    uint8_t matchtype[64];
+    int nmatch = 0;
+    DIR *dp = opendir(dir);
+    if (dp) {
+        struct dirent *de;
+        while ((de = readdir(dp)) != NULL && nmatch < 64) {
+            if (de->d_name[0] == '.' && base[0] != '.') continue;
+            if (strncmp(de->d_name, base, strlen(base)) == 0) {
+                strncpy(matches[nmatch], de->d_name, LINE_MAX - 1);
+                matches[nmatch][LINE_MAX - 1] = 0;
+                matchtype[nmatch] = de->d_type;
+                nmatch++;
+            }
+        }
+        closedir(dp);
+    }
+    if (nmatch == 0) return;
+
+    if (nmatch == 1) {
+        char add[LINE_MAX];
+        bool isdir = (matches[0][0] && matchtype[0] == DT_DIR);
+        snprintf(add, sizeof add, "%s%s", matches[0] + strlen(base),
+                 isdir ? "/" : "");
+        for (int i = 0; add[i]; i++) edit_insert(add[i]);
+        return;
+    }
+    /* 多匹配：补公共前缀 */
+    int common = strlen(base);
+    for (;;) {
+        char ch = matches[0][common];
+        if (!ch) break;
+        bool same = true;
+        for (int i = 1; i < nmatch; i++)
+            if (matches[i][common] != ch) { same = false; break; }
+        if (!same) break;
+        common++;
+    }
+    if (common > (int)strlen(base)) {
+        char add[LINE_MAX];
+        snprintf(add, sizeof add, "%s", matches[0] + strlen(base));
+        add[common - strlen(base)] = 0;
+        for (int i = 0; add[i]; i++) edit_insert(add[i]);
+    }
+    /* 列出候选 */
+    u_print("\r\n");
+    for (int i = 0; i < nmatch; i++) {
+        u_print("  "); u_print(matches[i]); u_print("\r\n");
+    }
+    prompt();
+    redraw_full();
+}
+
 
 /* ---- 行编辑转义序列状态机 ---- */
 #define ESC_NONE 0
 #define ESC_ESC  1   /* 已收到 ESC */
 #define ESC_BRK  2   /* 已收到 ESC [ */
 static int g_esc = ESC_NONE;
+static int g_esc_num = 0;   /* ESC[ 之后的数字前缀（如 Delete 的 3） */
 
 static void prompt(void)
 {
@@ -770,8 +973,6 @@ static void libc_selftest(void)
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    char line[LINE_MAX];
-    uint32_t len = 0;
 
     /* 初始化家目录环境变量（bash 风格） */
     setenv("HOME", "/", 1);
@@ -782,6 +983,7 @@ int main(int argc, char **argv)
     libc_selftest();
     sys_port_claim(SHELL_PORT);    /* A2 项：认领 shell 接收端口 */
     u_print("Type 'help' for commands.\n\n");
+    g_len = 0; g_cur = 0; g_line[0] = 0; g_hist_idx = g_hist_count;
     prompt();
 
     for (;;) {
@@ -794,42 +996,50 @@ int main(int argc, char **argv)
         }
         char c = *((char *)g_rx + sizeof(*h));
 
-        /* ---- 方向键转义序列状态机 ---- */
+        /* ---- 方向键转义序列状态机 ----
+         * input_server 把 PS/2 方向键编码为 ANSI 转义字节流逐字节送达：
+         *   ESC [ A  上      ESC [ B  下      ESC [ C  右
+         *   ESC [ D  左      ESC [ H  Home    ESC [ F  End
+         *   ESC [ 3 ~  Delete（带数字前缀，需缓存）             */
         if (g_esc == ESC_ESC) {
-            if (c == '[') { g_esc = ESC_BRK; continue; }
-            g_esc = ESC_NONE;  /* 非 [ 则取消转义 */
+            if (c == '[') { g_esc = ESC_BRK; g_esc_num = 0; continue; }
+            g_esc = ESC_NONE;          /* 非 [ 则取消转义 */
         }
         if (g_esc == ESC_BRK) {
-            g_esc = ESC_NONE;
-            if (c == 'A') {  /* 上：历史上一条 */
-                if (g_hist_count > 0) {
-                    if (g_hist_idx > 0) g_hist_idx--;
-                    int idx = g_hist_idx;
-                    /* 清当前行 */
-                    for (uint32_t i = 0; i < len; i++) u_print("\b \b");
-                    len = 0;
-                    const char *hs = g_hist[idx];
-                    while (hs[len] && len < LINE_MAX - 1) { line[len] = hs[len]; len++; }
-                    line[len] = '\0';
-                    u_print(hs);
-                }
+            if (c >= '0' && c <= '9') {        /* 缓存数字（如 Delete 的 '3'） */
+                g_esc_num = g_esc_num * 10 + (c - '0');
                 continue;
             }
-            if (c == 'B') {  /* 下：历史下一条 */
-                if (g_hist_count > 0 && g_hist_idx < g_hist_count) {
-                    g_hist_idx++;
-                    for (uint32_t i = 0; i < len; i++) u_print("\b \b");
-                    len = 0;
-                    if (g_hist_idx < g_hist_count) {
-                        const char *hs = g_hist[g_hist_idx];
-                        while (hs[len] && len < LINE_MAX - 1) { line[len] = hs[len]; len++; }
-                        line[len] = '\0';
-                        u_print(hs);
+            if (c == '~') {                    /* 数字型末尾，如 ESC[3~ */
+                if (g_esc_num == 3) edit_delete();   /* Delete 键 */
+                g_esc = ESC_NONE; g_esc_num = 0; continue;
+            }
+            int code = c;
+            g_esc = ESC_NONE; g_esc_num = 0;
+            switch (code) {
+                case 'A':   /* 上：历史上一条 */
+                    if (g_hist_count > 0 && g_hist_idx > 0) {
+                        g_hist_idx--;
+                        redraw_full();
+                        hist_load(g_hist_idx);
+                        redraw_full();
                     }
-                }
-                continue;
+                    break;
+                case 'B':   /* 下：历史下一条（到末尾则回到新行） */
+                    if (g_hist_count > 0 && g_hist_idx < g_hist_count) {
+                        g_hist_idx++;
+                        redraw_full();
+                        if (g_hist_idx < g_hist_count) hist_load(g_hist_idx);
+                        else hist_load_new();
+                        redraw_full();
+                    }
+                    break;
+                case 'C':   edit_right();  break;   /* 右移光标 */
+                case 'D':   edit_left();   break;   /* 左移光标 */
+                case 'H':   edit_home();   break;   /* Home */
+                case 'F':   edit_end();    break;   /* End */
+                default: break;                       /* 其它忽略 */
             }
-            /* 其它方向键忽略 */
             continue;
         }
         if (c == 0x1B) {  /* ESC：进入转义序列 */
@@ -837,28 +1047,28 @@ int main(int argc, char **argv)
             continue;
         }
 
-        if (c == '\b') {
-            if (len > 0) {
-                len--;
-                u_print("\b \b");
-            }
+        if (c == '\b' || c == 0x7F) {   /* Backspace / DEL(0x7F) */
+            edit_backspace();
             continue;
         }
-        if (c == '\n') {
+        if (c == '\t') {                /* Tab：补全 */
+            edit_tab_complete();
+            continue;
+        }
+        if (c == '\n' || c == '\r') {
             u_print("\n");
-            line[len] = '\0';
-            if (len > 0) {
-                hist_push(line);
+            g_line[g_len] = '\0';
+            if (g_len > 0) {
+                hist_push(g_line);
                 g_hist_idx = g_hist_count;   /* 浏览游标回到“新行” */
-                run_command(line);
+                run_command(g_line);
             }
-            len = 0;
+            g_len = 0; g_cur = 0; g_line[0] = 0;
             prompt();
             continue;
         }
-        if (len < LINE_MAX - 1 && c >= 32 && c < 127) {
-            line[len++] = c;
-            u_printn(&c, 1);                 /* 回显 */
+        if (c >= 32 && c < 127) {       /* 可打印字符：光标处插入 */
+            edit_insert((char)c);
         }
     }
     return 0;

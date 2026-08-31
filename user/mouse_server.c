@@ -44,12 +44,15 @@ typedef struct mouse_packet {
 } mouse_packet_t;
 
 
-/* 鼠标事件消息：mouse_server -> display_server（MOUSE_PORT）。
- * msgh_id 区分事件类型。坐标由 mouse_server 维护，display_server 用自身
- * 分辨率二次 clamp 后绘制光标。 */
-#define MOUSE_MSG_MOVE  1   /* 光标移动（含按钮状态） */
-#define MOUSE_MSG_BUTTON 2  /* 按钮状态变化（按下/松开） */
-#define MOUSE_MSG_WHEEL 3   /* 滚轮事件 */
+/* 鼠标事件消息：mouse_server -> display_server（经 DISPLAY_PORT 投递）。
+ * msgh_id 区分事件类型，且必须与 display_server 的 id 分区一致：
+ *   文本 DISP_MSG_TEXT = 1（由内核 user_puts 转发），若鼠标也用 1 会造成歧义，
+ *   故鼠标事件采用独立 id 段（>=100），与文本彻底隔离。
+ * 坐标由 mouse_server 维护（绝对坐标，默认 1024x768 基准），display_server
+ * 收到后用自身实际分辨率二次 clamp 后绘制光标。 */
+#define MOUSE_MSG_MOVE  101   /* 光标移动（含按钮状态） */
+#define MOUSE_MSG_BUTTON 102  /* 按钮状态变化（按下/松开） */
+#define MOUSE_MSG_WHEEL 103   /* 滚轮事件 */
 
 typedef struct mouse_event_msg {
     mach_msg_header_t h;

@@ -65,11 +65,6 @@ static volatile uint32_t g_rhead = 0, g_rtail = 0;
 static bool g_shift = false;
 static bool g_caps  = false;
 
-/* 诊断计数（轻量，仅供串口观测运行期 IRQ 路由；不影响逻辑） */
-static volatile uint32_t g_kirq_cnt = 0;        /* kbd IRQ 触发次数 */
-static volatile uint32_t g_kirq_aux = 0;        /* 其中 STS_AUX=1 的次数 */
-static volatile uint32_t g_kirq_to_mouse = 0;   /* 转交鼠标的次数 */
-
 static void kbd_push(char c)
 {
     uint32_t next = (g_head + 1) % KBD_BUF_SIZE;
@@ -152,17 +147,10 @@ static void kbd_irq_handler(registers_t *r)
         return;                 /* 无数据（spurious，忽略） */
     }
     uint8_t sc = inb(KBD_DATA);
-    g_kirq_cnt++;
     if (st & STS_AUX) {
-        g_kirq_aux++;
-        g_kirq_to_mouse++;
         mouse_feed_byte(sc);    /* 鼠标 */
     } else {
         kbd_feed_byte(sc);      /* 键盘 */
-    }
-    if ((g_kirq_cnt & 0xFF) == 0) {
-        kprintf("[kbd-diag] irq=%u aux=%u to_mouse=%u\n",
-                g_kirq_cnt, g_kirq_aux, g_kirq_to_mouse);
     }
 }
 

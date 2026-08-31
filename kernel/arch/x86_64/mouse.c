@@ -74,9 +74,6 @@ static bool g_have_wheel = false;
 static mouse_packet_t g_last;
 static volatile bool g_have_last = false;
 
-/* 诊断计数（轻量，仅供串口观测运行期 PS/2 包拼装；不影响逻辑） */
-static volatile uint32_t g_mirq_pktdone = 0;    /* 完成拼包次数 */
-
 static void mse_wait_input(void)
 {
     for (int i = 0; i < 100000; i++) {
@@ -191,11 +188,6 @@ void mouse_feed_byte(uint8_t b)
     if (g_pkt_idx >= g_pkt_len) {
         mse_parse();
         g_pkt_idx = 0;
-        g_mirq_pktdone++;
-        if ((g_mirq_pktdone & 0xFF) == 0) {
-            kprintf("[mouse-diag] pktdone=%u (dx=%d dy=%d btn=%u)\n",
-                    g_mirq_pktdone, g_last.dx, g_last.dy, g_last.buttons);
-        }
     }
 }
 

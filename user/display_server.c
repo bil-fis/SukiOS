@@ -413,6 +413,10 @@ static void csi_dispatch(char final)
     case 'D':   /* 光标左移 */
         g_term_x = (g_term_x >= (uint32_t)n) ? g_term_x - (uint32_t)n : 0;
         break;
+    case 'G':   /* 光标水平绝对定位 CHA：ESC[<col>G（1-based） */
+        g_term_x = (g_csi_has_n && g_csi_n >= 1) ? (uint32_t)(g_csi_n - 1) : 0;
+        if (g_term_x >= g_term_cols) g_term_x = g_term_cols ? g_term_cols - 1 : 0;
+        break;
     case 'H':   /* 光标定位（本服务按归位处理：shell 只发 ESC[H） */
         g_term_x = 0;
         g_term_y = 0;

@@ -121,19 +121,39 @@ static void ed_right(int n)
     ed_raw(seq);
 }
 
-/* 从编辑行起点起重绘整行（清行尾 + 重印 g_line + 把光标移回 g_cur）。
- * 关键：先按 g_scr_x 回退到编辑行起点，再清屏，否则清行尾会从错误列开始，
- * 旧字符（如刚被退格删除的那个）会残留在屏幕上——这正是「退格不好使」的根因。 */
+/* 用【绝对列定位】重绘整行。
+ * 做法：先以 CHA(ESC[<col>G) 跳到编辑行起点列，再以 ESC[K 清到行尾（保留提示符），
+ * 重印整行，最后把光标定位到 g_cur。
+ *
+ * 为什么必须绝对定位：之前（step55/56）用 ed_left(g_scr_x - g_prompt_col) 相对回退到行首，
+ * 这要求 g_scr_x 与显示侧 g_term_x 绝对同步。但凡命令输出未以换行结尾、或 clear 之后
+ * 终端光标落在非预期列，二者就会失步——清行尾从错误列开始，旧字符（典型如 "lsear" 里
+ * 的 "ear"）无法被完整清除。绝对列定位完全不依赖 g_scr_x，每次都落在当前编辑行的正确
+ * 列，因此无论之前光标被带偏到哪，ESC[K 都从编辑行起点清起，残留必被抹掉。 */
+static void redraw_full_line(void)
+{
+    char seq[16]; int k;
+    k = 0; seq[k++] = '\x1b'; seq[k++] = '[';
+    int col = g_prompt_col + 1;                  /* 1-based 绝对列 */
+    if (col >= 10) seq[k++] = '0' + col / 10;
+    seq[k++] = '0' + col % 10;
+    seq[k++] = 'G';
+    ed_raw(seq);                                 /* 跳到编辑行起点列 */
+    ed_raw("\x1b[K");                            /* 清到行尾（保留提示符） */
+    ed_raw(g_line);                              /* 重印整行 */
+    k = 0; seq[k++] = '\x1b'; seq[k++] = '[';    /* 光标定位到 g_cur */
+    col = g_prompt_col + g_cur + 1;
+    if (col >= 10) seq[k++] = '0' + col / 10;
+    seq[k++] = '0' + col % 10;
+    seq[k++] = 'G';
+    ed_raw(seq);
+    g_scr_x = g_prompt_col + g_cur;              /* 同步镜像，供 edit_* 相对移动使用 */
+}
+
+/* 从光标处起重绘（保持光标位置）——统一走 redraw_full_line 的绝对列定位版本 */
 static void redraw_from_cursor(void)
 {
-    int back_to_start = g_scr_x - g_prompt_col;   /* 终端光标距编辑行起点的偏移 */
-    if (back_to_start > 0) ed_left(back_to_start); /* 回到编辑行起点 */
-    ed_raw("\x1b[K");                             /* 清到行尾 */
-    ed_raw(g_line);                               /* 重印整行 */
-    int target = g_prompt_col + g_cur;            /* 光标应处的列 */
-    int delta = target - g_scr_x;                 /* 重印后 g_scr_x = 起点+g_len */
-    if (delta < 0)      ed_left(-delta);
-    else if (delta > 0) ed_right(delta);
+    redraw_full_line();
 }
 
 /* 在光标处插入一个字符（bash 风格：把右侧字符右推） */
@@ -201,7 +221,7 @@ static void line_replace(const char *text)
         g_len = 0;
     }
     g_cur = g_len;
-    ed_raw(g_line);
+    redraw_full_line();
 }
 
 /* Tab 补全：对当前光标所在词的目录/基础名前缀做文件名匹配。
@@ -294,10 +314,9 @@ static void edit_tab_complete(void)
     }
     prompt();
     /* prompt() 之后光标位于编辑行起点（提示符之后），g_scr_x 已重置。
-     * 只需清行尾并重印整行；用 ed_raw 同步镜像，避免后续编辑错位。 */
-    ed_raw("\x1b[K");
-    ed_raw(g_line);
+     * 用绝对列重绘整行，保证与显示侧一致、无残留。 */
     g_cur = g_len;
+    redraw_full_line();
 }
 
 

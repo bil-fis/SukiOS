@@ -331,9 +331,109 @@ static void draw_glyph(uint32_t ox, uint32_t oy, uint8_t ch, uint32_t fg)
     }
 }
 
+/* ---- ANSI/VT100 转义序列（CSI）解析状态 ----
+ * shell 的行内编辑依赖控制序列（清行尾 ESC[K、光标移动 ESC[nD / ESC[nC、
+ * 归位 ESC[H、清屏 ESC[2J）。若本服务把 '[' 'K' 'D' 等当普通字符栅格化，
+ * 屏幕上就会出现 "[k" 之类的垃圾字符——故必须在此解析并执行这些序列。 */
+#define CSI_NONE 0
+#define CSI_ESC  1   /* 已收到 ESC */
+#define CSI_BRK  2   /* 已收到 ESC [ （正在收集参数，等待终结字母） */
+static int g_esc_state = CSI_NONE;
+static int g_csi_n = 0;        /* 第一个数值参数 */
+static int g_csi_has_n = 0;    /* 是否显式给出了参数 */
+
+/* 清除第 row 行 [x0, x1) 列的像素（用窗口背景色填充） */
+static void clear_cols(uint32_t row, uint32_t x0, uint32_t x1)
+{
+    if (x1 > g_term_cols) x1 = g_term_cols;
+    if (x0 >= x1) return;
+    uint32_t px = CON_MARGIN + x0 * CHAR_W;
+    uint32_t py = TITLE_H + CON_MARGIN + row * CHAR_H;
+    fill_rect(px, py, (x1 - x0) * CHAR_W, CHAR_H, COL_WINBG);
+}
+
+/* 清屏：只清终端客户区并让光标归位（保留桌面与标题栏） */
+static void clear_screen_area(void)
+{
+    uint32_t wx = CON_MARGIN + 2;
+    uint32_t wy = TITLE_H + CON_MARGIN + 2;
+    uint32_t ww = g_fb_width  - CON_MARGIN * 2 - 4;
+    uint32_t wh = g_fb_height - TITLE_H - CON_MARGIN * 2 - 4;
+    fill_rect(wx, wy, ww, wh, COL_WINBG);
+    g_term_x = 0;
+    g_term_y = 0;
+}
+
+/* 执行一条 CSI 序列（终结字母 final） */
+static void csi_dispatch(char final)
+{
+    int n = g_csi_has_n ? g_csi_n : 1;   /* 缺省参数为 1（A/B/C/D） */
+    switch (final) {
+    case 'A':   /* 光标上移 */
+        g_term_y = (g_term_y >= (uint32_t)n) ? g_term_y - (uint32_t)n : 0;
+        break;
+    case 'B':   /* 光标下移 */
+        g_term_y += (uint32_t)n;
+        if (g_term_y >= g_term_rows) g_term_y = g_term_rows ? g_term_rows - 1 : 0;
+        break;
+    case 'C':   /* 光标右移 */
+        g_term_x += (uint32_t)n;
+        if (g_term_x >= g_term_cols) g_term_x = g_term_cols ? g_term_cols - 1 : 0;
+        break;
+    case 'D':   /* 光标左移 */
+        g_term_x = (g_term_x >= (uint32_t)n) ? g_term_x - (uint32_t)n : 0;
+        break;
+    case 'H':   /* 光标定位（本服务按归位处理：shell 只发 ESC[H） */
+        g_term_x = 0;
+        g_term_y = 0;
+        break;
+    case 'J':   /* 清屏：n=2 全清；n=0 清光标到屏尾；n=1 清屏首到光标 */
+        if (g_csi_has_n && g_csi_n == 1 && g_term_y > 0) {
+            for (uint32_t r = 0; r < g_term_y; r++) clear_cols(r, 0, g_term_cols);
+            clear_cols(g_term_y, 0, g_term_x);
+        } else {
+            clear_screen_area();
+        }
+        break;
+    case 'K':   /* 清行：n=0 光标到行尾；n=1 行首到光标；n=2 整行 */
+        if (g_csi_has_n && g_csi_n == 2)      clear_cols(g_term_y, 0, g_term_cols);
+        else if (g_csi_has_n && g_csi_n == 1) clear_cols(g_term_y, 0, g_term_x + 1);
+        else                                  clear_cols(g_term_y, g_term_x, g_term_cols);
+        break;
+    case 'm':   /* SGR 颜色/属性：不支持，忽略 */
+    default:
+        break;
+    }
+}
+
 /* 画一个字符到终端客户区当前光标位置，并推进光标 */
 static void term_putc(char c)
 {
+    /* ---- 第一层：转义序列状态机（不绘制任何东西） ---- */
+    if (g_esc_state == CSI_ESC) {
+        if (c == '[') {
+            g_esc_state = CSI_BRK;
+            g_csi_n = 0;
+            g_csi_has_n = 0;
+        } else {
+            g_esc_state = CSI_NONE;   /* ESC 后非 '['：整条序列忽略 */
+        }
+        return;
+    }
+    if (g_esc_state == CSI_BRK) {
+        if (c >= '0' && c <= '9') {           /* 收集数值参数 */
+            if (g_csi_n < 9999) g_csi_n = g_csi_n * 10 + (c - '0');
+            g_csi_has_n = 1;
+            return;
+        }
+        if (c == ';' || c == '?') return;     /* 参数分隔/私有前缀：忽略后续参数 */
+        g_esc_state = CSI_NONE;
+        if (c >= '@' && c <= '~') csi_dispatch(c);   /* 终结字母 */
+        return;                                /* 未知/异常字节：放弃本条序列 */
+    }
+    if (c == 0x1B) { g_esc_state = CSI_ESC; return; }   /* ESC：进入转义 */
+
+    /* ---- 第二层：原有普通字符处理 ---- */
     if (c == '\r') { g_term_x = 0; return; }
     if (c == '\n') { g_term_x = 0; g_term_y++; }
     else if (c == '\t') {

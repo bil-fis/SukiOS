@@ -56,3 +56,8 @@ longjmp:
     /* 实际用 jmp 到恢复地址更稳（longjmp 不返回原栈帧，rsp 已恢复） */
     add rsp, 8            /* 撤销上面的 push */
     jmp rax
+
+/* 声明本目标文件不需要可执行栈：否则链接器会警告
+   "missing .note.GNU-stack section implies executable stack"，
+   且内核载入器按 W^X 策略检查时可能拒绝映像。 */
+    .section .note.GNU-stack,"",@progbits

@@ -57,22 +57,6 @@ static void prompt(void);
 
 /* ============ 行内编辑（光标感知） ============ */
 /* 把光标移回行首并重绘整行（用于历史切换/补全后） */
-static void redraw_full(void)
-{
-    char seq[16]; int k = 0;
-    if (g_cur > 0) {                       /* 先左移光标到行首 */
-        seq[k++] = '\x1b'; seq[k++] = '[';
-        if (g_cur >= 10) seq[k++] = '0' + (g_cur / 10);
-        seq[k++] = '0' + (g_cur % 10);
-        seq[k++] = 'D';
-    }
-    u_printn(seq, k);
-    u_print("\x1b[K");                     /* 清到行尾 */
-    u_print(g_line);                       /* 重印整行 */
-    /* 光标应位于行尾（重印后 g_cur==g_len） */
-    g_cur = g_len;
-}
-
 /* 从光标处起重绘（保持光标位置） */
 static void redraw_from_cursor(void)
 {
@@ -97,8 +81,13 @@ static void edit_insert(char c)
         memmove(g_line + g_cur + 1, g_line + g_cur, g_len - g_cur);
     g_line[g_cur] = c;
     g_len++; g_cur++;
-    u_printn(&c, 1);                       /* 打印新字符 */
-    redraw_from_cursor();                  /* 重绘余下并移回光标 */
+    u_printn(&c, 1);                       /* 回显新字符 */
+    /* 仅当光标右侧还有内容（在行中间插入）时才需要清行尾 + 重绘右侧 +
+     * 把光标移回。在行尾插入是最常见情形，此时不发任何控制序列——避免
+     * 每次按键都向终端倾泻 ESC[K 等序列（既省带宽，也降低终端解析负担）。 */
+    if (g_cur < g_len) {
+        redraw_from_cursor();
+    }
 }
 
 static void edit_backspace(void)           /* 删光标前一个字符 */
@@ -146,20 +135,35 @@ static void edit_end(void)
     }
 }
 
-/* 载入历史第 idx 条到编辑行（idx 0..count-1，0=最旧） */
-static void hist_load(int idx)
+/* 用 text 整体替换当前编辑行（用于历史切换）。text 为 "" 表示回到空的新行。
+ *
+ * 关键：必须【先】按【旧】的 g_cur 把光标左移回行首，再清行，最后打印新内容。
+ * 早期实现是「redraw_full(); hist_load(); redraw_full();」两次重绘——第二次
+ * 的左移量用的是【新】行长，而屏幕上光标实际停在旧行重印之后的位置，二者
+ * 不一致会导致光标错位、旧内容残留（表现为屏幕上莫名出现上一句命令）。
+ * 这里改为单次、顺序正确的重绘：移回行首 -> 清整行 -> 打印新行。 */
+static void line_replace(const char *text)
 {
-    const char *hs = g_hist[idx];
-    int i = 0;
-    while (hs[i] && i < LINE_MAX - 1) { g_line[i] = hs[i]; i++; }
-    g_line[i] = '\0';
-    g_len = i; g_cur = i;
-}
-
-/* 载入“当前新行”（清空） */
-static void hist_load_new(void)
-{
-    g_line[0] = '\0'; g_len = 0; g_cur = 0;
+    char seq[16]; int k = 0;
+    if (g_cur > 0) {                       /* 1) 左移光标回行首（用旧 g_cur） */
+        seq[k++] = '\x1b'; seq[k++] = '[';
+        if (g_cur >= 10) seq[k++] = '0' + (g_cur / 10);
+        seq[k++] = '0' + (g_cur % 10);
+        seq[k++] = 'D';
+        u_printn(seq, k);
+    }
+    u_print("\x1b[K");                     /* 2) 光标已在行首 -> 清整行 */
+    if (text) {                            /* 3) 载入并打印新内容 */
+        int i = 0;
+        while (text[i] && i < LINE_MAX - 1) { g_line[i] = text[i]; i++; }
+        g_line[i] = '\0';
+        g_len = i;
+    } else {
+        g_line[0] = '\0';
+        g_len = 0;
+    }
+    g_cur = g_len;
+    u_print(g_line);
 }
 
 /* Tab 补全：对当前光标所在词的目录/基础名前缀做文件名匹配。
@@ -247,7 +251,12 @@ static void edit_tab_complete(void)
         u_print("  "); u_print(matches[i]); u_print("\r\n");
     }
     prompt();
-    redraw_full();
+    /* 注意：prompt() 之后光标已位于该行起始位置（提示符之后），此时【绝不能】
+     * 再左移光标——否则会退回到提示符内部并把提示符一起清掉。这里只需清行尾
+     * 并重印整行即可（原实现调用 redraw_full() 会左移 g_cur，导致提示符被破坏）。 */
+    u_print("\x1b[K");
+    u_print(g_line);
+    g_cur = g_len;
 }
 
 
@@ -1032,9 +1041,17 @@ int main(int argc, char **argv)
          *   ESC [ 3 ~  Delete（带数字前缀，需缓存）             */
         if (g_esc == ESC_ESC) {
             if (c == '[') { g_esc = ESC_BRK; g_esc_num = 0; continue; }
-            g_esc = ESC_NONE;          /* 非 [ 则取消转义 */
+            /* 非 '['：放弃本条序列，且该字节一并丢弃（不能当普通字符插入，
+               否则 Alt+x 之类的组合会把 'x' 插进命令行）。 */
+            g_esc = ESC_NONE;
+            continue;
         }
         if (g_esc == ESC_BRK) {
+            if (c == 0x1B) {                  /* 序列中途又来一个 ESC：
+                                                 放弃当前半截序列，重新开始，
+                                                 避免 "[A" 之类残留被当文本插入 */
+                g_esc = ESC_ESC; g_esc_num = 0; continue;
+            }
             if (c >= '0' && c <= '9') {        /* 缓存数字（如 Delete 的 '3'） */
                 g_esc_num = g_esc_num * 10 + (c - '0');
                 continue;
@@ -1049,18 +1066,14 @@ int main(int argc, char **argv)
                 case 'A':   /* 上：历史上一条 */
                     if (g_hist_count > 0 && g_hist_idx > 0) {
                         g_hist_idx--;
-                        redraw_full();
-                        hist_load(g_hist_idx);
-                        redraw_full();
+                        line_replace(g_hist[g_hist_idx]);
                     }
                     break;
                 case 'B':   /* 下：历史下一条（到末尾则回到新行） */
                     if (g_hist_count > 0 && g_hist_idx < g_hist_count) {
                         g_hist_idx++;
-                        redraw_full();
-                        if (g_hist_idx < g_hist_count) hist_load(g_hist_idx);
-                        else hist_load_new();
-                        redraw_full();
+                        if (g_hist_idx < g_hist_count) line_replace(g_hist[g_hist_idx]);
+                        else line_replace("");        /* 回到空的新行 */
                     }
                     break;
                 case 'C':   edit_right();  break;   /* 右移光标 */

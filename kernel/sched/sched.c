@@ -1084,6 +1084,10 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     uint64_t next_cr3 = next->cr3;
     spin_unlock_irqrestore(&g_sched_lock, f);
 
+    /* SukiNative PROC 对象退出通知：释放调度锁后调用，内部可安全使用 sched_wake
+     * 唤醒阻塞在 SYS_SUKI_WAIT 上、等待本进程退出的任务。 */
+    suki_proc_notify_exit(t);
+
     if (cr3_switch) {
         vmm_switch(next_cr3);
     }

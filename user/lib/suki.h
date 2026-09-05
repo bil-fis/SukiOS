@@ -356,4 +356,22 @@ suki_status_t suki_obj_query(suki_handle_t h, suki_objinfo_t *info);
 /* 通用工厂：type 为 suki_obj_type_t，a2/a3 类型相关（事件:init,manual；信号量:initial,max） */
 suki_status_t suki_obj_create(uint32_t type, uint64_t a2, uint64_t a3, suki_handle_t *out);
 
+/* ---- SukiNative 文件对象（144..147）---- */
+/* path 为用户态字符串；access 为 SUKI_O_* 标志（见 posix.h），写文件用
+ * SUKI_O_CREAT|SUKI_O_RDWR|SUKI_O_TRUNC 等组合。out 返回文件句柄。 */
+suki_status_t suki_file_open(const char *path, uint32_t access, suki_handle_t *out);
+suki_status_t suki_file_read(suki_handle_t h, void *buf, size_t count, size_t *out_nread);
+suki_status_t suki_file_write(suki_handle_t h, const void *buf, size_t count, size_t *out_nwritten);
+suki_status_t suki_file_close(suki_handle_t h);
+
+/* ---- SukiNative 进程对象（148）---- */
+/* path 为程序路径；argv 为 const char*[] 用户数组（可为 NULL，argc=0）；
+ * out 返回监控句柄，子进程退出后可由 suki_wait 命中（经内核退出通知）。 */
+suki_status_t suki_proc_create(const char *path, int argc, const char **argv, suki_handle_t *out);
+
+/* ---- SukiNative 内存对象（149）---- */
+/* size 为请求字节数（内部页对齐）；out 返回句柄；映射用户地址经
+ * suki_obj_query().base 取得，可直接读写（按需零填充，与 mmap 同机制）。 */
+suki_status_t suki_mem_alloc(uint64_t size, suki_handle_t *out);
+
 #endif /* _SUKI_USER_SUKI_H */

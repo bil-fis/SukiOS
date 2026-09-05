@@ -702,9 +702,12 @@ typedef uint32_t suki_handle_t;
 /* 对象查询信息（SYS_SUKI_OBJ_QUERY 输出；内核/用户布局一致） */
 typedef struct suki_objinfo {
     uint32_t type;     /* suki_obj_type_t */
-    uint32_t state;    /* event:1=signaled; mutex:1=locked; sem:1=有可用计数 */
+    uint32_t state;    /* event:1=signaled; mutex:1=locked; sem:1=有可用计数;
+                        * proc:1=子进程已退出 */
     int32_t  count;    /* sem 当前计数（其余类型 0） */
     uint32_t _pad;
+    uint64_t base;     /* MEM：映射的用户基地址；PROC：子进程 pid（复用） */
+    uint64_t size;     /* MEM：映射区字节数；其余类型 0 */
 } suki_objinfo_t;
 
 /* ---- H. 网络（150..169）：socket 号位预留（协议栈未就绪，调用返回 -ENOSYS）---- */

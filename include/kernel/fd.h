@@ -68,6 +68,12 @@ typedef struct fd_entry {
     struct fd_pipe *pipe;
 
     char    *path;          /* 打开时的路径副本（诊断 / 未来 getcwd 用） */
+
+    /* SukiNative FILE 对象独占标记：由 SukiNative SYS_SUKI_FILE_OPEN 打开的 fd 置 true。
+     * 任务退出时 fd_exit_task 跳过此类槽（不清 fds、不降引用、不释放），改由持有它的
+     * SukiNative FILE 对象在引用归零（显式 CLOSE 或任务退出回收句柄表）时统一调
+     * fd_close 释放，避免任务退出路径与对象销毁路径对同一 fd 双重关闭。 */
+    bool     suki_owned;
 } fd_entry_t;
 
 /* 管道对象：读写两端共享，独立引用计数，归零才释放 */
@@ -103,6 +109,10 @@ void fd_release_slot(int slot);
 int          fd_open(struct task *t, const char *path, int flags, uint32_t mode);
 int          fd_close(struct task *t, int fd);
 suki_ssize_t fd_read(struct task *t, int fd, void *ubuf, size_t count);
+/* 内核态读：数据直接写入内核缓冲 kbuf（不经 copy_to_user）。
+ * 仅供内核自身把 ELF 映像等载入内核空间（如 SukiNative PROC_CREATE）使用。
+ * 仅支持常规文件后端（DISK/TMPFS/DEVFS）；TTY/PIPE/DIR 返回 -EINVAL。 */
+suki_ssize_t fd_read_kern(struct task *t, int fd, void *kbuf, size_t count);
 suki_ssize_t fd_write(struct task *t, int fd, const void *ubuf, size_t count);
 suki_off_t   fd_lseek(struct task *t, int fd, suki_off_t off, int whence);
 int          fd_fstat(struct task *t, int fd, suki_stat_t *out);

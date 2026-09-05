@@ -116,3 +116,55 @@ suki_status_t suki_obj_create(uint32_t type, uint64_t a2, uint64_t a3, suki_hand
     *out = (suki_handle_t)h;
     return 0;
 }
+
+/* ---- SukiNative 文件对象（144..147）---- */
+suki_status_t suki_file_open(const char *path, uint32_t access, suki_handle_t *out)
+{
+    int64_t h = __suki_syscall4(SYS_SUKI_FILE_OPEN,
+                                (uint64_t)path, (uint64_t)access, 0, (uint64_t)out);
+    if (h < 0)
+        return (suki_status_t)h;
+    *out = (suki_handle_t)h;
+    return 0;
+}
+
+suki_status_t suki_file_read(suki_handle_t h, void *buf, size_t count, size_t *out_nread)
+{
+    return (suki_status_t)__suki_syscall4(SYS_SUKI_FILE_READ,
+                                          (uint64_t)h, (uint64_t)buf, (uint64_t)count,
+                                          (uint64_t)out_nread);
+}
+
+suki_status_t suki_file_write(suki_handle_t h, const void *buf, size_t count, size_t *out_nwritten)
+{
+    return (suki_status_t)__suki_syscall4(SYS_SUKI_FILE_WRITE,
+                                          (uint64_t)h, (uint64_t)buf, (uint64_t)count,
+                                          (uint64_t)out_nwritten);
+}
+
+suki_status_t suki_file_close(suki_handle_t h)
+{
+    return (suki_status_t)__suki_syscall1(SYS_SUKI_FILE_CLOSE, (uint64_t)h);
+}
+
+/* ---- SukiNative 进程对象（148）---- */
+suki_status_t suki_proc_create(const char *path, int argc, const char **argv, suki_handle_t *out)
+{
+    int64_t h = __suki_syscall4(SYS_SUKI_PROC_CREATE,
+                                (uint64_t)path, (uint64_t)argv, (uint64_t)argc,
+                                (uint64_t)out);
+    if (h < 0)
+        return (suki_status_t)h;
+    *out = (suki_handle_t)h;
+    return 0;
+}
+
+/* ---- SukiNative 内存对象（149）---- */
+suki_status_t suki_mem_alloc(uint64_t size, suki_handle_t *out)
+{
+    int64_t h = __suki_syscall2(SYS_SUKI_MEM_ALLOC, (uint64_t)size, (uint64_t)out);
+    if (h < 0)
+        return (suki_status_t)h;
+    *out = (suki_handle_t)h;
+    return 0;
+}

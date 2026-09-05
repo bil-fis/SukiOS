@@ -124,6 +124,9 @@ typedef struct task {
     int                 suki_wait_n;
     suki_object_t      *suki_wait_set[SUKI_MAX_WAIT];
     bool                suki_wait_active;
+    suki_object_t      *suki_exit_notify;  /* 子任务退出通知链：本任务作为被监控的子进程时，
+                                            * 所有「监控本任务的 PROC 对象」挂在此链上；
+                                            * suki_proc_notify_exit 遍历并脱离。仅 PROC 对象用。 */
 } task_t;
 
 /* FPU/SSE 状态保存与恢复原语（实现见 sched/switch.S） */

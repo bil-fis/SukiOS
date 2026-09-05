@@ -309,6 +309,12 @@ void fd_exit_task(struct task *t)
     for (int i = 0; i < SUKI_FD_MAX; i++) {
         int s = t->fds[i];
         if (s >= 0 && s < FD_SLOT_MAX) {
+            /* SukiNative FILE 对象独占的 fd：跳过（不清 fds、不降引用、不释放）。
+             * 由持有它的 SukiNative FILE 对象在引用归零时统一 fd_close 释放，
+             * 避免与对象销毁路径对同一 fd 双重关闭。 */
+            if (g_fd_slots[s].suki_owned) {
+                continue;
+            }
             t->fds[i] = -1;
             if (slot_deref_locked(s) && npending < SUKI_FD_MAX) {
                 pending[npending++] = s;
@@ -817,6 +823,108 @@ suki_ssize_t fd_read(struct task *t, int fd, void *ubuf, size_t count)
     if (copy_to_user(ubuf, data, (size_t)nread) != (size_t)nread) {
         return -SUKI_EFAULT;
     }
+    return (suki_ssize_t)nread;
+}
+
+/*
+ * fd_read_kern —— 内核态读变体。
+ *
+ * 背景：普通 fd_read 把 FS/后端数据经 copy_to_user() 写回【用户虚拟地址】，
+ * 因为 syscall 语义要求数据最终落到调用进程的用户缓冲。但内核自身需要把
+ * 文件内容（典型如 SukiNative PROC_CREATE 要装载的 ELF 映像）读进【内核
+ * 虚拟地址】再交给 elf_load()，此时若仍用 fd_read，copy_to_user 的内核地址
+ * 校验会失败、返回 -EFAULT，导致读到 0 字节、blob 为空、elf_load 失败。
+ *
+ * 本函数对所有「常规文件」后端（DISK=FS_SERVER / TMPFS / DEVFS）直接把数据
+ * memcpy 进内核缓冲 kbuf，不经过用户指针校验。TTY/PIPE/DIR 不是合法的
+ * 可执行装载源，且需要用户虚拟地址做 copy_to_user，故直接返回 -EINVAL。
+ *
+ * 注意：DISK 后端的文件偏移由 FS_SERVER 侧按后端 fd 维护，内核 fd 层不碰
+ * e->offset（与 fd_read 的 DISK 分支保持一致），故此处也不更新。
+ */
+suki_ssize_t fd_read_kern(struct task *t, int fd, void *kbuf, size_t count)
+{
+    if (count == 0) {
+        return 0;
+    }
+    fd_entry_t *e = fd_get(t, fd);
+    if (!e) {
+        return -SUKI_EBADF;
+    }
+    if ((e->flags & SUKI_O_ACCMODE) == SUKI_O_WRONLY) {
+        return -SUKI_EBADF;
+    }
+    if (e->type == FD_TYPE_TTY || e->type == FD_TYPE_PIPE) {
+        return -SUKI_EINVAL;            /* 需用户虚拟地址做 copy_to_user，非装载源 */
+    }
+    if (e->type == FD_TYPE_DIR) {
+        return -SUKI_EISDIR;
+    }
+
+    if (e->vfs_backend == FD_BACKEND_TMPFS) {
+        /* 内建 tmpfs 文件读：直接读进内核缓冲（offset 用 fd 偏移） */
+        uint64_t nread = 0;
+        int rc = tmpfs_read(e->backend, (uint8_t *)kbuf, (uint32_t)count, &nread);
+        if (rc < 0) {
+            return rc;
+        }
+        e->offset += nread;
+        return (suki_ssize_t)nread;
+    }
+    if (e->vfs_backend == FD_BACKEND_DEVFS) {
+        /* 内建 devfs 字符设备读：直接读进内核缓冲 */
+        uint64_t nread = 0;
+        int rc = devfs_read((uint32_t)e->backend, (uint8_t *)kbuf,
+                            (uint32_t)count, e->offset, &nread);
+        if (rc < 0) {
+            return rc;
+        }
+        e->offset += nread;
+        return (suki_ssize_t)nread;
+    }
+    if (e->backend < 0) {
+        return -SUKI_EBADF;
+    }
+
+    uint32_t want = (count > FS_READ_MAX) ? FS_READ_MAX : (uint32_t)count;
+    uint8_t *req = rpc_req_buf();
+    uint32_t reqsz = (uint32_t)(sizeof(mach_msg_header_t)
+                                + sizeof(fs_read_req_t));
+    memset(req, 0, reqsz);
+    mach_msg_header_t *h = (mach_msg_header_t *)req;
+    h->msgh_bits = 0;
+    h->msgh_size = reqsz;
+    h->msgh_id = FS_MSG_READFD;
+    fs_read_req_t *rr = (fs_read_req_t *)(req + sizeof(mach_msg_header_t));
+    rr->fd = (uint32_t)e->backend;
+    rr->length = want;
+
+    uint32_t got = 0;
+    int rc = fs_rpc(req, reqsz, &got);
+    if (rc < 0) {
+        return rc;
+    }
+    uint8_t *resp = rpc_resp_buf();
+    fs_resp_t *fr = resp_hdr(resp);
+    if (fr->status != FS_OK) {
+        return fs_status_to_errno(fr->status);
+    }
+    if (got < RESP_RET_SIZE) {
+        return -SUKI_EIO;
+    }
+    int64_t nread = resp_ret(resp)->value;
+    if (nread < 0) {
+        return fs_status_to_errno((uint32_t)(-nread));
+    }
+    if (nread == 0) {
+        return 0;                       /* EOF */
+    }
+    if ((uint32_t)nread > FS_READ_MAX
+        || got < RESP_RET_SIZE + (uint32_t)nread) {
+        return -SUKI_EIO;
+    }
+    const uint8_t *data = resp + RESP_RET_SIZE;
+    memcpy(kbuf, data, (size_t)nread);  /* 内核->内核，不经 copy_to_user */
     return (suki_ssize_t)nread;
 }
 

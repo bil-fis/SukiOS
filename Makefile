@@ -146,7 +146,8 @@ USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/pthread.c.o \
                   $(BUILD)/user/lib/signal.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o \
-                  $(BUILD)/user/lib/setjmp.S.o
+                  $(BUILD)/user/lib/setjmp.S.o \
+                 $(BUILD)/user/lib/suki_native.c.o
 
 # FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接
 # DISK_PORT IPC 做磁盘 IO。ff.c + ffunicode.c 编入 fs_server 的 blob/elf。

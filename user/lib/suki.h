@@ -323,4 +323,37 @@ char  *u_utoa_s(uint64_t v, char *buf, size_t size); /* 十进制，长度安全
 char  *u_utoa(uint64_t v, char *buf);           /* 兼容包装(=u_utoa_s(v,buf,24))，
                                                  * 缓冲须 >=24 字节；新代码勿用 */
 
+/* ---- SukiNative 原生对象 API（130..149）----
+ * libsuki 封装（实现见 user/lib/suki_native.c）。一切皆对象，返回 suki_handle_t 句柄，
+ * 用 suki_status_t 状态码（0=成功，<0=SUKI_E* 错误）。与 POSIX 平行，新服务可直接用。
+ * 类型/标志常量来自 <sukios/posix.h>（suki_obj_type_t / suki_handle_t /
+ * suki_objinfo_t / SUKI_WAIT_*）。 */
+typedef int64_t suki_status_t;
+
+/* 事件：init_signaled=初始是否已触发，manual_reset=手动复位(否则 wait 命中后自动消费) */
+suki_status_t suki_event_create(bool init_signaled, bool manual_reset, suki_handle_t *out);
+suki_status_t suki_event_set(suki_handle_t h);
+suki_status_t suki_event_reset(suki_handle_t h);
+
+suki_status_t suki_mutex_create(suki_handle_t *out);
+suki_status_t suki_mutex_lock(suki_handle_t h);
+suki_status_t suki_mutex_unlock(suki_handle_t h);
+
+/* 信号量：initial/max 为初值与上限 */
+suki_status_t suki_sem_create(uint32_t initial, uint32_t max, suki_handle_t *out);
+suki_status_t suki_sem_acquire(suki_handle_t h);
+suki_status_t suki_sem_release(suki_handle_t h);
+
+/* 多对象等待：handles[count] 句柄数组；flags=SUKI_WAIT_ANY/ALL/NO_BLOCK；
+ * timeout_ms 暂未实现（0=无限等待）；命中写 *out_index。返回 0 命中，<0 错误。 */
+suki_status_t suki_wait(const suki_handle_t *handles, size_t count, uint32_t flags,
+                        uint64_t timeout_ms, size_t *out_index);
+
+suki_status_t suki_obj_destroy(suki_handle_t h);
+suki_status_t suki_obj_duplicate(suki_handle_t h, uint32_t rights, suki_handle_t *out);
+suki_status_t suki_obj_query(suki_handle_t h, suki_objinfo_t *info);
+
+/* 通用工厂：type 为 suki_obj_type_t，a2/a3 类型相关（事件:init,manual；信号量:initial,max） */
+suki_status_t suki_obj_create(uint32_t type, uint64_t a2, uint64_t a3, suki_handle_t *out);
+
 #endif /* _SUKI_USER_SUKI_H */

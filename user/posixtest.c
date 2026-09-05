@@ -922,6 +922,74 @@ static void test_signal(void)
     ck("SIG_IGN ignored", g_sig_usr1 == 0);
 }
 
+/* ---- SukiNative 原生对象 API 测试（130..149）----
+ * 单任务内验证 event/mutex/sem 的创建/set/reset/wait/consume/query/duplicate/destroy，
+ * 不依赖跨任务阻塞（避免测试挂死）。 */
+static void test_sukinative(void)
+{
+    print_str("--- sukinative objects (event/mutex/sem/wait) ---\n");
+
+    /* auto-reset 事件：初始未触发 */
+    suki_handle_t ev;
+    ck("suki_event_create(auto)", suki_event_create(false, false, &ev) == 0 && ev != 0);
+
+    size_t idx;
+    suki_status_t r = suki_wait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
+    ck("wait no-block on unsignaled event => EAGAIN", r == -SUKI_EAGAIN);
+
+    ck("suki_event_set", suki_event_set(ev) == 0);
+    r = suki_wait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
+    ck("wait on signaled event => 0 (index 0)", r == 0 && idx == 0);
+    r = suki_wait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
+    ck("auto-reset consumed (=> EAGAIN again)", r == -SUKI_EAGAIN);
+
+    /* manual-reset 事件：触发后多次等待命中，reset 后停止 */
+    suki_handle_t evm;
+    ck("suki_event_create(manual)", suki_event_create(true, true, &evm) == 0);
+    ck("wait manual signaled => 0", suki_wait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == 0 && idx == 0);
+    ck("wait manual again => 0",   suki_wait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == 0 && idx == 0);
+    ck("suki_event_reset", suki_event_reset(evm) == 0);
+    ck("wait after reset => EAGAIN", suki_wait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == -SUKI_EAGAIN);
+
+    /* 多对象 ANY 等待：仅触发第二个 */
+    suki_handle_t evs[2];
+    ck("ev0 create", suki_event_create(false, false, &evs[0]) == 0);
+    ck("ev1 create", suki_event_create(false, false, &evs[1]) == 0);
+    ck("suki_event_set(evs[1])", suki_event_set(evs[1]) == 0);
+    r = suki_wait(evs, 2, SUKI_WAIT_ANY, 0, &idx);
+    ck("wait ANY returns index 1", r == 0 && idx == 1);
+
+    /* 互斥锁：空闲可立即获取/释放 */
+    suki_handle_t mtx;
+    ck("suki_mutex_create", suki_mutex_create(&mtx) == 0);
+    ck("mutex lock(free)=>0", suki_mutex_lock(mtx) == 0);
+    ck("mutex unlock=>0",     suki_mutex_unlock(mtx) == 0);
+
+    /* 信号量：初值 2，取一次释放一次，回到 2 */
+    suki_handle_t sem;
+    ck("suki_sem_create(2,5)", suki_sem_create(2, 5, &sem) == 0);
+    ck("sem acquire=>0", suki_sem_acquire(sem) == 0);
+    ck("sem release=>0", suki_sem_release(sem) == 0);
+
+    /* 对象查询 */
+    suki_objinfo_t info;
+    ck("suki_obj_query(sem)", suki_obj_query(sem, &info) == 0 &&
+        info.type == SUKI_OT_SEM && info.count == 2);
+
+    /* 句柄复制 + 销毁（引用计数） */
+    suki_handle_t dup;
+    ck("suki_obj_duplicate", suki_obj_duplicate(sem, 0, &dup) == 0);
+    ck("suki_obj_destroy(sem)", suki_obj_destroy(sem) == 0);
+    ck("suki_obj_destroy(dup)", suki_obj_destroy(dup) == 0);
+    ck("suki_obj_destroy(ev)",   suki_obj_destroy(ev) == 0);
+    ck("suki_obj_destroy(evm)",  suki_obj_destroy(evm) == 0);
+    ck("suki_obj_destroy(evs0)", suki_obj_destroy(evs[0]) == 0);
+    ck("suki_obj_destroy(evs1)", suki_obj_destroy(evs[1]) == 0);
+    ck("suki_obj_destroy(mtx)",  suki_obj_destroy(mtx) == 0);
+
+    print_str("[sukinative] done\n");
+}
+
 int main(void)
 {
     print_str("\n=== POSIX syscall conformance test ===\n");
@@ -938,6 +1006,7 @@ int main(void)
     test_fork();
     test_pthread();
     test_signal();
+    test_sukinative();
     if (wait_fs_ready()) {
         test_file();
     } else {

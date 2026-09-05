@@ -12,6 +12,7 @@
 
 struct kernel_port;   /* 前向声明（ipc/port.h） */
 struct ool_map_node;   /* 前向声明（ipc/port.h，OOL 映射链表） */
+#include <kernel/suki_native.h>   /* SukiNative 对象/句柄类型（详见 kernel/suki_native.c） */
 
 enum task_state { READY, RUNNING, BLOCKED, WAITING };
 
@@ -112,6 +113,17 @@ typedef struct task {
     uint8_t  in_signal;         /* 嵌套信号层数（>0 表示正在处理器中） */
     uint64_t sig_altstack;      /* 信号栈基址（sigaltstack；0=未设置） */
     uint64_t sig_altstack_size; /* 信号栈大小 */
+
+    /* --- SukiNative 对象/句柄（Phase 1，详见 kernel/suki_native.c）---
+     * 句柄表惰性分配（首次 SukiNative 调用时），fork/clone 子任务继承空表（不继承父句柄）。
+     * 等待态：任务阻塞于 SYS_SUKI_WAIT 时，用 suki_wait_nodes[] 串入各对象的 waiter
+     * 链表（每对象一个节点，避免单 next 指针无法同时挂多链）。 */
+    suki_handle_entry_t *suki_handles;   /* NULL=尚未建表 */
+    uint32_t            suki_handle_cap;
+    suki_waitnode_t     suki_wait_nodes[SUKI_MAX_WAIT];
+    int                 suki_wait_n;
+    suki_object_t      *suki_wait_set[SUKI_MAX_WAIT];
+    bool                suki_wait_active;
 } task_t;
 
 /* FPU/SSE 状态保存与恢复原语（实现见 sched/switch.S） */

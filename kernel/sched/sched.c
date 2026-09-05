@@ -845,6 +845,7 @@ static void reap_dead(void)
         if (t->kstack_base) {
             kstack_free(t->kstack_base);   /* P0-R5：归还守卫页栈槽位 */
         }
+        suki_handles_free_all(t);          /* 回收本任务的 SukiNative 句柄表并 unref 对象 */
         kfree(t);
         t = nx;
     }
@@ -879,6 +880,7 @@ static void task_reap_locked(task_t *t)
     if (t->kstack_base) {
         kstack_free(t->kstack_base);       /* P0-R5：归还守卫页栈槽位 */
     }
+    suki_handles_free_all(t);              /* 回收本任务的 SukiNative 句柄表并 unref 对象 */
     kfree(t);
 }
 

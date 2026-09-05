@@ -966,8 +966,6 @@ static uint64_t sys_display_blit(uint64_t a1, uint64_t a2, uint64_t a3,
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    task_t *cur = sched_current();
-
     /* 分发顺序（与 posix.h 号段一致）：
      *   0..19     —— Mach 原生/端口（下方显式 case）
      *   20..129   —— POSIX 兼容层（posix_dispatch），对外行为保持不变

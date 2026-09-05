@@ -680,6 +680,33 @@ typedef struct suki_fd_set {
 #define SYS_SUKI_PROC_CREATE    148
 #define SYS_SUKI_MEM_ALLOC      149
 
+/* ---- G'（续）SukiNative ABI 公共类型（内核/用户共享，单一真相源）---- */
+typedef enum {
+    SUKI_OT_NONE  = 0,
+    SUKI_OT_EVENT,
+    SUKI_OT_MUTEX,
+    SUKI_OT_SEM,
+    SUKI_OT_FILE,
+    SUKI_OT_PROC,
+    SUKI_OT_MEM,
+} suki_obj_type_t;
+
+/* 句柄：每任务句柄表索引 +1（0 保留为非法）。 */
+typedef uint32_t suki_handle_t;
+
+/* SYS_SUKI_WAIT 的 a3 flags */
+#define SUKI_WAIT_ANY       0x1
+#define SUKI_WAIT_ALL       0x2
+#define SUKI_WAIT_NO_BLOCK  0x4
+
+/* 对象查询信息（SYS_SUKI_OBJ_QUERY 输出；内核/用户布局一致） */
+typedef struct suki_objinfo {
+    uint32_t type;     /* suki_obj_type_t */
+    uint32_t state;    /* event:1=signaled; mutex:1=locked; sem:1=有可用计数 */
+    int32_t  count;    /* sem 当前计数（其余类型 0） */
+    uint32_t _pad;
+} suki_objinfo_t;
+
 /* ---- H. 网络（150..169）：socket 号位预留（协议栈未就绪，调用返回 -ENOSYS）---- */
 #define SYS_SOCKET          150
 #define SYS_BIND            151

@@ -1221,15 +1221,12 @@ int64_t task_wait_any_child(int64_t pid, uint64_t *pid_out,
 }
 
 /*
- * task_signal —— POSIX kill 的信号投递（默认动作语义）。
+ * task_signal —— POSIX kill 的信号投递（handler / 默认动作语义）。
  * 安全边界（关键）：绝不在内核中途就地杀死一个任务——它可能正持有自旋锁、
  * 正停在 context_switch 内部或半途更新链表，强行摘除会造成整机死锁或
- * 结构损坏。此处只做两件事：
- *   1) 置目标的 pending_kill/pending_signo；
- *   2) 若目标因阻塞（IPC/等待）不在运行队列，则 sched_wake 唤醒它，
- *      使其尽快走到 syscall 返回边界并自我终止。
- * 真正的终止发生在 syscall_dispatch 入口的 pending_kill 检查（等价于
- * Linux 返回用户态前的 TIF_SIGPENDING 处理）。
+ * 结构损坏。此处只置目标的 pending 位（新信号框架），真正的「投递 / 默认终止 /
+ * 忽略」由目标在【syscall 返回用户态的边界】经 sig_deliver_check 完成
+ *（等价于 Linux 返回用户态前的 TIF_SIGPENDING 处理）。
  */
 int task_signal(uint64_t pid, int signo)
 {
@@ -1238,9 +1235,11 @@ int task_signal(uint64_t pid, int signo)
     }
     task_t *cur = sched_current();
 
-    /* 发给自己：默认动作 = 终止（128+signo 是 shell 的死法约定） */
+    /* 发给自己：置 pending 位，由 syscall 返回边界的 sig_deliver_check 按处置
+     * （handler / 默认终止 / 忽略）处理，绝不中途杀死。 */
     if (pid == cur->id) {
-        task_exit_current((uint64_t)(128 + signo));   /* 不返回 */
+        task_signal_send(cur, signo);
+        return 0;
     }
 
     uint64_t f = spin_lock_irqsave(&g_sched_lock);
@@ -1256,14 +1255,11 @@ int task_signal(uint64_t pid, int signo)
         spin_unlock_irqrestore(&g_sched_lock, f);
         return -SUKI_EPERM;             /* 绝不允许杀死 idle（会导致无任务可调度） */
     }
-    t->pending_kill = true;
-    t->pending_signo = signo;
-    bool need_wake = (t->state != READY && t->state != RUNNING);
     spin_unlock_irqrestore(&g_sched_lock, f);
 
-    if (need_wake) {
-        sched_wake(t);                  /* 唤醒阻塞中的目标，使其尽快处理信号 */
-    }
+    /* 置目标的 pending 位（新信号框架）；task_signal_send 内部会在目标非运行态时
+     * 唤醒它，使其尽快返回用户态检查 pending 信号。 */
+    task_signal_send(t, signo);
     return 0;
 }
 

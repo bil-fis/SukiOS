@@ -106,6 +106,15 @@ typedef struct task {
     uint64_t fs_base;          /* 每线程 TLS 基址（FS base MSR；arch_prctl(SET_FS) 设置） */
     uint64_t clear_child_tid;  /* set_tid_address / CLONE_CHILD_CLEARTID：线程退出时清零并 futex_wake 的地址 */
     uint8_t  owns_as;          /* 1=独占地址空间，退出时负责销毁 cr3/vma；0=共享（线程，由最后退出者销毁） */
+
+    /* --- 信号（signal/sigaction）支持 --- */
+    struct suki_sigaction sigactions[SUKI_NSIG]; /* 每信号处置（handler/flags/mask） */
+    suki_sigset_t sigmask;      /* 当前阻塞的信号集 */
+    suki_sigset_t pending;      /* 待投递（pending）的信号集 */
+    suki_sigset_t saved_sigmask;/* 进入处理器前的 sigmask，sigreturn 时还原 */
+    uint8_t  in_signal;         /* 嵌套信号层数（>0 表示正在处理器中） */
+    uint64_t sig_altstack;      /* 信号栈基址（sigaltstack；0=未设置） */
+    uint64_t sig_altstack_size; /* 信号栈大小 */
 } task_t;
 
 /* FPU/SSE 状态保存与恢复原语（实现见 sched/switch.S） */
@@ -199,13 +208,16 @@ uint32_t task_count(void);
 
 /*
  * POSIX kill：向 pid 投递信号。
- * 本阶段实现「默认动作」语义：所有信号默认终止目标（无自定义 handler，
- * 无进程组）。安全边界：绝不就地杀死正在运行/持锁的任务——仅置
- * pending_kill，由目标在【syscall 返回用户态的边界】自我终止（与 Linux
- * 的 TIF_SIGPENDING 处理时机一致）；若目标正阻塞在等待队列，则同时唤醒它。
- * 返回 0 成功；<0 为负 errno（-ESRCH 无此进程 / -EINVAL 非法信号 /
- * -EPERM 不允许（如 idle）/ -EINVAL 不支持的 pid 语义）。
+ * 语义：置目标的 pending 位（新信号框架），由目标在【syscall 返回用户态的边界】
+ * 经 sig_deliver_check 按处置（handler / 默认终止 / 忽略）处理——绝不就地杀死
+ * 正在运行/持锁的任务（与 Linux 的 TIF_SIGPENDING 处理时机一致）；若目标正
+ * 阻塞在等待队列，则同时唤醒它。返回 0 成功；<0 为负 errno。
  */
 int task_signal(uint64_t pid, int signo);
+
+/* 向任务 t 投递信号 sig：置 pending 位；若 t 不在运行态则唤醒，使其尽快返回
+ * 用户态检查 pending 信号。由 sig_deliver_check 在 syscall 返回边界完成真实投递
+ * 或默认动作。定义见 kernel/syscall/signal.c。 */
+void task_signal_send(task_t *t, int sig);
 
 #endif /* _SUKI_KERNEL_TASK_H */

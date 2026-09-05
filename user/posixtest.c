@@ -875,6 +875,53 @@ static void test_pthread(void)
        pthread_mutex_destroy(&cm) == 0);
 }
 
+/* ===================== 信号（signal/sigaction） ===================== */
+static volatile int g_sig_usr1 = 0;
+static volatile int g_sig_usr2 = 0;
+static volatile int g_sig_last = 0;
+
+static void h_sigusr1(int s) { g_sig_usr1++; g_sig_last = s; }
+static void h_sigusr2(int s) { g_sig_usr2++; g_sig_last = s; }
+
+/* 验证：signal/sigaction 安装用户 handler 并经 kill/raise 投递；
+ * sigprocmask 阻塞期间不投递、解除后自动投递；SIG_IGN 忽略。
+ * 全程不触发默认终止动作（默认动作信号未在没有 handler 时投递），进程继续运行。 */
+static void test_signal(void)
+{
+    print_str("--- signal (sigaction/kill/raise/sigprocmask) ---\n");
+
+    /* T1: signal() + raise()：handler 应被调用且收到正确 signo */
+    g_sig_usr1 = 0; g_sig_last = 0;
+    signal(SIGUSR1, h_sigusr1);
+    raise(SIGUSR1);
+    ck("signal+raise handler invoked", g_sig_usr1 == 1);
+    ck("signal signo matches", g_sig_last == SIGUSR1);
+
+    /* T2: sigaction() 经 kill(getpid(), sig) 投递 */
+    g_sig_usr2 = 0; g_sig_last = 0;
+    signal(SIGUSR2, h_sigusr2);
+    kill(getpid(), SIGUSR2);
+    ck("sigaction+kill handler invoked", g_sig_usr2 == 1);
+    ck("kill signo matches", g_sig_last == SIGUSR2);
+
+    /* T3: sigprocmask 阻塞期间不投递，解除后自动投递 */
+    sigset_t mask = (sigset_t)(1ULL << (SIGUSR1 - 1));
+    sigset_t oldmask = 0;
+    g_sig_usr1 = 0;
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+    raise(SIGUSR1);                              /* 阻塞：不应立即投递 */
+    ck("blocked signal not delivered", g_sig_usr1 == 0);
+    sigprocmask(SIG_UNBLOCK, &mask, NULL);      /* 解除：返回时自动投递 */
+    ck("signal delivered after unblock", g_sig_usr1 == 1);
+    sigprocmask(SIG_SETMASK, &oldmask, NULL);
+
+    /* T4: SIG_IGN 忽略信号 */
+    g_sig_usr1 = 0;
+    signal(SIGUSR1, SIG_IGN);
+    raise(SIGUSR1);
+    ck("SIG_IGN ignored", g_sig_usr1 == 0);
+}
+
 int main(void)
 {
     print_str("\n=== POSIX syscall conformance test ===\n");
@@ -890,6 +937,7 @@ int main(void)
     test_system();
     test_fork();
     test_pthread();
+    test_signal();
     if (wait_fs_ready()) {
         test_file();
     } else {

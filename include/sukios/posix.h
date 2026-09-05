@@ -242,24 +242,104 @@ typedef int32_t  suki_key_t;
 #define SUKI_WUNTRACED 2
 #define SUKI_WCONTINUED 8
 
-/* 信号（kill 用；本阶段仅实现"终止/忽略"语义，其它默认终止） */
-#define SUKI_SIGHUP   1
-#define SUKI_SIGINT   2
-#define SUKI_SIGQUIT  3
-#define SUKI_SIGILL   4
-#define SUKI_SIGTRAP  5
-#define SUKI_SIGABRT  6
-#define SUKI_SIGBUS   7
-#define SUKI_SIGFPE   8
-#define SUKI_SIGKILL  9
-#define SUKI_SIGUSR1  10
-#define SUKI_SIGSEGV  11
-#define SUKI_SIGUSR2  12
-#define SUKI_SIGPIPE  13
-#define SUKI_SIGALRM  14
-#define SUKI_SIGTERM  15
-#define SUKI_SIGCHLD  17
-#define SUKI_SIGSTOP  19
+/* 信号编号（POSIX 兼容常量；与 Linux 取值一致，便于移植） */
+#define SUKI_SIGHUP    1
+#define SUKI_SIGINT    2
+#define SUKI_SIGQUIT   3
+#define SUKI_SIGILL    4
+#define SUKI_SIGTRAP   5
+#define SUKI_SIGABRT   6
+#define SUKI_SIGBUS    7
+#define SUKI_SIGFPE    8
+#define SUKI_SIGKILL   9
+#define SUKI_SIGUSR1   10
+#define SUKI_SIGSEGV   11
+#define SUKI_SIGUSR2   12
+#define SUKI_SIGPIPE   13
+#define SUKI_SIGALRM   14
+#define SUKI_SIGTERM   15
+#define SUKI_SIGSTKFLT 16
+#define SUKI_SIGCHLD   17
+#define SUKI_SIGCONT   18
+#define SUKI_SIGSTOP   19
+#define SUKI_SIGTSTP   20
+#define SUKI_SIGTTIN   21
+#define SUKI_SIGTTOU   22
+#define SUKI_SIGURG    23
+#define SUKI_SIGXCPU   24
+#define SUKI_SIGXFSZ   25
+#define SUKI_SIGVTALRM 26
+#define SUKI_SIGPROF   27
+#define SUKI_SIGWINCH  28
+#define SUKI_SIGPOLL   29
+#define SUKI_SIGPWR    30
+#define SUKI_SIGSYS    31
+#define SUKI_NSIG      64   /* 信号总数（含 1..63 可用；0 为预留） */
+
+/* 信号处置（sa_handler 取值） */
+#define SUKI_SIG_DFL   ((void (*)(int))0)   /* 默认动作 */
+#define SUKI_SIG_IGN   ((void (*)(int))1)   /* 忽略 */
+#define SUKI_SIG_ERR   ((void (*)(int))-1)  /* 错误返回 */
+
+/* sigaction 标志 */
+#define SUKI_SA_NOCLDSTOP 0x00000001
+#define SUKI_SA_RESTART    0x00000002
+#define SUKI_SA_NOCLDWAIT  0x00000008
+#define SUKI_SA_RESETHAND  0x00000004
+#define SUKI_SA_SIGINFO    0x00000040
+#define SUKI_SA_NODEFER    0x00000020
+#define SUKI_SA_RESTORER   0x04000000
+
+/* sigprocmask how */
+#define SUKI_SIG_BLOCK   0
+#define SUKI_SIG_UNBLOCK 1
+#define SUKI_SIG_SETMASK 2
+
+/* siginfo code（常用） */
+#define SUKI_SI_USER     0
+#define SUKI_SI_KERNEL   128
+#define SUKI_SI_QUEUE    1
+#define SUKI_SI_TIMER    2
+#define SUKI_SI_TKILL    4
+
+/* 信号集：本实现以 64 位位掩码表示（bit (sig-1) 置位） */
+typedef uint64_t suki_sigset_t;
+
+/* struct sigaction（简化但可移植；sa_handler 与 sa_sigaction 共用首字段） */
+struct suki_sigaction {
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, struct suki_siginfo *, struct suki_ucontext *);
+    } _u;
+    uint64_t        sa_flags;
+    void          (*sa_restorer)(void);
+    suki_sigset_t   sa_mask;
+};
+
+/* struct siginfo（简化：覆盖 signo/code/pid/uid/status/value） */
+struct suki_siginfo {
+    int    si_signo;
+    int    si_code;
+    int    si_errno;
+    int    _pad0;
+    int64_t si_pid;
+    int64_t si_uid;
+    int64_t si_status;
+    int64_t si_value;
+};
+
+/* 用户态上下文（信号帧与 sigreturn 还原用）。
+ * gpr 顺序与内核返回帧 GPR 槽一致：r9,r8,r10,rdx,rsi,rdi,r15,r14,r13,r12,rbp,rbx */
+struct suki_ucontext {
+    uint64_t gpr[12];
+    uint64_t rax;
+    uint64_t rip;
+    uint64_t rflags;
+    uint64_t rsp;
+    uint64_t cr2;
+    suki_sigset_t sigmask;
+    uint8_t  fpu[512] __attribute__((aligned(16)));   /* fxsave/fxrstor 要求 16 字节对齐 */
+};
 
 /* socket（号位预留；协议栈未就绪时按 POSIX 语义返回 -ENOSYS） */
 #define SUKI_AF_UNIX   1
@@ -617,6 +697,13 @@ typedef struct suki_fd_set {
 
 /* 八、线程 / 克隆（pthread 基础，SYS_CLONE 走 native 分发，不入 >=204 的 posix 表） */
 #define SYS_CLONE           205   /* 创建线程/子进程：共享地址空间 + 自定义入口（trampoline） */
+
+/* 九、信号（signal/sigaction/raise/kill 用户态处理器投递） */
+#define SYS_SIGACTION       206   /* sigaction(sig, act, oldact) */
+#define SYS_SIGRETURN       207   /* sigreturn(ucontext*)：还原被信号打断的上下文 */
+#define SYS_SIGPROCMASK     208   /* sigprocmask(how, set, oldset) */
+#define SYS_TKILL           209   /* tkill(tid, sig)：向指定线程发送信号 */
+#define SYS_RAISE           210   /* raise(sig)：向自身发送信号 */
 #define SUKI_ARCH_SET_FS    0x1002  /* arch_prctl：设置 FS base（TLS 基址，x86_64） */
 #define SUKI_ARCH_GET_FS    0x1003  /* arch_prctl：读取 FS base */
 /* sys_clone flags（SukiOS 自有定义；本系统程序重编译，不追求与 Linux 完全一致） */

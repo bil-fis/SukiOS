@@ -144,6 +144,7 @@ USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/dirent.c.o \
                   $(BUILD)/user/lib/syscalls.c.o \
                   $(BUILD)/user/lib/pthread.c.o \
+                  $(BUILD)/user/lib/signal.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o \
                   $(BUILD)/user/lib/setjmp.S.o
 

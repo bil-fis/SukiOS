@@ -173,6 +173,10 @@ syscall_return_path:
     movq  8(%r11), %rcx         /* rcx = scr_rsp */
     movq  %rcx, 120(%rsp)       /* 帧 RSP 槽 = scr_rsp */
 
+    /* 信号投递不在汇编返回路径做（避免破坏 rax 返回值与栈对齐）：改为在
+     * kernel/syscall/sys_posix.c 的 posix_dispatch() 返回前调用 sig_deliver_check，
+     * 它直接改写 g_syscall_gpr[cpu] 帧与 g_scratch[cpu]（scr_rip/scr_rsp），
+     * 本处的 scr 覆盖逻辑据此写 iret 帧，handler 即可正确进入。 */
     popq  %r9
     popq  %r8
     popq  %r10

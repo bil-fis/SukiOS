@@ -51,6 +51,14 @@
 extern void fork_child_return(void);
 extern uint64_t g_syscall_gpr[MAX_CPUS];
 
+/* 信号相关系统调用（实现见 kernel/syscall/signal.c） */
+extern int64_t sys_sigaction(uint64_t a1, uint64_t a2, uint64_t a3);
+extern int64_t sys_sigreturn(uint64_t a1);
+extern int64_t sys_sigprocmask(uint64_t a1, uint64_t a2, uint64_t a3);
+extern int64_t sys_tkill(uint64_t a1, uint64_t a2);
+extern int64_t sys_raise(uint64_t a1);
+extern uint64_t sig_deliver_check(uint64_t rax, uint64_t frame);
+
 /* 段选择子（与 syscall_entry.S / gdt.c 保持一致） */
 #define USER_CS_SEL   0x1B
 #define USER_DS_SEL   0x23
@@ -2295,6 +2303,12 @@ bool posix_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     case SYS_SET_TID_ADDRESS:  r = sys_set_tid_address(a1); break;
     case SYS_ARCH_PRCTL:       r = sys_arch_prctl((int32_t)a1, a2); break;
     case SYS_FUTEX:            r = sys_futex(a1, a2, a3, a4, a5, a6); break;
+    /* 信号（用户态 handler 投递） */
+    case SYS_SIGACTION:        r = sys_sigaction(a1, a2, a3); break;
+    case SYS_SIGRETURN:        r = sys_sigreturn(a1); break;
+    case SYS_SIGPROCMASK:      r = sys_sigprocmask(a1, a2, a3); break;
+    case SYS_TKILL:            r = sys_tkill(a1, a2); break;
+    case SYS_RAISE:            r = sys_raise(a1); break;
     case SYS_GETRLIMIT:
         r = sys_getrlimit((int32_t)a1, (suki_rlimit_t *)a2);
         break;
@@ -2539,6 +2553,10 @@ bool posix_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         return false;              /* 非 POSIX 号，交回上层处理 */
     }
 
-    *ret = r;
+    /* 信号投递：在返回用户态前检查 pending 信号并注入 handler。
+     * 直接改写 g_syscall_gpr[cpu] 帧与 g_scratch[cpu]（scr_rip/scr_rsp），
+     * syscall_return_path 末尾的 scr 覆盖逻辑据此写 iret 帧，handler 得以进入。 */
+    *ret = (int64_t)sig_deliver_check((uint64_t)r,
+                                      (uint64_t)g_syscall_gpr[cpu_index()]);
     return true;
 }

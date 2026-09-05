@@ -155,6 +155,68 @@ int uname(struct utsname *buf);
 
 #define S_ISDIR(m)  (((m) & SUKI_S_IFMT) == SUKI_S_IFDIR)
 #define S_ISREG(m)  (((m) & SUKI_S_IFMT) == SUKI_S_IFREG)
+
+/* ---- 信号（signal/sigaction，用户态 handler 投递） ---- */
+typedef void (*sighandler_t)(int);
+typedef struct suki_siginfo  siginfo_t;
+typedef struct suki_ucontext ucontext_t;
+typedef suki_sigset_t        sigset_t;
+
+/* POSIX struct sigaction（与内核 struct suki_sigaction 二进制布局一致）。
+ * 必须以 struct 标签形式定义：struct 标签与下方函数名 sigaction 处于不同命名
+ * 空间，不冲突；若用 typedef 名 sigaction 则会与普通标识符（函数名）冲突，
+ * 触发「redefinition of sigaction」编译错误。 */
+struct sigaction {
+    union {
+        sighandler_t           sa_handler;
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    } _u;
+    uint64_t        sa_flags;
+    void          (*sa_restorer)(void);
+    sigset_t        sa_mask;
+};
+
+#define SIG_DFL       SUKI_SIG_DFL
+#define SIG_IGN       SUKI_SIG_IGN
+#define SIG_ERR       SUKI_SIG_ERR
+#define SA_SIGINFO    SUKI_SA_SIGINFO
+#define SA_RESTART    SUKI_SA_RESTART
+#define SA_RESETHAND  SUKI_SA_RESETHAND
+#define SA_NODEFER    SUKI_SA_NODEFER
+#define SA_RESTORER   SUKI_SA_RESTORER
+#define SIG_BLOCK     SUKI_SIG_BLOCK
+#define SIG_UNBLOCK   SUKI_SIG_UNBLOCK
+#define SIG_SETMASK   SUKI_SIG_SETMASK
+
+#define SIGHUP    SUKI_SIGHUP
+#define SIGINT    SUKI_SIGINT
+#define SIGQUIT   SUKI_SIGQUIT
+#define SIGILL    SUKI_SIGILL
+#define SIGTRAP   SUKI_SIGTRAP
+#define SIGABRT   SUKI_SIGABRT
+#define SIGBUS    SUKI_SIGBUS
+#define SIGFPE    SUKI_SIGFPE
+#define SIGKILL   SUKI_SIGKILL
+#define SIGUSR1   SUKI_SIGUSR1
+#define SIGSEGV   SUKI_SIGSEGV
+#define SIGUSR2   SUKI_SIGUSR2
+#define SIGPIPE   SUKI_SIGPIPE
+#define SIGALRM   SUKI_SIGALRM
+#define SIGTERM   SUKI_SIGTERM
+#define SIGCHLD   SUKI_SIGCHLD
+#define SIGCONT   SUKI_SIGCONT
+#define SIGSTOP   SUKI_SIGSTOP
+#define SIGTSTP   SUKI_SIGTSTP
+#define SIGURG    SUKI_SIGURG
+#define NSIG      SUKI_NSIG
+
+/* libc 信号 API（实现见 lib/signal.c） */
+int    sigaction(int sig, const struct sigaction *act, struct sigaction *oldact);
+int    sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+int    kill(int pid, int sig);
+int    raise(int sig);
+sighandler_t signal(int sig, sighandler_t handler);
+void   sigreturn(const void *ucontext);
 #define S_ISCHR(m)  (((m) & SUKI_S_IFMT) == SUKI_S_IFCHR)
 #define S_ISBLK(m)  (((m) & SUKI_S_IFMT) == SUKI_S_IFBLK)
 #define S_ISFIFO(m) (((m) & SUKI_S_IFMT) == SUKI_S_IFIFO)

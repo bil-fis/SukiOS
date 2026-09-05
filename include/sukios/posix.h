@@ -654,22 +654,48 @@ typedef struct suki_fd_set {
 #define SYS_SCHED_GETPID    123
 #define SYS_MPROTECT_KEY    124
 #define SYS_OOL_UNMAP       125   /* 释放 mach_msg OOL 接收窗口（va） */
-/* ---- G. 网络（130..149）：号位预留 ---- */
-#define SYS_SOCKET          130
-#define SYS_BIND            131
-#define SYS_CONNECT         132
-#define SYS_LISTEN          133
-#define SYS_ACCEPT          134
-#define SYS_SENDTO          135
-#define SYS_RECVFROM        136
-#define SYS_SENDMSG         137
-#define SYS_RECVMSG         138
-#define SYS_SHUTDOWN        139
-#define SYS_SETSOCKOPT      140
-#define SYS_GETSOCKOPT      141
-#define SYS_GETPEERNAME     142
-#define SYS_GETSOCKNAME     143
-#define SYS_SOCKETPAIR      144
+/* ---- G. SukiNative 原生对象 API（130..149）----
+ * 与 POSIX（20..129）【平行】的原生接口：一切皆对象，返回 suki_handle_t 句柄，
+ * 用 suki_status_t 状态码（而非 errno）。POSIX 兼容层对外号位与行为保持不变；
+ * 新服务可直接使用 SukiNative。当前 Phase 0 仅完成号位预留与分发路由
+ * （sys_suki_dispatch），具体对象/句柄子系统在 Phase 1 实现，未实现号返回 -ENOSYS。 */
+#define SYS_SUKI_OBJ_CREATE     130
+#define SYS_SUKI_OBJ_DESTROY    131
+#define SYS_SUKI_OBJ_DUPLICATE  132
+#define SYS_SUKI_OBJ_QUERY      133
+#define SYS_SUKI_WAIT           134
+#define SYS_SUKI_EVENT_CREATE   135
+#define SYS_SUKI_EVENT_SET      136
+#define SYS_SUKI_EVENT_RESET    137
+#define SYS_SUKI_MUTEX_CREATE   138
+#define SYS_SUKI_MUTEX_LOCK     139
+#define SYS_SUKI_MUTEX_UNLOCK   140
+#define SYS_SUKI_SEM_CREATE     141
+#define SYS_SUKI_SEM_ACQUIRE    142
+#define SYS_SUKI_SEM_RELEASE    143
+#define SYS_SUKI_FILE_OPEN      144
+#define SYS_SUKI_FILE_READ      145
+#define SYS_SUKI_FILE_WRITE     146
+#define SYS_SUKI_FILE_CLOSE     147
+#define SYS_SUKI_PROC_CREATE    148
+#define SYS_SUKI_MEM_ALLOC      149
+
+/* ---- H. 网络（150..169）：socket 号位预留（协议栈未就绪，调用返回 -ENOSYS）---- */
+#define SYS_SOCKET          150
+#define SYS_BIND            151
+#define SYS_CONNECT         152
+#define SYS_LISTEN          153
+#define SYS_ACCEPT          154
+#define SYS_SENDTO          155
+#define SYS_RECVFROM        156
+#define SYS_SENDMSG         157
+#define SYS_RECVMSG         158
+#define SYS_SHUTDOWN        159
+#define SYS_SETSOCKOPT      160
+#define SYS_GETSOCKOPT      161
+#define SYS_GETPEERNAME     162
+#define SYS_GETSOCKNAME     163
+#define SYS_SOCKETPAIR      164
 
 /* 内核扩展：Ring3 显示服务经此系统调用获得帧缓冲用户态映射与显示配置。
  * 放在原生区之外的独立扩展号，避免与 POSIX 区（20+）混淆。 */

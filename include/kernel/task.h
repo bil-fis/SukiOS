@@ -92,13 +92,10 @@ typedef struct task {
 
     /* --- POSIX 等待与信号语义 --- */
     bool     wait_any;               /* 以 waitpid(-1,...) 方式阻塞等待【任意】
-                                      * 子进程退出（父阻塞在此标志上，任何子退出
-                                      * 时由 task_exit_current 唤醒它） */
-    bool     pending_kill;           /* 有待处理信号，默认动作 = 终止。
-                                      * 【重要】绝不在持锁/内核中途直接杀死任务——
-                                      * 只在 syscall 返回用户态的边界检查并自我
-                                      * 终止，避免锁被带走/资源半释放 */
-    int      pending_signo;          /* pending_kill 时待投递的信号号 */
+                                     * 子进程退出（父阻塞在此标志上，任何子退出
+                                     * 时由 task_exit_current 唤醒它） */
+    /* 注：信号投递已统一为 pending 位 + 返回路径 sig_deliver_check
+     * （见 kernel/syscall/signal.c），不再使用 pending_kill/pending_signo 中间态。 */
 
     /* --- 线程（pthread）支持 --- */
     uint64_t tid;              /* 线程 id（gettid 返回） */

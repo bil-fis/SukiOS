@@ -191,8 +191,7 @@ int64_t sys_fork(void)
     child->exit_code = 0;
     child->wait_result = 0;
     child->wait_any = false;
-    child->pending_kill = false;
-    child->pending_signo = 0;
+
     child->is_idle = false;
     child->in_rq = false;
     child->ticks_remaining = TIME_SLICE_TICKS;
@@ -389,8 +388,7 @@ int64_t sys_clone(uint64_t flags, uint64_t child_stack, uint64_t trampoline,
     child->umask = parent->umask;
     child->brk = parent->brk;
     child->brk_start = parent->brk_start;
-    child->pending_kill = false;
-    child->pending_signo = 0;
+
 
     /* KPTI：把子内核栈映射进（可能共享的）影子 PML4 */
     vmm_kpti_map_kstack(child->cr3, child->kstack_base, child->kstack_top);

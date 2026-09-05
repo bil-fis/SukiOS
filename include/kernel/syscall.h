@@ -77,6 +77,12 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5,
                           uint64_t a6);
 
+/* SukiNative 原生对象 API 分发（130..199）：与 POSIX（20..129）平行的原生接口。
+ * 当前 Phase 0 仅完成号位预留与分发路由，未实现的具体号返回 -ENOSYS；
+ * Phase 1 起在此实现对象/句柄子系统（suki_object_t、句柄表、SYS_SUKI_WAIT 等）。 */
+uint64_t sys_suki_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6);
+
 /* POSIX 子系统初始化（fd 表等）。kmain 在 syscall_init 之后调用。 */
 void posix_init(void);
 

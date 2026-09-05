@@ -958,22 +958,28 @@ static uint64_t sys_display_blit(uint64_t a1, uint64_t a2, uint64_t a3,
  * 分发顺序：先处理 SukiOS/Mach 原生号（0..19 中未划归 POSIX 者），
  * 其余交给 posix_dispatch()（完整 POSIX 号区，见 kernel/syscall/sys_posix.c）。
  *
- * 【信号边界】进入分发前先处理 pending_kill：这是本内核投递信号的唯一
- * 安全时机——任务此刻刚从用户态经 syscall 陷入，未持有任何内核锁、不在
- * context_switch 内部、未半途更新任何链表。绝不在任务持锁/阻塞中途就地
- * 杀死它（那会带走自旋锁或留下半改链表，是整机死锁的经典成因）。
+ * 【信号边界】信号投递统一在 posix_dispatch 返回用户态前的边界经
+ * sig_deliver_check() 处理（含默认终止），不在中途就地杀死任务；本函数不再
+ * 处理 pending_kill。SukiNative 原生对象 API（130..199）经 sys_suki_dispatch
+ * 路由，当前 Phase 0 仅完成号位预留与分发，未实现号返回 -ENOSYS。
  */
 uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     task_t *cur = sched_current();
 
-    /* 信号边界：有待处理信号且默认动作为终止 -> 自我终止（128+signo） */
-    if (cur->pending_kill) {
-        int signo = cur->pending_signo;
-        cur->pending_kill = false;
-        cur->pending_signo = 0;
-        task_exit_current((uint64_t)(128 + signo));   /* 不返回 */
+    /* 分发顺序（与 posix.h 号段一致）：
+     *   0..19     —— Mach 原生/端口（下方显式 case）
+     *   20..129   —— POSIX 兼容层（posix_dispatch），对外行为保持不变
+     *   130..199  —— SukiNative 原生对象 API（sys_suki_dispatch，Phase 0 仅路由）
+     *   200..     —— 内核扩展（下方显式 case）
+     * 信号边界已统一在 posix_dispatch 返回路径经 sig_deliver_check 处理（含默认
+     * 终止），不再需要中途的 pending_kill 检查。 */
+
+    /* SukiNative 原生对象 API：号位 130..199 一律经 sys_suki_dispatch 路由；
+     * 当前未实现的具体号返回 -ENOSYS（网络 socket 号已重定位到 150..，同样暂未实现）。 */
+    if (num >= 130 && num <= 199) {
+        return sys_suki_dispatch(num, a1, a2, a3, a4, a5, a6);
     }
 
     switch (num) {

@@ -416,3 +416,59 @@ int getopt_long(int argc, char *const argv[], const char *optstring,
     /* 退化为短选项解析（复用 getopt 主体） */
     return getopt(argc, argv, optstring);
 }
+
+/* ========================================================================== */
+/* qsort：标准快排（Lomuto 分区 + 显式栈，迭代式），供 FreeType 等使用。        */
+/* ========================================================================== */
+static void tq_swap(char *a, char *b, size_t sz)
+{
+    char t;
+    for (size_t i = 0; i < sz; i++) { t = a[i]; a[i] = b[i]; b[i] = t; }
+}
+
+void qsort(void *base, size_t nmemb, size_t size,
+           int (*compar)(const void *, const void *))
+{
+    if (!base || nmemb < 2 || size == 0 || !compar) return;
+    /* 显式栈模拟递归（避免 freestanding 深层递归栈风险） */
+    struct { char *lo, *hi; } stack[64];
+    int sp = 0;
+    stack[sp].lo = (char*)base;
+    stack[sp].hi = (char*)base + (nmemb - 1) * size;
+    sp++;
+
+    while (sp > 0) {
+        sp--;
+        char *lo = stack[sp].lo;
+        char *hi = stack[sp].hi;
+        while (lo < hi) {
+            /* 小数组用插入排序（更快且省栈） */
+            if ((size_t)(hi - lo) / size < 16) {
+                for (char *i = lo + size; i <= hi; i += size) {
+                    char *j = i;
+                    while (j > lo && compar(j - size, j) > 0) {
+                        tq_swap(j - size, j, size);
+                        j -= size;
+                    }
+                }
+                break;
+            }
+            /* Lomuto 分区，pivot 取末元素 */
+            char *pivot = hi;
+            char *i = lo;
+            for (char *j = lo; j < hi; j += size) {
+                if (compar(j, pivot) <= 0) {
+                    if (i != j) tq_swap(i, j, size);
+                    i += size;
+                }
+            }
+            if (i != pivot) tq_swap(i, pivot, size);
+            /* i 为 pivot 最终位置，分 [lo, i-size) 与 (i+size, hi] */
+            char *p = i;            /* pivot 位置 */
+            if (p > lo)  { stack[sp].lo = lo; stack[sp].hi = p - size; sp++; }
+            if (p < hi)  { stack[sp].lo = p + size; stack[sp].hi = hi; sp++; }
+            break; /* 本层处理完，回到 while 处理新入栈区间 */
+        }
+        if (sp >= (int)(sizeof(stack)/sizeof(stack[0]))) break; /* 防御 */
+    }
+}

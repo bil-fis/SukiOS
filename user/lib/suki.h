@@ -35,6 +35,7 @@
 #define FS_REPLY_PORT   7
 #define APP_PORT        8               /* 独立 app 可认领的通用应答端口 */
 #define MOUSE_PORT      9               /* Ring3 鼠标驱动 -> 显示服务 的光标事件端口 */
+#define FONT_PORT       10              /* 字体服务（FreeType 渲染）端口 */
 
 typedef struct mach_msg_header {
     uint32_t msgh_bits;

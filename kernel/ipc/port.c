@@ -108,8 +108,8 @@ void ipc_init(void)
     g_ports[PORT_NULL].in_use = true;
     g_ports[PORT_NULL].name   = PORT_NULL;
     g_ports[PORT_NULL].owner  = NULL;
-    /* 预留知名端口（含 APP_PORT，供独立 app 认领应答） */
-    for (uint32_t p = DISK_PORT; p <= APP_PORT; p++) {
+    /* 预留知名端口（含 APP_PORT、FONT_PORT，供独立 app / 字体服务认领） */
+    for (uint32_t p = DISK_PORT; p <= FONT_PORT; p++) {
         g_ports[p].in_use = true;
         g_ports[p].name = p;
     }

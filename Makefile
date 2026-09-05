@@ -143,7 +143,8 @@ USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/unistd.c.o $(BUILD)/user/lib/time.c.o \
                   $(BUILD)/user/lib/dirent.c.o \
                   $(BUILD)/user/lib/syscalls.c.o \
-                  $(BUILD)/user/lib/stack_canary.c.o
+                  $(BUILD)/user/lib/stack_canary.c.o \
+                  $(BUILD)/user/lib/setjmp.S.o
 
 # FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接
 # DISK_PORT IPC 做磁盘 IO。ff.c + ffunicode.c 编入 fs_server 的 blob/elf。
@@ -171,6 +172,55 @@ APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
                 -I user/lib/shims -I minimp3
 APP_ELFS     := $(patsubst %,$(BUILD)/apps/%.elf,$(APP_PROGS))
+
+# ---- FreeType 静态库（字体服务 pchfnt/fontsrv 的字形光栅化引擎）----
+# 仅编入 TrueType 渲染必需模块（base/sfnt/truetype/smooth/raster/autofit/
+# psaux/pshinter/psnames），配合 user/lib/ftmodule_min.h 关闭其余驱动。
+# 通过 FT_CONFIG_STANDARD_LIBRARY_H 指向 user/lib/freetype_shim.h 屏蔽宿主
+# stdio 依赖（本仓仅用 FT_OPEN_MEMORY 从内存加载字体）。
+FT_DIR       := lib/freetype-2.14.3
+FT_SRC_DIRS  := base sfnt truetype smooth raster autofit psaux pshinter psnames
+# 收集上述目录下的全部 .c（排除明显非编译单元，如工具/调试）
+FT_SRCS      := $(foreach d,$(FT_SRC_DIRS),$(wildcard $(FT_DIR)/src/$(d)/*.c))
+FT_OBJS      := $(patsubst $(FT_DIR)/%,$(BUILD)/ft/%,$(FT_SRCS:.c=.c.o))
+FT_LIB       := $(BUILD)/libfreetype.a
+FT_CFLAGS    := -ffreestanding -nostdlib -std=gnu11 -O2 -fno-asynchronous-unwind-tables -fcommon \
+                -DFT2_BUILD_LIBRARY -DFT_CONFIG_OPTION_USE_ZLIB=0 \
+                -DFT_CONFIG_STANDARD_LIBRARY_H='"user/lib/freetype_shim.h"' \
+                -DFT_CONFIG_MODULES_H='"user/lib/ftmodule_min.h"' \
+                -I $(CURDIR) -I $(FT_DIR)/include -I user/lib/shims -I user/lib -I include
+# 单独编译 freetype 源（不依赖 USER_CFLAGS 的栈保护/red-zone 等，避免污染引擎）
+$(BUILD)/ft/%.c.o: $(FT_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(FT_CFLAGS) -c $< -o $@
+
+FT_SHIM_OBJ := $(BUILD)/user/lib/freetype_shim.c.o
+$(FT_SHIM_OBJ): user/lib/freetype_shim.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(FT_CFLAGS) -c $< -o $@
+
+$(FT_LIB): $(FT_OBJS) $(FT_SHIM_OBJ)
+	@mkdir -p $(dir $@)
+	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ \
+		$(FT_OBJS) $(FT_SHIM_OBJ)
+	@echo "==> FreeType static lib $(FT_LIB) ($(words $(FT_OBJS)) objects)"
+
+# 字体相关独立程序：fontsrv（常驻字体服务）与 pchfnt（渲染命令行工具）
+FONT_PROGS  := fontsrv pchfnt
+FONT_ELFS   := $(patsubst %,$(BUILD)/apps/%.elf,$(FONT_PROGS))
+
+# 字体程序编译时同样用 FT_CONFIG_STANDARD_LIBRARY_H 覆盖 ftstdlib.h，
+# 并加入 freetype 公共头搜索路径；其余沿用 APP_CFLAGS（栈保护/SSE/用户态链接）。
+FONT_CFLAGS := -DFT_CONFIG_STANDARD_LIBRARY_H='"user/lib/freetype_shim.h"' \
+               -DFT_CONFIG_MODULES_H='"user/lib/ftmodule_min.h"' \
+               -I $(CURDIR) -I $(FT_DIR)/include
+$(BUILD)/apps/fontsrv.o: user/fontsrv.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(APP_CFLAGS) $(FONT_CFLAGS) -c $< -o $@
+$(BUILD)/apps/pchfnt.o: user/apps/pchfnt.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(APP_CFLAGS) $(FONT_CFLAGS) -c $< -o $@
+
 
 OBJS := $(patsubst %,$(BUILD)/%.o,$(C_SRCS) $(S_SRCS)) $(USER_BLOBS)
 
@@ -241,6 +291,10 @@ QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
 .PHONY: all iso run run-headless run-dbg run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk gcc FORCE
 
 all: $(KERNEL)
+# 默认目标固定为 all：本 Makefile 中 FreeType/字体程序的规则位于 all 之前，
+# 若不显式声明，make 会把第一个规则（freetype_shim.c.o）当成默认目标，
+# 导致 `make` 只编一个对象就退出、内核镜像不重建。
+.DEFAULT_GOAL := all
 
 info:
 	@echo "Toolchain : $(TOOLCHAIN)"
@@ -336,6 +390,19 @@ $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(USER_LIB_OBJS) user/user.ld
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> standalone app $@ ($$(stat -c%s $@) bytes)"
 
+# 字体程序（fontsrv/pchfnt）额外链接 FreeType 静态库。
+$(BUILD)/apps/fontsrv.elf: $(BUILD)/apps/fontsrv.o $(USER_LIB_OBJS) $(FT_LIB) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $< $(USER_LIB_OBJS) $(FT_LIB) -lgcc
+	@echo "==> font service $@ ($$(stat -c%s $@) bytes)"
+
+$(BUILD)/apps/pchfnt.elf: $(BUILD)/apps/pchfnt.o $(USER_LIB_OBJS) $(FT_LIB) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $< $(USER_LIB_OBJS) $(FT_LIB) -lgcc
+	@echo "==> font tool $@ ($$(stat -c%s $@) bytes)"
+
 # ---- 编译期配置头（SMP 开关的注入载体）----
 # 每次 make 都重新求值（FORCE），但只有【内容真正变化】时才改写文件时间戳
 # （cmp 比对后丢弃临时文件），避免无误的全量重编。
@@ -419,7 +486,7 @@ $(ISO): $(KERNEL) grub/grub.cfg configs/display.cfg
 # PLAYAUDIO 超过 8.3 短名 → mtools 自动创建长文件名(LFN)，FS_SERVER 已支持
 # 读取 LFN，故 shell 可用 `exec BIN/playaudio` 装载。
 disk: $(DISK)
-$(DISK): $(APP_ELFS) others_tests/moonhalo.mp3
+$(DISK): $(APP_ELFS) $(FONT_ELFS) others_tests/moonhalo.mp3
 	@mkdir -p $(BUILD)
 	truncate -s 64M $@
 	mformat -i $@ -F -v SUKIOS ::
@@ -446,6 +513,20 @@ $(DISK): $(APP_ELFS) others_tests/moonhalo.mp3
 		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up.SKA; \
 	done
 	mcopy -i $@ others_tests/moonhalo.mp3 ::MOONHALO.MP3
+	# 字体文件目录：把 resources/ 下 .ttf 放入 ::FONTS/，供字体服务内存加载
+	mmd -i $@ ::FONTS 2>/dev/null || true
+	@for f in resources/*.ttf; do \
+		[ -e "$$f" ] || continue; \
+		bn=$$(basename $$f | tr a-z A-Z); \
+		echo "  disk: FONTS/$$bn <= $$f"; \
+		mcopy -i $@ $$f ::FONTS/$$bn; \
+	done
+	# 字体服务与渲染工具：放入 ::BIN/
+	@for p in $(FONT_PROGS); do \
+		up=$$(echo $$p | tr a-z A-Z); \
+		echo "  disk: BIN/$$up.SKA  <= $(BUILD)/apps/$$p.elf"; \
+		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up.SKA; \
+	done
 	@echo "==> Built FAT32 disk $(DISK)"
 
 # ---- 运行 (带图形窗口，需 X/GTK) ----

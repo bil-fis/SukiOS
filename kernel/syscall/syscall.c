@@ -302,7 +302,10 @@ static uint64_t sys_port_claim(uint64_t port)
 #define EXEC_PATH_MAX   256
 #define EXEC_ARG_MAX    ELF_ARG_MAX   /* 与 elf_build_stack 容量共享同一常量（H1） */
 #define EXEC_STR_MAX    512
-#define EXEC_ELF_MAX    (16 * 4096)   /* 与 OOL 单条 16 页上限一致 */
+/* 可装载 ELF 映像上限：由原 64KiB(OOL 单条) 提升为 1MiB。
+ * 原因：fontsrv 集成 FreeType 后映像约 950KiB；exec_read_file 现改为
+ * FS_MSG_READ_AT 分块读（不再受 OOL 16 页限制），故内核侧上限可独立放大。 */
+#define EXEC_ELF_MAX    (1024 * 1024)
 
 /* 这两个 scratch 由 syscall_entry.S 存入“当前任务”的 scr_rip/scr_rsp
  * （task_t 字段，经 g_scratch 指针访问）；execve 改写它们使 syscall 返回
@@ -434,6 +437,15 @@ static void exec_free_args(char *argv_k[EXEC_ARG_MAX], int argc,
  * 成功返回 kmalloc 的缓冲（首部为 fs_resp_t，其后为文件字节）；
  * 通过 elf_data / elf_len 给出 ELF 数据区间。失败返回 NULL（并释放资源）。
  * 调用方负责 kfree 返回的缓冲。 */
+/* 读取磁盘上的 ELF 映像，供 execve/spawn 使用。
+ *
+ * 说明（大 ELF 支持）：FS_PORT 的整文件读走 OOL，单条 OOL 上限为
+ * MACH_MSG_OOL_MAX_PAGES(16) 页 = 64KiB，无法一次承载 fontsrv 这类集成了
+ * FreeType 的较大映像（约 950KiB）。因此本函数改用【分块读】：
+ * 反复发送 FS_MSG_READ_AT（内联响应，每块最多 FS_READ_MAX=3584 字节）从
+ * offset 递增处读取，追加到内核缓冲区，直到某次返回 0 字节（EOF）为止。
+ * 该路径不依赖 OOL，对任何大小（<= EXEC_ELF_MAX）的映像都成立。
+ */
 static uint8_t *exec_read_file(const char *path, size_t pl,
                                const uint8_t **elf_data, size_t *elf_len)
 {
@@ -447,42 +459,74 @@ static uint8_t *exec_read_file(const char *path, size_t pl,
         return NULL;
     }
 
-    uint8_t req[sizeof(mach_msg_header_t) + EXEC_PATH_MAX];
-    memset(req, 0, sizeof(req));
-    mach_msg_header_t *rh = (mach_msg_header_t *)req;
-    rh->msgh_bits = 0;
-    rh->msgh_size = sizeof(*rh) + (uint32_t)pl + 1;
-    rh->msgh_remote_port = FS_PORT;
-    rh->msgh_local_port = rp;
-    rh->msgh_id = FS_MSG_READ_FILE;
-    rh->msgh_reserved = 0;
-    memcpy(req + sizeof(*rh), path, pl + 1);
+    uint8_t req[sizeof(mach_msg_header_t) + sizeof(fs_read_at_req_t) + EXEC_PATH_MAX];
+    uint8_t resp[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + FS_READ_MAX + 64];
 
-    if (ipc_send_kernel(FS_PORT, req, rh->msgh_size) != MACH_MSG_SUCCESS) {
-        port_free(rp);
-        kfree(elfbuf);
-        return NULL;
-    }
+    uint32_t offset = 0, total = 0;
+    for (;;) {
+        if (total >= EXEC_ELF_MAX) {
+            /* 超出内核可装载上限，放弃 */
+            port_free(rp);
+            kfree(elfbuf);
+            return NULL;
+        }
+        uint32_t want = (uint32_t)(EXEC_ELF_MAX - total);
+        if (want > FS_READ_MAX) want = FS_READ_MAX;
 
-    uint8_t inline_buf[sizeof(mach_msg_header_t) + sizeof(fs_resp_t)];
-    uint32_t inline_out = 0, elf_out = 0;
-    if (ipc_recv_ool_kernel(rp, inline_buf, sizeof(inline_buf), &inline_out,
-                            elfbuf, EXEC_ELF_MAX, &elf_out, true)
-            != MACH_MSG_SUCCESS) {
-        port_free(rp);
-        kfree(elfbuf);
-        return NULL;
+        memset(req, 0, sizeof(req));
+        mach_msg_header_t *rh = (mach_msg_header_t *)req;
+        fs_read_at_req_t *ra = (fs_read_at_req_t *)(req + sizeof(*rh));
+        ra->offset = offset;
+        ra->length = want;
+        memcpy(req + sizeof(*rh) + sizeof(*ra), path, pl + 1);
+        rh->msgh_bits = 0;
+        rh->msgh_size = sizeof(*rh) + sizeof(*ra) + (uint32_t)pl + 1;
+        rh->msgh_remote_port = FS_PORT;
+        rh->msgh_local_port = rp;
+        rh->msgh_id = FS_MSG_READ_AT;
+        rh->msgh_reserved = 0;
+
+        if (ipc_send_kernel(FS_PORT, req, rh->msgh_size) != MACH_MSG_SUCCESS) {
+            port_free(rp);
+            kfree(elfbuf);
+            return NULL;
+        }
+
+        uint32_t out = 0;
+        if (ipc_recv_kernel(rp, resp, sizeof(resp), &out, true) != MACH_MSG_SUCCESS) {
+            port_free(rp);
+            kfree(elfbuf);
+            return NULL;
+        }
+        mach_msg_header_t *sh = (mach_msg_header_t *)resp;
+        fs_resp_t *fr = (fs_resp_t *)(resp + sizeof(*sh));
+        if (fr->status != FS_OK) {
+            port_free(rp);
+            kfree(elfbuf);
+            return NULL;
+        }
+        if (fr->length == 0) {
+            break;                       /* EOF：文件读完 */
+        }
+        if (fr->length > FS_READ_MAX ||
+            total + fr->length > EXEC_ELF_MAX) {
+            port_free(rp);
+            kfree(elfbuf);
+            return NULL;
+        }
+        const uint8_t *data = resp + sizeof(*sh) + sizeof(*fr);
+        memcpy(elfbuf + total, data, fr->length);
+        total += fr->length;
+        offset += fr->length;
     }
     port_free(rp);
 
-    /* OOL 数据首部即 fs_resp（status/length），其后为 ELF 字节 */
-    fs_resp_t *fr = (fs_resp_t *)elfbuf;
-    if (fr->status != FS_OK || elf_out <= sizeof(fs_resp_t)) {
+    if (total == 0) {
         kfree(elfbuf);
         return NULL;
     }
-    *elf_data = elfbuf + sizeof(fs_resp_t);
-    *elf_len = fr->length;
+    *elf_data = elfbuf;
+    *elf_len = total;
     return elfbuf;     /* 调用方负责 kfree */
 }
 

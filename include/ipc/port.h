@@ -69,7 +69,8 @@ typedef struct mach_ool_desc {
 #define SHELL_PORT      6               /* Shell 接收（键盘字符 + FS 应答） */
 #define FS_REPLY_PORT   7               /* FS_SERVER 接收磁盘应答 */
 #define APP_PORT        8               /* 通用客户端(独立 app)可认领的应答端口 */
-#define PORT_FIRST_DYN  9               /* 动态分配起始 */
+#define FONT_PORT       10              /* 字体服务（FreeType 渲染）端口 */
+#define PORT_FIRST_DYN  9               /* 动态分配起始（10 留给 FONT_PORT 预留） */
 #define PORT_MAX        64
 /* 单端口消息队列长度上限（M5 修复）：防止失控/恶意任务狂发消息耗尽内核堆，
  * 超出即拒绝投递并返回 MACH_SEND_NO_BUFFER 形成背压。 */

@@ -251,3 +251,16 @@ const char *strsignal(int sig)
         default: return "Unknown signal";
     }
 }
+
+/* ========================================================================== */
+/* 内存块原语：FreeType 等需要 memchr（memcpy/memset/memcmp/memmove 由编译器 */
+/* 内建或 suki.c 提供，这里仅补齐 memchr 以保证链接可解析）。                  */
+/* ========================================================================== */
+void *memchr(const void *s, int c, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char uc = (unsigned char)c;
+    for (size_t i = 0; i < n; i++)
+        if (p[i] == uc) return (void *)(p + i);
+    return NULL;
+}

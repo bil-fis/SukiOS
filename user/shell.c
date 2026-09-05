@@ -982,6 +982,35 @@ int main(int argc, char **argv)
     u_print("\n[shell] SukiOS shell online (Ring3, bash-like)\n");
     libc_selftest();
     sys_port_claim(SHELL_PORT);    /* A2 项：认领 shell 接收端口 */
+
+    /* 后台拉起常驻字体服务（FreeType 渲染），供 pchfnt 等程序调用 */
+    u_print("[shell] boot: launching font service + selftest\n");
+    {
+        char *fargv[] = { (char*)"/BIN/FONTSRV.SKA", NULL };
+        int fpid = sys_task_spawn((char*)"/BIN/FONTSRV.SKA", fargv, NULL);
+        if (fpid < 0)
+            u_print("[shell] warn: fontsrv spawn failed\n");
+        else
+            u_print("[shell] font service spawned\n");
+
+        /* 启动自检：用 pchfnt 渲染一行文本，验证「加载字体→光栅化→合成」链路
+         * （headless 下 fontsrv 降级仅输出统计，仍证明端到端可用） */
+        char *pargv[] = {
+            (char*)"pchfnt",
+            (char*)"--font", (char*)"/FONTS/RESOURCEHANROUNDEDCN-MEDIUM.TTF",
+            (char*)"--text", (char*)"SukiOS FreeType",
+            (char*)"--size", (char*)"40",
+            (char*)"--x",    (char*)"80",
+            (char*)"--y",    (char*)"80",
+            NULL
+        };
+        int tpid = sys_task_spawn((char*)"/BIN/PCHFNT.SKA", pargv, NULL);
+        if (tpid < 0)
+            u_print("[shell] warn: pchfnt selftest spawn failed\n");
+        else
+            u_print("[shell] pchfnt selftest spawned\n");
+    }
+
     u_print("Type 'help' for commands.\n\n");
     g_len = 0; g_cur = 0; g_line[0] = 0; g_hist_idx = g_hist_count;
     prompt();

@@ -99,6 +99,13 @@ typedef struct task {
                                       * 只在 syscall 返回用户态的边界检查并自我
                                       * 终止，避免锁被带走/资源半释放 */
     int      pending_signo;          /* pending_kill 时待投递的信号号 */
+
+    /* --- 线程（pthread）支持 --- */
+    uint64_t tid;              /* 线程 id（gettid 返回） */
+    uint64_t tgid;             /* 线程组 id（getpid 返回；fork=自身 id，clone=共享组长 tgid） */
+    uint64_t fs_base;          /* 每线程 TLS 基址（FS base MSR；arch_prctl(SET_FS) 设置） */
+    uint64_t clear_child_tid;  /* set_tid_address / CLONE_CHILD_CLEARTID：线程退出时清零并 futex_wake 的地址 */
+    uint8_t  owns_as;          /* 1=独占地址空间，退出时负责销毁 cr3/vma；0=共享（线程，由最后退出者销毁） */
 } task_t;
 
 /* FPU/SSE 状态保存与恢复原语（实现见 sched/switch.S） */
@@ -127,6 +134,7 @@ void   schedule(void);              /* 主动触发一次调度 */
  * 必须在关中断/持适当锁的上下文调用；本函数内部持 g_sched_lock（irqsave），
  * 故不会在持锁期被 IPI 嵌套（interrupt gate 自动 CLI）。 */
 void   sched_wake(task_t *t);
+void   sched_set_fs_base(uint64_t base);   /* 设置当前 CPU 的 FS base（每线程 TLS 基址） */
 task_t *sched_create_idle(uint32_t cpu);  /* 为某 CPU 建 idle 任务（P0-R1） */
 
 /* sys_wait 核心：等待子任务退出（SMP 安全，g_sched_lock 保护，P0-R1）。

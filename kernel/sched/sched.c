@@ -36,6 +36,8 @@
 #include <kernel/hda.h>      /* hda_release_owner：任务退出释放音频流 */
 #include <ipc/port.h>
 #include <kernel/fd.h>       /* fd_exit_task / fd_install_stdio */
+#include <kernel/futex.h>    /* futex_wake：线程退出时唤醒 join 等待者 */
+#include <kernel/syscall.h>  /* copy_to_user：退出清零 clear_child_tid */
 
 /* 供 spinlock 死锁诊断打印持锁任务名（spinlock.h 声明，此处实现）。
  * 仅返回当前 CPU 运行任务的名字，零副作用。 */
@@ -390,6 +392,12 @@ static task_t *task_alloc_kernel(void (*entry)(void *), void *arg,
         return NULL;
     }
     t->id = sched_next_pid();
+    /* 线程字段默认值（kzalloc 已清零，此处显式初始化避免歧义） */
+    t->tid = t->id;
+    t->tgid = t->id;
+    t->fs_base = 0;
+    t->clear_child_tid = 0;
+    t->owns_as = 1;
     t->state = READY;
     t->cr3 = vmm_kernel_pml4();
     t->priority = 128;
@@ -581,6 +589,32 @@ static task_t *steal_task(uint32_t self)
     return NULL;
 }
 
+/* 设置当前 CPU 的 FS 段基址（用户态 TLS 基址）。
+ * 内核自身用 GS（swapgs）做 per-CPU，FS 段内核态不使用；栈保护也用全局
+ * __stack_chk_guard（-mstack-protector-guard=global），不依赖 %fs，故此处写
+ * MSR_FS_BASE 是安全的。每个任务切换时统一刷新，使线程 TLS 始终指向正确 TCB。
+ *
+ * 内联汇编隔离（特权指令 wrmsr）：wrmsr 语义为 ECX=MSR 索引，EDX:EAX=写入值。
+ * 使用 noinline 封装 + 完整 Clobber List，避免被编译器优化干扰寄存器。 */
+static void set_fs_base(uint64_t base)
+{
+    uint32_t lo = (uint32_t)base;
+    uint32_t hi = (uint32_t)(base >> 32);
+    __asm__ __volatile__(
+        "mov %k[msr], %%ecx\n\t"   /* ECX = IA32_FS_BASE (0xC0000100) */
+        "mov %k[lo],  %%eax\n\t"   /* EAX = 值低 32 位 */
+        "mov %k[hi],  %%edx\n\t"   /* EDX = 值高 32 位 */
+        "wrmsr\n\t"
+        :
+        : [msr]"r"((uint32_t)0xC0000100u), [lo]"r"(lo), [hi]"r"(hi)
+        : "rax", "rcx", "rdx", "memory");
+}
+
+void sched_set_fs_base(uint64_t base)
+{
+    set_fs_base(base);
+}
+
 /* 执行一次调度（调用时须处于关中断状态，或本函数内部会自行关中断）。
  * 在持有 g_sched_lock 期间完成“挑选 + 摘链 + 状态/CR3/栈切换”，随后释锁再做
  * context_switch（绝不在持锁时切栈，避免锁被新任务栈“带走”造成其它核死等）。 */
@@ -681,6 +715,9 @@ void schedule(void)
     g_syscall_kstack[cpu] = next->kstack_top;
     g_scratch[cpu]        = &next->scr_rip;
     tss_set_rsp0(next->kstack_top);
+
+    /* 刷新 FS base 为下一任务的 TLS 基址（每线程独立；内核用 GS，FS 仅用于用户 TLS） */
+    set_fs_base(next->fs_base);
 
     bool cr3_switch = (next->cr3 != cur->cr3);
     uint64_t next_cr3 = next->cr3;
@@ -894,6 +931,23 @@ int64_t task_wait_child(uint64_t child_pid, uint64_t *rc_out)
     return 0;
 }
 
+/* 是否存在其它【存活】任务与本任务共享同一 cr3（同一地址空间）。
+ * 调用方必须已持有 g_sched_lock。用于线程退出时判断是否需要销毁地址空间：
+ * 仅最后一个退出者才销毁（避免误伤仍在运行兄弟线程的映射）。 */
+static bool address_space_shared(task_t *self)
+{
+    for (task_t *p = g_all_tasks; p; p = p->all_next) {
+        if (p == self)
+            continue;
+        /* 仅统计「存活且非僵尸」的共享者：僵尸（zombie）任务不可运行、
+         * 且回收时不销毁地址空间，不会阻止最后退出者回收 AS（避免泄漏）；
+         * 已置 dead 的兄弟线程已从 g_all_tasks 摘除，亦不计。 */
+        if (p->cr3 == self->cr3 && !p->dead && !p->zombie)
+            return true;
+    }
+    return false;
+}
+
 __attribute__((noreturn)) void task_exit_current(uint64_t code)
 {
     interrupts_disable();
@@ -902,6 +956,16 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     task_t *t = g_percpu[cpu].current_task;
     kprintf("[sched] task '%s' pid=%lu exited (code=%lu)\n",
             t->name, (unsigned long)t->id, (unsigned long)code);
+
+    /* 线程退出：清零 clear_child_tid（CLONE_CHILD_CLEARTID 语义，glibc 据此探测
+     * 线程退出）。注意：此处持有 g_sched_lock，不得调用 futex_wake（它会经
+     * sched_wake 再次拿 g_sched_lock → 自死锁）。本系统的 pthread_join 经过
+     * 用户态 join_futex + FUTEX_WAKE 实现，不依赖内核 clear_child_tid 唤醒，
+     * 故此处只做清零即可（copy_to_user 不睡眠，持锁安全）。 */
+    if (t->clear_child_tid) {
+        uint32_t zero = 0;
+        copy_to_user((void *)t->clear_child_tid, &zero, sizeof(uint32_t));
+    }
 
     /* 唤醒阻塞在本任务退出的父任务（跨核等待者发 IPI 立即唤醒） */
     {
@@ -944,10 +1008,14 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     fd_exit_task(t);        /* POSIX：关闭本任务持有的全部 fd（引用归零者会
                              * 向 FS_SERVER 发 CLOSE，释放服务端句柄，避免
                              * 反复 spawn 造成服务端句柄表耗尽） */
-    vma_destroy_all(t);
-    if (t->is_user && t->cr3 && t->cr3 != vmm_kernel_pml4()) {
-        vmm_switch(vmm_kernel_pml4());
-        vmm_destroy_address_space(t->cr3);
+    /* 仅当没有其他存活任务共享本地址空间时才销毁 cr3/vma（线程共享 AS 时由最后
+     * 退出的线程负责释放，避免误伤仍在运行兄弟线程的映射；此时已持 g_sched_lock）。 */
+    if (!address_space_shared(t)) {
+        vma_destroy_all(t);
+        if (t->is_user && t->cr3 && t->cr3 != vmm_kernel_pml4()) {
+            vmm_switch(vmm_kernel_pml4());
+            vmm_destroy_address_space(t->cr3);
+        }
     }
     t->cr3 = 0;
 
@@ -959,7 +1027,11 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
      *   等价由 init 收养后即刻退出的简化路径。
      *   注意：地址空间/端口/fd 等资源已在上方释放，zombie 仅保留 task 结构与
      *   元数据（exit_code 等）供父读取，占用极小。 */
-    bool has_parent = (t->parent_id != 0);
+    /* 线程（tgid != id，即非线程组组长）不可经 waitpid 回收——它由 pthread_join
+     * 经 futex 等待、立即回收；若当作普通子进程留作 zombie 将永久滞留。故仅组长
+     * （进程 leader）参与 waitpid 僵尸语义。 */
+    bool is_group_leader = (t->tgid == t->id);
+    bool has_parent = (t->parent_id != 0) && is_group_leader;
     if (has_parent) {
         /* 确认父仍存活于 g_all_tasks（防止父先于子退出后仍残留引用） */
         task_t *p = g_all_tasks;
@@ -995,6 +1067,8 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     g_syscall_kstack[cpu] = next->kstack_top;
     g_scratch[cpu]        = &next->scr_rip;
     tss_set_rsp0(next->kstack_top);
+    /* 刷新 FS base 为下一任务的 TLS 基址（线程退出场景下也必须正确切换） */
+    set_fs_base(next->fs_base);
 
     fpu_fxsave(&t->fpu_state);
     if (next->fpu_valid) {

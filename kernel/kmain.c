@@ -453,9 +453,11 @@ static void boot_late_init(void *arg)
      * 再跑文件类用例，故与 fs-server 的 mount 时序无关。
      * 它的输出是「完整 POSIX 系统调用层」的验收依据，用
      * `make run-headless QEMU_SERIAL="-serial file:/tmp/x.log"` 收集。 */
-    // task_create_user(user_posixtest_start,
-    //                  (size_t)(user_posixtest_end - user_posixtest_start),
-    //                  "posixtest");
+    /* POSIX 一致性测试（含本次新增的 pthread/clone/futex 多线程用例），开机自检。
+     * 输出经串口落盘，用于 QEMU 无头回归判定（验证多线程零 panic + 计数精确）。 */
+    task_create_user(user_posixtest_start,
+                     (size_t)(user_posixtest_end - user_posixtest_start),
+                     "posixtest");
 
     kprintf("[boot] core services spawned (input+display); shell deferred "
             "until display layer ready.\n\n");

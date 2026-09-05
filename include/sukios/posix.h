@@ -614,6 +614,18 @@ typedef struct suki_fd_set {
  *        a2 = 宽（像素），a3 = 高（像素），a4 = 目标 x，a5 = 目标 y；
  *   返回 0 成功，非法参数/指针返回 (uint64_t)-1。单次 blit 上限 4MiB 像素字节。 */
 #define SYS_DISPLAY_BLIT    203
+
+/* 八、线程 / 克隆（pthread 基础，SYS_CLONE 走 native 分发，不入 >=204 的 posix 表） */
+#define SYS_CLONE           205   /* 创建线程/子进程：共享地址空间 + 自定义入口（trampoline） */
+#define SUKI_ARCH_SET_FS    0x1002  /* arch_prctl：设置 FS base（TLS 基址，x86_64） */
+#define SUKI_ARCH_GET_FS    0x1003  /* arch_prctl：读取 FS base */
+/* sys_clone flags（SukiOS 自有定义；本系统程序重编译，不追求与 Linux 完全一致） */
+#define SUKI_CLONE_VM             0x0001  /* 共享地址空间（线程语义；否则按 fork 复制） */
+#define SUKI_CLONE_FILES          0x0002  /* 共享 fd 槽表 */
+#define SUKI_CLONE_THREAD         0x0004  /* 共享 tgid（getpid 返回线程组组长 pid） */
+#define SUKI_CLONE_SETTLS         0x0008  /* tls 有效，作为子线程 FS base */
+#define SUKI_CLONE_CHILD_SETTID   0x0010  /* 将子线程 tid 写入用户 *ptid */
+#define SUKI_CLONE_CHILD_CLEARTID 0x0020  /* 子线程退出时清零用户 *ctid 并 futex_wake */
 /* 204: sys_mouse_read —— 非阻塞取一个解析后的鼠标事件；无数据返回 (uint64_t)-1。
  *    a1 = 用户态 mouse_packet_t*（内核填 dx/dy/buttons/wheel 后 copy_to_user 写回）；
  *    成功返回 0，失败（指针非法）返回 (uint64_t)-1。事件语义见 kernel/mouse.h。 */

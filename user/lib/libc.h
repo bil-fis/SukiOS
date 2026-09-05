@@ -188,4 +188,26 @@ int getopt(int argc, char *const argv[], const char *optstring);
 int getopt_long(int argc, char *const argv[], const char *optstring,
                 const struct option *longopts, int *longindex);
 
+/* ---- 线程 / TLS / futex 底层 syscall 封装（pthread.c 复用） ---- */
+/* clone：创建共享地址空间的线程或新进程。trampoline 为子线程用户态入口，
+ * child_stack 为子线程用户栈顶，tls 为子线程 FS base（TCB 地址）。
+ * 返回父进程的子系统 tid；子线程不经过本调用返回，直接执行 trampoline。 */
+long clone(unsigned long flags, void *child_stack, void *trampoline,
+           void *tls, void *ptid, void *ctid);
+
+/* futex：op=0 等待（*uaddr==val 才睡），op=1 唤醒最多 val 个等待者 */
+int futex(uint32_t *uaddr, int op, uint32_t val, const void *timeout,
+          uint32_t *uaddr2, uint32_t val3);
+
+/* arch_prctl：x86_64 专用，code=SUKI_ARCH_SET_FS/GET_FS，addr 为 FS base 或接收缓冲 */
+long arch_prctl(int code, void *addr);
+
+/* gettid / set_tid_address：线程 id 与退出清零地址登记 */
+int  gettid(void);
+int  set_tid_address(int *tidptr);
+
+/* POSIX mmap / munmap：六参 mmap 薄封装（底层 SYS_MMAP=90 / SYS_MUNMAP=91） */
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off);
+int  munmap(void *addr, size_t len);
+
 #endif /* _SUKI_USER_LIBC_H */

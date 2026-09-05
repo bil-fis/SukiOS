@@ -31,6 +31,10 @@
 #include <kernel/fd.h>       /* fd_exit_task()：任务退出时释放其 fd 表 */
 #include <kernel/mouse.h>    /* mouse_get_packet()：SYS_MOUSE_READ 内核采集层 */
 
+/* sys_clone 在 kernel/syscall/sys_posix.c 实现（pthread 线程创建基座） */
+extern int64_t sys_clone(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                         uint64_t a5, uint64_t a6);
+
 /* ---- 用户指针校验（A1 项）----
  * 合法用户区间：[0, USER_SPACE_TOP]，且 [ptr, ptr+n) 不得回绕/越界；
  * 逐页检查页表项存在（copy_from_user）或被映射为可写（copy_to_user），
@@ -998,6 +1002,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_CONSOLE_READ:    return sys_console_read(a1, a2);
     case SYS_DISPLAY_BLIT:    return sys_display_blit(a1, a2, a3, a4, a5);
     case SYS_OOL_UNMAP:       return ipc_ool_unmap_user(a1);
+    /* 线程创建（pthread 基座）：在 shared 地址空间内造新 task，跳入 trampoline。 */
+    case SYS_CLONE:           return sys_clone(a1, a2, a3, a4, a5, a6);
     default: {
         /* 其余全部交给 POSIX 层（进程/文件/内存/时间/系统/网络号区） */
         int64_t r = 0;

@@ -26,6 +26,7 @@
  */
 #include <kernel/syscall.h>
 #include <kernel/posix.h>
+#include <kernel/futex.h>    /* futex_wait / futex_wake：pthread 同步基座 */
 #include <kernel/types.h>
 #include <kernel/task.h>
 #include <kernel/string.h>
@@ -168,6 +169,9 @@ int64_t sys_fork(void)
     memcpy(child, parent, sizeof(task_t));
     child->id = sched_next_pid();
     child->parent_id = parent->id;
+    /* fork 创建的是全新进程（进程组组长），必须拥有独立 tgid（== 自身 id），
+     * 否则会被误判为「线程」而在退出时不保留 zombie，导致父 waitpid 收到 -ECHILD。 */
+    child->tgid = child->id;
     child->kstack_base = kst;
     child->kstack_top = kst + KERNEL_STACK_BYTES;
     *(uint64_t *)kst = KSTACK_CANARY;
@@ -281,7 +285,158 @@ int64_t sys_fork(void)
 }
 
 /* getpid / getppid / getuid / geteuid / getgid / getegid */
-static int64_t sys_getpid(void)  { return (int64_t)sched_current()->id; }
+/* getpid 返回线程组 id（进程 leader）。线程共享 tgid，故同进程内各线程 getpid 一致。 */
+static int64_t sys_getpid(void)  { return (int64_t)sched_current()->tgid; }
+/* ========================================================================== */
+/*  clone：创建线程 / 子进程（pthread 基座，SYS_CLONE 走 native 分发）            */
+/*                                                                            */
+/*  flags（SukiOS 自有定义）：                                                 */
+/*    SUKI_CLONE_VM             共享父地址空间（线程语义；否则按 fork 复制）     */
+/*    SUKI_CLONE_FILES          共享 fd 槽表                                   */
+/*    SUKI_CLONE_THREAD         共享 tgid（getpid 返回组长 pid）               */
+/*    SUKI_CLONE_SETTLS         tls 作为子线程 FS base                        */
+/*    SUKI_CLONE_CHILD_SETTID   将子线程 tid 写入用户 *ptid                   */
+/*    SUKI_CLONE_CHILD_CLEARTID 子线程退出时清零用户 *ctid 并 futex_wake      */
+/*                                                                            */
+/*  child_stack 为子线程用户栈顶，trampoline 为子线程用户态入口（内核直接跳入，  */
+/*  不经过父的 syscall 返回路径）。父返回子线程 id；子线程不返回本调用，直接执行   */
+/*  trampoline -> start -> pthread_exit。                                      */
+/* ========================================================================== */
+int64_t sys_clone(uint64_t flags, uint64_t child_stack, uint64_t trampoline,
+                  uint64_t tls, uint64_t ptid, uint64_t ctid)
+{
+    task_t *parent = sched_current();
+    uint32_t cpu = cpu_index();
+
+    if (child_stack == 0 || trampoline == 0)
+        return -SUKI_EINVAL;
+
+    uint64_t kstack = kstack_alloc();
+    if (!kstack)
+        return -SUKI_ENOMEM;
+
+    task_t *child = (task_t *)kzalloc(sizeof(task_t));
+    if (!child) {
+        kstack_free(kstack);
+        return -SUKI_ENOMEM;
+    }
+
+    child->id = sched_next_pid();
+    child->state = READY;
+    child->priority = parent->priority;
+    child->ticks_remaining = TIME_SLICE_TICKS;
+    child->is_user = parent->is_user;
+    child->alive = true;
+    child->cpu = parent->cpu;
+    child->kstack_base = kstack;
+    child->kstack_top  = kstack + KERNEL_STACK_BYTES;
+    *(uint64_t *)kstack = KSTACK_CANARY;
+
+    /* 线程：共享父地址空间（同一 cr3 与 vma 链表）；否则按 fork 复制 */
+    if (flags & SUKI_CLONE_VM) {
+        child->cr3 = parent->cr3;
+        child->vma_list = parent->vma_list;
+        child->owns_as = 0;
+    } else {
+        uint64_t new_as = vmm_create_address_space();
+        if (!new_as) {
+            kfree(child);
+            kstack_free(kstack);
+            return -SUKI_ENOMEM;
+        }
+        child->cr3 = new_as;
+        if (!vma_clone_all(child, parent)) {
+            vmm_destroy_address_space(new_as);
+            kstack_free(kstack);
+            kfree(child);
+            return -SUKI_ENOMEM;
+        }
+        child->owns_as = 1;
+    }
+
+    /* 子线程入口 = trampoline，栈 = child_stack；保存父 FPU 快照 */
+    child->user_rip       = trampoline;
+    child->user_stack_top = child_stack;
+    child->scr_rip        = trampoline;
+    child->scr_rsp        = child_stack;
+    fpu_fxsave(&child->fpu_state);
+    child->fpu_valid = true;
+
+    /* 线程字段 */
+    child->tid = child->id;
+    child->tgid = (flags & SUKI_CLONE_THREAD) ? parent->tgid : child->id;
+    child->fs_base = (flags & SUKI_CLONE_SETTLS) ? tls : parent->fs_base;
+    child->clear_child_tid = (flags & SUKI_CLONE_CHILD_CLEARTID) ? ctid : 0;
+
+    /* 继承 POSIX 进程属性 */
+    child->parent_id = (flags & SUKI_CLONE_THREAD) ? parent->parent_id : parent->id;
+    child->zombie = false;
+    child->dead = false;
+    memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
+    child->cwd_cluster = parent->cwd_cluster;
+    child->uid = parent->uid;
+    child->gid = parent->gid;
+    child->euid = parent->euid;
+    child->egid = parent->egid;
+    child->umask = parent->umask;
+    child->brk = parent->brk;
+    child->brk_start = parent->brk_start;
+    child->pending_kill = false;
+    child->pending_signo = 0;
+
+    /* KPTI：把子内核栈映射进（可能共享的）影子 PML4 */
+    vmm_kpti_map_kstack(child->cr3, child->kstack_base, child->kstack_top);
+
+    /* fd 表：拷贝父的 fd 槽（共享底层 file 对象引用）。线程场景下由各线程独立
+     * close，后续可增强为共享 fd 表指针（见 SukiOS 全栈手册「线程 fd 共享」）。 */
+    fd_fork_clone(child, parent);
+
+    /* 构造内核栈帧（与 fork 同构，仅覆盖子线程 RIP/RSP 为 trampoline/child_stack）。
+     * GPR 帧来源与 fork 一致：取自本 CPU 的 syscall GPR 保存区 g_syscall_gpr[cpu]，
+     * 该区由 syscall 入口写入父任务此刻的 12 个用户 GPR。子线程的 trampoline 从 TLS
+     * （TCB）读取线程函数与参数，故这些 GPR 值仅作状态自洽（不被 trampoline 依赖）。 */
+    uint64_t frame = g_syscall_gpr[cpu];
+    if (frame < KSTACK_AREA_BASE || frame + 12 * 8 > KSTACK_AREA_END)
+        return -SUKI_EINVAL;
+    uint64_t *gpr = (uint64_t *)frame;
+
+    uint64_t *sp = (uint64_t *)child->kstack_top - 24;
+    sp[0] = gpr[6];                    /* r15 */
+    sp[1] = gpr[7];                    /* r14 */
+    sp[2] = gpr[8];                    /* r13 */
+    sp[3] = gpr[9];                    /* r12 */
+    sp[4] = gpr[10];                   /* rbp */
+    sp[5] = gpr[11];                   /* rbx */
+    sp[6] = (uint64_t)fork_child_return;  /* context_switch 返回地址 */
+
+    for (int i = 0; i < 12; i++)
+        sp[7 + i] = gpr[i];
+    sp[19] = trampoline;               /* 子线程用户 RIP = trampoline */
+    sp[20] = USER_CS_SEL;
+    sp[21] = USER_RFLAGS;
+    sp[22] = child_stack;              /* 子线程用户 RSP = child_stack */
+    sp[23] = USER_DS_SEL;
+    child->rsp = (uint64_t)sp;
+
+    /* 子进程的返回暂存：与 fork 同语义（后续正常 syscall 会被覆盖） */
+    child->scr_rip = trampoline;
+    child->scr_rsp = child_stack;
+
+    /* CLONE_CHILD_SETTID：把子线程 tid 写入用户 *ptid */
+    if (flags & SUKI_CLONE_CHILD_SETTID) {
+        uint64_t id = child->id;
+        if (copy_to_user((void *)ptid, &id, sizeof(uint64_t)) != sizeof(uint64_t))
+            kprintf("[posix] clone: CHILD_SETTID copy_to_user failed\n");
+    }
+
+    task_publish_ready(child);
+
+    kprintf("[posix] clone: parent pid=%lu -> tid=%lu (thread=%d, cr3=%p)\n",
+            (unsigned long)parent->id, (unsigned long)child->id,
+            (int)((flags & SUKI_CLONE_THREAD) != 0), (void *)child->cr3);
+    return (int64_t)child->id;
+}
+
 static int64_t sys_getppid(void) { return (int64_t)sched_current()->parent_id; }
 static int64_t sys_getuid(void)  { return (int64_t)sched_current()->uid; }
 static int64_t sys_geteuid(void) { return (int64_t)sched_current()->euid; }
@@ -547,28 +702,53 @@ static int64_t sys_prctl(int32_t option, uint64_t arg2)
     return 0;
 }
 
-/* futex：本阶段无用户态线程库（pthread 尚未落地）。真实的 futex 需要
- * 「按用户地址建等待队列」的能力；此处返回 ENOSYS 是 POSIX 允许的正确语义，
- * newlib/应用据此降级为忙等或自旋锁，不会误判为成功。 */
-static int64_t sys_futex(uint64_t a1, uint64_t a2, uint64_t a3)
+/* futex：基于 kernel/sched/futex.c 的真实实现。
+ * a1=uaddr(用户 32 位字), a2=op, a3=val, a4=timeout_ns, a5=uaddr2, a6=val3。
+ * op=0 (FUTEX_WAIT)：仅当 *uaddr==val 时阻塞；op=1 (FUTEX_WAKE)：唤醒最多 val 个。
+ * 其余 op（REQUEUE 等）暂返回 ENOSYS（pthread 基础集仅需 wait/wake）。 */
+static int64_t sys_futex(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                         uint64_t a5, uint64_t a6)
 {
-    (void)a1; (void)a2; (void)a3;
-    return -SUKI_ENOSYS;
+    (void)a5; (void)a6;
+    uint32_t *uaddr = (uint32_t *)a1;
+    int op = (int)a2;
+    uint32_t val = (uint32_t)a3;
+    uint64_t timeout_ns = a4;
+    if (op == 1) {                       /* FUTEX_WAKE */
+        return futex_wake(uaddr, (int)val);
+    } else if (op == 0) {                /* FUTEX_WAIT */
+        return futex_wait(uaddr, val, timeout_ns);
+    }
+    return -SUKI_ENOSYS;                  /* REQUEUE 等暂不支持 */
 }
 
-/* set_tid_address / arch_prctl：Linux 兼容桩，本架构无对应语义。
- * glibc 启动会调用它们；返回 0（成功无操作）是安全且符合语义的——
- * set_tid_address 只是登记一个「退出时清零的地址」，不做也无害；
- * arch_prctl 在 x86_64 上仅用于设置 FS/GS 基址，本系统 GS 由内核独占。 */
+/* set_tid_address：登记「线程退出时清零并 futex_wake」的地址（pthread_join 用）。
+ * 返回当前线程 id（glibc 据此写回 tid）。 */
 static int64_t sys_set_tid_address(uint64_t addr)
 {
-    (void)addr;
+    sched_current()->clear_child_tid = addr;
     return (int64_t)sched_current()->id;
 }
+
+/* arch_prctl：x86_64 专用，设置/读取 FS base（TLS 基址）。
+ * 内核用 GS（swapgs）做 per-CPU，FS 段专供用户态 TLS，二者不冲突。 */
 static int64_t sys_arch_prctl(int32_t code, uint64_t addr)
 {
-    (void)code; (void)addr;
-    return -SUKI_EINVAL;
+    task_t *cur = sched_current();
+    switch (code) {
+    case SUKI_ARCH_SET_FS:
+        cur->fs_base = addr;
+        sched_set_fs_base(addr);   /* 立即生效（对当前运行任务） */
+        return 0;
+    case SUKI_ARCH_GET_FS: {
+        uint64_t v = cur->fs_base;
+        if (copy_to_user((void *)addr, &v, sizeof(uint64_t)) != sizeof(uint64_t))
+            return -SUKI_EFAULT;
+        return 0;
+    }
+    default:
+        return -SUKI_EINVAL;
+    }
 }
 
 /* ========================================================================== */
@@ -2114,7 +2294,7 @@ bool posix_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     case SYS_EXIT_GROUP:       r = sys_exit_group(a1); break;
     case SYS_SET_TID_ADDRESS:  r = sys_set_tid_address(a1); break;
     case SYS_ARCH_PRCTL:       r = sys_arch_prctl((int32_t)a1, a2); break;
-    case SYS_FUTEX:            r = sys_futex(a1, a2, a3); break;
+    case SYS_FUTEX:            r = sys_futex(a1, a2, a3, a4, a5, a6); break;
     case SYS_GETRLIMIT:
         r = sys_getrlimit((int32_t)a1, (suki_rlimit_t *)a2);
         break;

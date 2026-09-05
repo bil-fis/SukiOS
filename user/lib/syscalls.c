@@ -98,3 +98,60 @@ int _wait(int *status)
 {
     return waitpid(-1, status, 0);
 }
+
+/* ========================================================================== */
+/* 线程 / TLS / futex 底层 syscall 封装（pthread.c 复用）                       */
+/* ========================================================================== */
+
+long clone(unsigned long flags, void *child_stack, void *trampoline,
+           void *tls, void *ptid, void *ctid)
+{
+    long r = suki_syscall6(SYS_CLONE, (uint64_t)flags, (uint64_t)child_stack,
+                           (uint64_t)trampoline, (uint64_t)tls,
+                           (uint64_t)ptid, (uint64_t)ctid);
+    return r;
+}
+
+int futex(uint32_t *uaddr, int op, uint32_t val, const void *timeout,
+          uint32_t *uaddr2, uint32_t val3)
+{
+    long r = suki_syscall6(SYS_FUTEX, (uint64_t)uaddr, (uint64_t)op,
+                           (uint64_t)val, (uint64_t)timeout,
+                           (uint64_t)uaddr2, (uint64_t)val3);
+    /* futex 返回 0 表示成功（唤醒/睡眠），负值（内核 errno）需经 libc_ret 转换 */
+    return (int)libc_ret(r);
+}
+
+long arch_prctl(int code, void *addr)
+{
+    long r = suki_syscall2(SYS_ARCH_PRCTL, (uint64_t)code, (uint64_t)addr);
+    return (long)libc_ret(r);
+}
+
+int gettid(void)
+{
+    long r = suki_syscall0(SYS_GETTID);
+    return (int)libc_ret(r);
+}
+
+int set_tid_address(int *tidptr)
+{
+    long r = suki_syscall1(SYS_SET_TID_ADDRESS, (uint64_t)tidptr);
+    return (int)libc_ret(r);
+}
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
+{
+    void *r = sys_mmap_posix(addr, len, prot, flags, fd, off);
+    if ((intptr_t)r < 0) {
+        errno = (int)(-(intptr_t)r);
+        return MAP_FAILED;
+    }
+    return r;
+}
+
+int munmap(void *addr, size_t len)
+{
+    long r = suki_syscall2(SYS_MUNMAP, (uint64_t)addr, (uint64_t)len);
+    return (int)libc_ret(r);
+}

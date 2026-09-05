@@ -364,6 +364,36 @@ static void clear_screen_area(void)
     g_term_y = 0;
 }
 
+/* 终端软滚动：把客户区整体上移【一行】（CHAR_H 像素），末行清空。
+ * 与 clear_screen_area 不同，本函数保留已有文本，仅把顶部一行推出窗口，
+ * 避免 shell 写满时「刷新整个区域」（历史文本丢失、整屏闪烁）。
+ * 像素拷贝直接在帧缓冲上做（xRGB32，每像素 4 字节）；拷贝方向自上而下、
+ * 目标行恒在源行之上，逐行互不重叠，安全无撕裂。 */
+static void term_scroll_up(void)
+{
+    if (g_term_rows == 0) return;
+    uint32_t left     = CON_MARGIN;
+    uint32_t top      = TITLE_H + CON_MARGIN;
+    uint32_t width_px = g_fb_width - CON_MARGIN * 2;
+    uint32_t pitch_px = g_fb_pitch / 4;
+    uint32_t row_px   = CHAR_H;
+    uint32_t rows     = g_term_rows;
+
+    /* 鼠标光标若是可见的，先在滚动前恢复其背景：否则滚动把箭头像素一起上移，
+     * 之后光标移动恢复背景时会把错误的像素写回，造成残影。 */
+    if (g_cur_visible) cursor_restore_bg();
+
+    /* 逐行上移：第 y 行 <- 第 y+1 行（y = 0 .. rows-2） */
+    for (uint32_t y = 0; y + 1 < rows; y++) {
+        uint32_t *dst = (uint32_t *)g_fb + (top + y * row_px) * pitch_px + left;
+        uint32_t *src = (uint32_t *)g_fb + (top + (y + 1) * row_px) * pitch_px + left;
+        memcpy(dst, src, (size_t)width_px * row_px * sizeof(uint32_t));
+    }
+    /* 清空末行（用窗口背景色填充） */
+    uint32_t *dst = (uint32_t *)g_fb + (top + (rows - 1) * row_px) * pitch_px + left;
+    for (uint32_t i = 0; i < width_px * row_px; i++) dst[i] = COL_WINBG;
+}
+
 /* 执行一条 CSI 序列（终结字母 final） */
 static void csi_dispatch(char final)
 {
@@ -461,12 +491,9 @@ static void term_putc(char c)
     }
     if (g_term_x >= g_term_cols) { g_term_x = 0; g_term_y++; }
     if (g_term_y >= g_term_rows) {
-        /* 软滚动：整体上移一行（无完整文本缓冲，采用保守策略避免乱码） */
+        /* 软滚动：客户区上移一行（保留历史文本），而非清空整片区域。 */
+        term_scroll_up();
         g_term_y = g_term_rows - 1;
-        fill_rect(CON_MARGIN, TITLE_H + CON_MARGIN,
-                  g_fb_width - CON_MARGIN * 2,
-                  g_fb_height - TITLE_H - CON_MARGIN * 2, COL_WINBG);
-        g_term_y = 0;
         g_term_x = 0;
     }
 }

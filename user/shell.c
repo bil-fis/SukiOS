@@ -51,26 +51,89 @@ static char g_line[LINE_MAX];
 static int  g_len = 0;    /* 已输入字符数 */
 static int  g_cur = 0;    /* 光标下标 0..g_len */
 
+/* 终端光标列追踪（与显示服务侧的 g_term_x 保持同步的「用户态镜像」）。
+ * shell 在行编辑期只做「整行重绘」，重绘前必须先把终端光标移回编辑行起点，
+ * 否则 ESC[K 会从错误的列开始清屏、把已删除字符残留屏幕上（退格失效的根因）。
+ * 本镜像在 prompt() 时初始化为提示符之后的列号，并由 ed_raw() 在每次输出时
+ * 随字符/转义序列同步推进，使 redraw_from_cursor() 总能算出「回退到行首」所需的
+ * 左移量，从而不依赖显示服务回复、也无需绝对定位（避免跨行环绕问题）。 */
+static int  g_scr_x = 0;        /* 终端光标当前列（相对整行左缘） */
+static int  g_prompt_col = 0;   /* 编辑行起点列（提示符之后） */
+
 /* 前向声明 */
 static int run_builtin_raw(char *line);
 static void prompt(void);
 
 /* ============ 行内编辑（光标感知） ============ */
-/* 把光标移回行首并重绘整行（用于历史切换/补全后） */
-/* 从光标处起重绘（保持光标位置） */
+/* ---- 终端光标镜像维护 ----
+ * ed_raw() 在把字符串交给显示服务前，先按字符更新 g_scr_x（遇到 \n/\r/\t/\b
+ * 及我们自身发出的 CSI 序列时同步推进，使 shell 侧的列号与显示服务 g_term_x
+ * 始终一致）。这样 redraw_from_cursor() 就能算出「终端光标距编辑行起点的偏移」，
+ * 先左移回起点、清行尾、重印整行、再把光标移回 g_cur，全程不依赖绝对定位，
+ * 因此即便出现长行环绕也是最坏情况（单行内仍正确），不会出现错位或残留。 */
+static void ed_track(const char *s)
+{
+    for (; *s; s++) {
+        unsigned char ch = (unsigned char)*s;
+        if (ch == '\n' || ch == '\r') {
+            g_scr_x = 0;
+        } else if (ch == '\t') {
+            g_scr_x += 8 - (g_scr_x % 8);
+        } else if (ch == '\b') {
+            if (g_scr_x > 0) g_scr_x--;
+        } else if (ch == 0x1B) {                 /* 解析我们发出的 CSI */
+            if (s[1] == '[') {
+                const char *p = s + 2;
+                int n = 0;
+                while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
+                char fin = *p;
+                if (fin == 'D')      g_scr_x = (g_scr_x >= n ? g_scr_x - n : 0);
+                else if (fin == 'C') g_scr_x += n;
+                /* K / H 等不改变列号 */
+                s = p;                              /* 跳过整条 CSI */
+            }
+        } else {
+            g_scr_x++;
+        }
+    }
+}
+static void ed_raw(const char *s) { ed_track(s); u_print(s); }
+
+/* 发射左/右移光标的 CSI 序列（经 ed_raw 同步镜像） */
+static void ed_left(int n)
+{
+    if (n <= 0) return;
+    char seq[16]; int k = 0;
+    seq[k++] = '\x1b'; seq[k++] = '[';
+    if (n >= 10) seq[k++] = '0' + (n / 10);
+    seq[k++] = '0' + (n % 10);
+    seq[k++] = 'D';
+    ed_raw(seq);
+}
+static void ed_right(int n)
+{
+    if (n <= 0) return;
+    char seq[16]; int k = 0;
+    seq[k++] = '\x1b'; seq[k++] = '[';
+    if (n >= 10) seq[k++] = '0' + (n / 10);
+    seq[k++] = '0' + (n % 10);
+    seq[k++] = 'C';
+    ed_raw(seq);
+}
+
+/* 从编辑行起点起重绘整行（清行尾 + 重印 g_line + 把光标移回 g_cur）。
+ * 关键：先按 g_scr_x 回退到编辑行起点，再清屏，否则清行尾会从错误列开始，
+ * 旧字符（如刚被退格删除的那个）会残留在屏幕上——这正是「退格不好使」的根因。 */
 static void redraw_from_cursor(void)
 {
-    u_print("\x1b[K");                     /* 清到行尾 */
-    u_print(g_line + g_cur);               /* 打印光标后内容 */
-    int back = g_len - g_cur;              /* 把光标移回正确位置 */
-    if (back > 0) {
-        char seq[16]; int k = 0;
-        seq[k++] = '\x1b'; seq[k++] = '[';
-        if (back >= 10) seq[k++] = '0' + (back / 10);
-        seq[k++] = '0' + (back % 10);
-        seq[k++] = 'D';
-        u_printn(seq, k);
-    }
+    int back_to_start = g_scr_x - g_prompt_col;   /* 终端光标距编辑行起点的偏移 */
+    if (back_to_start > 0) ed_left(back_to_start); /* 回到编辑行起点 */
+    ed_raw("\x1b[K");                             /* 清到行尾 */
+    ed_raw(g_line);                               /* 重印整行 */
+    int target = g_prompt_col + g_cur;            /* 光标应处的列 */
+    int delta = target - g_scr_x;                 /* 重印后 g_scr_x = 起点+g_len */
+    if (delta < 0)      ed_left(-delta);
+    else if (delta > 0) ed_right(delta);
 }
 
 /* 在光标处插入一个字符（bash 风格：把右侧字符右推） */
@@ -81,13 +144,7 @@ static void edit_insert(char c)
         memmove(g_line + g_cur + 1, g_line + g_cur, g_len - g_cur);
     g_line[g_cur] = c;
     g_len++; g_cur++;
-    u_printn(&c, 1);                       /* 回显新字符 */
-    /* 仅当光标右侧还有内容（在行中间插入）时才需要清行尾 + 重绘右侧 +
-     * 把光标移回。在行尾插入是最常见情形，此时不发任何控制序列——避免
-     * 每次按键都向终端倾泻 ESC[K 等序列（既省带宽，也降低终端解析负担）。 */
-    if (g_cur < g_len) {
-        redraw_from_cursor();
-    }
+    redraw_from_cursor();   /* 统一整行重绘，正确反映插入字符与光标位置 */
 }
 
 static void edit_backspace(void)           /* 删光标前一个字符 */
@@ -107,52 +164,33 @@ static void edit_delete(void)              /* 删光标后一个字符 (Del) */
     redraw_from_cursor();
 }
 
-static void edit_left(void)  { if (g_cur > 0)  { g_cur--; u_print("\x1b[D"); } }
-static void edit_right(void) { if (g_cur < g_len) { g_cur++; u_print("\x1b[C"); } }
+static void edit_left(void)  { if (g_cur > 0)  { g_cur--; ed_left(1); } }
+static void edit_right(void) { if (g_cur < g_len) { g_cur++; ed_right(1); } }
 static void edit_home(void)
 {
     if (g_cur > 0) {
-        char seq[16]; int k = 0;
-        seq[k++] = '\x1b'; seq[k++] = '[';
-        if (g_cur >= 10) seq[k++] = '0' + (g_cur / 10);
-        seq[k++] = '0' + (g_cur % 10);
-        seq[k++] = 'D';
-        u_printn(seq, k);
+        ed_left(g_cur);     /* 镜像列已含起点偏移：左移 g_cur 列即回行首 */
         g_cur = 0;
     }
 }
 static void edit_end(void)
 {
     if (g_cur < g_len) {
-        char seq[16]; int k = 0;
-        int d = g_len - g_cur;
-        seq[k++] = '\x1b'; seq[k++] = '[';
-        if (d >= 10) seq[k++] = '0' + (d / 10);
-        seq[k++] = '0' + (d % 10);
-        seq[k++] = 'C';
-        u_printn(seq, k);
+        ed_right(g_len - g_cur);
         g_cur = g_len;
     }
 }
 
 /* 用 text 整体替换当前编辑行（用于历史切换）。text 为 "" 表示回到空的新行。
  *
- * 关键：必须【先】按【旧】的 g_cur 把光标左移回行首，再清行，最后打印新内容。
- * 早期实现是「redraw_full(); hist_load(); redraw_full();」两次重绘——第二次
- * 的左移量用的是【新】行长，而屏幕上光标实际停在旧行重印之后的位置，二者
- * 不一致会导致光标错位、旧内容残留（表现为屏幕上莫名出现上一句命令）。
- * 这里改为单次、顺序正确的重绘：移回行首 -> 清整行 -> 打印新行。 */
+ * 关键：必须【先】按【当前镜像】把终端光标左移回行首（CLI 下不能用旧 g_cur
+ * 计算左移量——屏幕光标实际停在旧行重印之后的位置），再清行、打印新内容。
+ * 用镜像列 g_scr_x 计算偏移可彻底避免历史切换时旧命令残留/错位。 */
 static void line_replace(const char *text)
 {
-    char seq[16]; int k = 0;
-    if (g_cur > 0) {                       /* 1) 左移光标回行首（用旧 g_cur） */
-        seq[k++] = '\x1b'; seq[k++] = '[';
-        if (g_cur >= 10) seq[k++] = '0' + (g_cur / 10);
-        seq[k++] = '0' + (g_cur % 10);
-        seq[k++] = 'D';
-        u_printn(seq, k);
-    }
-    u_print("\x1b[K");                     /* 2) 光标已在行首 -> 清整行 */
+    int back = g_scr_x - g_prompt_col;     /* 终端光标距编辑行起点的偏移 */
+    if (back > 0) ed_left(back);           /* 1) 左移回行首 */
+    ed_raw("\x1b[K");                      /* 2) 清整行 */
     if (text) {                            /* 3) 载入并打印新内容 */
         int i = 0;
         while (text[i] && i < LINE_MAX - 1) { g_line[i] = text[i]; i++; }
@@ -163,7 +201,7 @@ static void line_replace(const char *text)
         g_len = 0;
     }
     g_cur = g_len;
-    u_print(g_line);
+    ed_raw(g_line);
 }
 
 /* Tab 补全：对当前光标所在词的目录/基础名前缀做文件名匹配。
@@ -251,11 +289,10 @@ static void edit_tab_complete(void)
         u_print("  "); u_print(matches[i]); u_print("\r\n");
     }
     prompt();
-    /* 注意：prompt() 之后光标已位于该行起始位置（提示符之后），此时【绝不能】
-     * 再左移光标——否则会退回到提示符内部并把提示符一起清掉。这里只需清行尾
-     * 并重印整行即可（原实现调用 redraw_full() 会左移 g_cur，导致提示符被破坏）。 */
-    u_print("\x1b[K");
-    u_print(g_line);
+    /* prompt() 之后光标位于编辑行起点（提示符之后），g_scr_x 已重置。
+     * 只需清行尾并重印整行；用 ed_raw 同步镜像，避免后续编辑错位。 */
+    ed_raw("\x1b[K");
+    ed_raw(g_line);
     g_cur = g_len;
 }
 
@@ -272,6 +309,10 @@ static void prompt(void)
     u_print("SukiOS:");
     u_print(g_cwd);
     u_print("> ");
+    /* 编辑行起点列 = 提示符长度（"SukiOS:" = 7 + "> " = 2 = 9）+ cwd 长度。
+     * 同时初始化终端列镜像，使后续 redraw_from_cursor() 的「回退到行首」计算正确。 */
+    g_prompt_col = 9 + (int)strlen(g_cwd);
+    g_scr_x = g_prompt_col;
 }
 
 /* 发送 FS 请求（应答异步回到 SHELL_PORT，由主循环等待收取） */

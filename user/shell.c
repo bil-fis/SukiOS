@@ -228,10 +228,14 @@ static void edit_tab_complete(void)
         memcpy(dir, frag, dlen); dir[dlen] = 0;
         strcpy(base, slash + 1);
         if (dir[0] != '/') {
-            /* 相对路径：基于 g_cwd 拼接 */
-            snprintf(dir, sizeof dir, "%s%s", g_cwd,
-                     (g_cwd[0] && g_cwd[strlen(g_cwd)-1] != '/') ? "/" : "");
-            strncat(dir, frag, sizeof(dir) - strlen(dir) - 1);
+            /* 相对路径：仅拼接【目录部分】dir，而非整个 frag——否则会把基础名
+             * 也拼进目录路径，导致 opendir 失败（如 "SUB/F" 被拼成 "/SUB/F"）。 */
+            char tmp[PATH_MAX];
+            snprintf(tmp, sizeof(tmp), "%s%s%s", g_cwd,
+                     (g_cwd[0] && g_cwd[strlen(g_cwd)-1] != '/') ? "/" : "",
+                     dir);
+            strncpy(dir, tmp, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = '\0';
         }
     } else {
         strncpy(dir, g_cwd, sizeof dir); dir[sizeof(dir)-1] = 0;
@@ -306,6 +310,13 @@ static int g_esc_num = 0;   /* ESC[ 之后的数字前缀（如 Delete 的 3） 
 
 static void prompt(void)
 {
+    /* 关键：强制「回车 + 换行」让终端光标回到新行行首，并重置镜像。
+     * 否则若上一条命令输出未以换行结尾（如 echo -n、文件末尾无 \n 的 cat、
+     * 或 FS 列表恰在行尾收尾），显示侧光标会停在任意列，而 g_scr_x 仍按
+     * g_prompt_col 计算，二者失步 → redraw_from_cursor() 清行尾的起点算错，
+     * 旧字符残留（如 "lsear"）。先 \r\n 复位可彻底规避这一类失步。 */
+    ed_raw("\r\n");
+    g_scr_x = 0;
     u_print("SukiOS:");
     u_print(g_cwd);
     u_print("> ");
@@ -713,8 +724,9 @@ static int run_builtin_raw(char *line)
                 "Syntax: ';' separates; '&&' / '||' short-circuit; '#' comment; '~' home\n");
     } else if (u_strcmp(line, "ls") == 0) {
         /* 支持 ls -l / ls --long：目前 FS 后端以固定格式返回目录清单，
-         * -l 仅影响展示标签，核心仍走 FS_MSG_LIST（真正可工作的列表）。 */
-        fs_request(FS_MSG_LIST, 0);
+         * -l 仅影响展示标签，核心仍走 FS_MSG_LIST（真正可工作的列表）。
+         * 传入当前工作目录 g_cwd（绝对路径），使 ls 列出当前目录而非总是根目录。 */
+        fs_request(FS_MSG_LIST, g_cwd);
         fs_wait_and_print(FS_MSG_LIST, false);
     } else if (u_strcmp(line, "cat") == 0) {
         if (!*arg) {

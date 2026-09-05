@@ -990,13 +990,21 @@ static void handle_chmod(uint32_t local_port, uint32_t id,
 }
 
 /* ===================== 请求处理（一代） ===================== */
-/* 列根目录：枚举 "/" 下所有条目，以 "name\n" 形式写入应答数据。 */
-static void handle_list(uint32_t local_port, uint32_t id)
+/* 列目录：枚举 path（来自请求负载，绝对或相对）下所有条目，以 "name\n" 形式写入应答数据。 */
+static void handle_list(uint32_t local_port, uint32_t id, const char *path)
 {
     char *data = (char *)(g_resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t));
     uint32_t total = 0;
 
-    FRESULT fr = f_opendir(&g_dir, "/");
+    char pbuf[256];
+    if (path && path[0]) {
+        u_memcpy(pbuf, path, u_strlen(path) + 1);
+    } else {
+        pbuf[0] = '\0';
+    }
+    normalize_path(pbuf);
+
+    FRESULT fr = f_opendir(&g_dir, pbuf);
     if (fr != FR_OK) {
         build_resp(local_port, id, fr_to_status(fr), 0, NULL);
         mach_msg_send(g_resp, resp_header()->msgh_size);
@@ -1294,7 +1302,7 @@ static void service_loop(void)
 
         switch (id) {
         case FS_MSG_LIST:
-            handle_list(local, id);
+            handle_list(local, id, (const char *)payload);
             break;
         case FS_MSG_READ: {
             char *fname = (char *)payload;

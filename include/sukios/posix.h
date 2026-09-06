@@ -665,6 +665,11 @@ typedef struct suki_fd_set {
 #define SYS_SCHED_GETPID    123
 #define SYS_MPROTECT_KEY    124
 #define SYS_OOL_UNMAP       125   /* 释放 mach_msg OOL 接收窗口（va） */
+/* ---- F'. 动态链接（dlopen/dlsym，与 POSIX 加载语义同源）---- */
+#define SYS_DL_OPEN         126   /* dlopen(path): 加载 .sl 共享库，返回模块句柄(>=1) */
+#define SYS_DL_SYM          127   /* dlsym(handle, name): 返回符号地址，未找到返回 0 */
+#define SYS_DL_CLOSE        128   /* dlclose(handle): 引用计数-1，归零暂不卸载，返回 0 */
+#define SYS_DL_ERROR        129   /* dlerror(): 返回上次错误字符串地址（内核侧，用户态缓存） */
 /* ---- G. SukiNative 原生对象 API（130..149）----
  * 与 POSIX（20..129）【平行】的原生接口：一切皆对象，返回 suki_handle_t 句柄，
  * 用 suki_status_t 状态码（而非 errno）。POSIX 兼容层对外号位与行为保持不变；

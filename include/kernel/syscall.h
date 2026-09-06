@@ -91,4 +91,13 @@ uint64_t sys_net_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 /* POSIX 子系统初始化（fd 表等）。kmain 在 syscall_init 之后调用。 */
 void posix_init(void);
 
+/*
+ * 读磁盘上的 ELF 映像到内核缓冲（经 FS_PORT 分块读，不依赖 OOL 大小上限）。
+ * 成功返回 kmalloc 的缓冲（其内为文件字节），通过 elf_data / elf_len 给出 ELF
+ * 数据区间；失败返回 NULL（并释放资源）。调用方负责 kfree 返回的缓冲。
+ * 供 execve/spawn 与 elf.c 加载 DT_NEEDED 共享库复用。
+ */
+uint8_t *exec_read_file(const char *path, size_t pl,
+                        const uint8_t **elf_data, size_t *elf_len);
+
 #endif /* _SUKI_KERNEL_SYSCALL_H */

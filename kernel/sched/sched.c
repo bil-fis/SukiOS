@@ -18,6 +18,7 @@
  *           schedule；syscall/中断路径 -> schedule。
  */
 #include <kernel/task.h>
+#include <kernel/elf.h>        /* elf_link_dynamic：task_create_user_args 加载 DT_NEEDED 依赖 */
 #include <kernel/interrupts.h>
 #include <kernel/gdt.h>
 #include <kernel/string.h>
@@ -522,6 +523,16 @@ task_t *task_create_user_args(const void *elf, size_t size,
                            - (uint64_t)VMA_STACK_GROW_PAGES * PAGE_SIZE;
         vma_insert(t, grow_lo, mapped_lo, PTE_WRITE | PTE_NX, VMA_TYPE_STACK);
     }
+
+    /* 动态链接：解析主程序 .dynamic，加载 DT_NEEDED 依赖（约定 /LIB/<name>）并重定位。
+     * elf 缓冲（内核嵌入或 kmalloc）保留为 modules[0].img，供符号解析（进程生命周期内有效）。 */
+    if (!elf_link_dynamic(t, as, (const uint8_t *)elf, size, res.base, res.entry)) {
+        kprintf("[sched] task_create_user: elf_link_dynamic FAILED\n");
+        t->nmodules = 0;   /* 清空模块表，避免悬空 img 引用 */
+        vmm_destroy_address_space(as);
+        return NULL;
+    }
+
     /* 修正跳板参数：r13 槽（arg）指向任务自身 */
     ((uint64_t *)t->rsp)[2] = (uint64_t)t;
 

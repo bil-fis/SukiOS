@@ -130,7 +130,7 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest dltest
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -177,7 +177,8 @@ USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/signal.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o \
                   $(BUILD)/user/lib/setjmp.S.o \
-                 $(BUILD)/user/lib/suki_native.c.o
+                 $(BUILD)/user/lib/suki_native.c.o \
+                 $(BUILD)/user/lib/dlfcn.c.o
 
 # FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接
 # DISK_PORT IPC 做磁盘 IO。ff.c + ffunicode.c 编入 fs_server 的 blob/elf。
@@ -197,7 +198,7 @@ USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.ssvc.blob.o,$(USER_PROGS))
 #   * 可使用浮点 / SSE（minimp3 MP3 解码依赖），故启用 -msse2 且去掉
 #     -mgeneral-regs-only（内核 switch.S 已 fxsave/fxrstor 保存 Ring3 SSE 上下文）。
 #   * -Os 优先缩小体积，以适配内核 execve 单条 OOL(16 页=64KiB) 的加载上限。
-APP_PROGS    := hello playaudio audiotest bmploader nettest
+APP_PROGS    := hello playaudio audiotest bmploader nettest dltest
 APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -mno-red-zone -msse -msse2 \
                 -ffunction-sections -fdata-sections \
@@ -205,6 +206,27 @@ APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
                 -I user/lib/shims -I minimp3
 APP_ELFS     := $(patsubst %,$(BUILD)/apps/%.elf,$(APP_PROGS))
+
+# ---- 共享库 libtest.sl（动态链接 / dlopen 验证用）----
+# 裸机交叉工具链的 ld 不支持 -shared（会退化为 ET_EXEC），故用 -pie 生成
+# ET_DYN 位置无关对象（内核 elf_dlopen 按 ET_DYN 加载并重定位，等效共享库）。
+# 显式构造 PIC 标志集（避免 USER_CFLAGS 的 -fno-pic/-fno-pie 残留），并关闭栈保护
+# （共享库不链 stack_canary，避免 __stack_chk_fail 未定义）。
+LIBTEST_SL     := $(BUILD)/libtest.sl
+LIB_SL_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
+                   -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
+                   -mcmodel=small -fPIC -fPIE -fno-stack-protector \
+                   -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
+                   -I user/lib/shims -include $(CONFIG_H)
+$(BUILD)/libs/libtest.c.o: user/libs/libtest.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(LIB_SL_CFLAGS) -c $< -o $@
+$(LIBTEST_SL): $(BUILD)/libs/libtest.c.o
+	@mkdir -p $(dir $@)
+	$(USER_CC) -pie $(LIB_SL_CFLAGS) -Wl,--no-warn-rwx-segments -Wl,--no-dynamic-linker \
+		-Wl,--export-dynamic \
+		-o $@ $<
+	@echo "==> shared lib $@ ($$(stat -c%s $@) bytes)"
 
 # ---- FreeType 静态库（字体服务 pchfnt/fontsrv 的字形光栅化引擎）----
 # 仅编入 TrueType 渲染必需模块（base/sfnt/truetype/smooth/raster/autofit/
@@ -444,6 +466,14 @@ $(BUILD)/user/%.ssvc.blob.o: $(BUILD)/user/%.elf
 	# .note.GNU-stack 段，确保内核栈不可执行。
 	objcopy --add-section .note.GNU-stack=/dev/null $@ $@.nostack && mv $@.nostack $@
 
+# dltest 是独立程序（user/apps/dltest.c → build/apps/dltest.elf），但内核内嵌
+# blob 规则（USER_PROGS）按 user/<name>.elf 命名。这里把 app 产物拷成
+# build/user/dltest.elf，使其复用上面的 %.ssvc.blob.o 规则生成内核可见的
+# user_dltest_start / user_dltest_end 符号供 kmain 自启动。
+$(BUILD)/user/dltest.elf: $(BUILD)/apps/dltest.elf
+	@mkdir -p $(dir $@)
+	cp $< $@
+
 # ---- 独立程序编译规则（user/apps/*.c，启用 SSE，链接为独立 ELF） ----
 $(BUILD)/apps/%.o: user/apps/%.c
 	@mkdir -p $(dir $@)
@@ -454,6 +484,17 @@ $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(USER_LIB_OBJS) user/user.ld
 		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -T user/user.ld \
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> standalone app $@ ($$(stat -c%s $@) bytes)"
+
+# dltest：动态链接验证程序（加载时 DT_NEEDED libtest.sl + 运行期 dlopen）。
+# 主程序仍为固定基址 ET_EXEC（-static -no-pie），通过 -Wl,-Bdynamic -l:libtest.sl
+# 记录 DT_NEEDED，由内核 elf_link_dynamic 在 execve 时自动加载并重定位。
+# dltest：动态链接验证程序（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
+# 纯静态可执行，不链接 libtest 符号，全部经内核 dlopen 系统调用(126/127)完成加载与解析。
+$(BUILD)/apps/dltest.elf: $(BUILD)/apps/dltest.o $(USER_LIB_OBJS) user/user.ld $(LIBTEST_SL)
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $< $(USER_LIB_OBJS) -lgcc
+	@echo "==> dynamic-link test $@ ($$(stat -c%s $@) bytes)"
 
 # 字体程序（fontsrv/pchfnt）额外链接 FreeType 静态库。
 $(BUILD)/apps/fontsrv.elf: $(BUILD)/apps/fontsrv.o $(USER_LIB_OBJS) $(FT_LIB) user/user.ld
@@ -551,7 +592,7 @@ $(ISO): $(KERNEL) grub/grub.cfg configs/display.cfg
 # PLAYAUDIO 超过 8.3 短名 → mtools 自动创建长文件名(LFN)，FS_SERVER 已支持
 # 读取 LFN，故 shell 可用 `exec BIN/playaudio` 装载。
 disk: $(DISK)
-$(DISK): $(APP_ELFS) $(FONT_ELFS) others_tests/moonhalo.mp3
+$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) others_tests/moonhalo.mp3
 	@mkdir -p $(BUILD)
 	truncate -s 64M $@
 	mformat -i $@ -F -v SUKIOS ::
@@ -577,6 +618,9 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) others_tests/moonhalo.mp3
 		echo "  disk: BIN/$$up.SKA  <= $(BUILD)/apps/$$p.elf"; \
 		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up.SKA; \
 	done
+	# 共享库目录：动态链接 / dlopen 运行时加载
+	mmd -i $@ ::LIB 2>/dev/null || true
+	mcopy -i $@ $(LIBTEST_SL) ::LIB/libtest.sl
 	mcopy -i $@ others_tests/moonhalo.mp3 ::MOONHALO.MP3
 	# 字体文件目录：把 resources/ 下 .ttf 放入 ::FONTS/，供字体服务内存加载
 	mmd -i $@ ::FONTS 2>/dev/null || true

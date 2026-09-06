@@ -67,6 +67,7 @@ extern const uint8_t user_posixtest_start[], user_posixtest_end[];
 extern const uint8_t user_mouse_server_start[], user_mouse_server_end[];
 extern const uint8_t user_net_server_start[], user_net_server_end[];
 extern const uint8_t user_nettest_start[], user_nettest_end[];
+extern const uint8_t user_dltest_start[], user_dltest_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -495,6 +496,12 @@ static void boot_late_init(void *arg)
     task_create_user(user_nettest_start,
                      (size_t)(user_nettest_end - user_nettest_start),
                      "nettest");
+
+    /* 动态链接验证：spawn dltest（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
+     * 验证内核 elf.c 的 ET_DYN 模块加载/重定位/符号解析（dlopen 路径）。 */
+    task_create_user(user_dltest_start,
+                     (size_t)(user_dltest_end - user_dltest_start),
+                     "dltest");
 
     kprintf("[boot] core services spawned (input+display); shell deferred "
             "until display layer ready.\n\n");

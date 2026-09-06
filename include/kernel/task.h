@@ -13,6 +13,7 @@
 struct kernel_port;   /* 前向声明（ipc/port.h） */
 struct ool_map_node;   /* 前向声明（ipc/port.h，OOL 映射链表） */
 #include <kernel/suki_native.h>   /* SukiNative 对象/句柄类型（详见 kernel/suki_native.c） */
+#include <kernel/elf.h>            /* 动态链接模块表 elf_module_t（task_t->modules） */
 
 enum task_state { READY, RUNNING, BLOCKED, WAITING };
 
@@ -127,6 +128,13 @@ typedef struct task {
     suki_object_t      *suki_exit_notify;  /* 子任务退出通知链：本任务作为被监控的子进程时，
                                             * 所有「监控本任务的 PROC 对象」挂在此链上；
                                             * suki_proc_notify_exit 遍历并脱离。仅 PROC 对象用。 */
+
+    /* --- 动态链接模块表（elf.c 维护）---
+     * modules[0] 恒为主程序；modules[1..nmodules-1] 为 DT_NEEDED 共享库或 dlopen 加载的 .sl。
+     * elf_link_dynamic 在 execve/spawn 时填充；elf_dlopen 运行时追加。img 在内核侧持有
+     * ELF 副本用于符号解析，进程退出时由 kernel 释放。 */
+    elf_module_t modules[ELF_MODULE_MAX];
+    int          nmodules;          /* 0=纯静态未链接；>=1 含主程序 */
 } task_t;
 
 /* FPU/SSE 状态保存与恢复原语（实现见 sched/switch.S） */

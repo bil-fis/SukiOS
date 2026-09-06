@@ -13,6 +13,7 @@
 #include <kernel/task.h>
 #include <kernel/console.h>
 #include <kernel/string.h>
+#include <kernel/elf.h>        /* elf_link_dynamic / elf_dlopen：动态链接 */
 #include <kernel/keyboard.h>
 #include <kernel/io.h>
 #include <kernel/serial.h>
@@ -466,7 +467,7 @@ static void exec_free_args(char *argv_k[EXEC_ARG_MAX], int argc,
  * offset 递增处读取，追加到内核缓冲区，直到某次返回 0 字节（EOF）为止。
  * 该路径不依赖 OOL，对任何大小（<= EXEC_ELF_MAX）的映像都成立。
  */
-static uint8_t *exec_read_file(const char *path, size_t pl,
+uint8_t *exec_read_file(const char *path, size_t pl,
                                const uint8_t **elf_data, size_t *elf_len)
 {
     uint32_t rp = port_allocate(sched_current());
@@ -595,6 +596,16 @@ static uint64_t sys_execve(uint64_t path_uptr, uint64_t argv_uptr,
         return (uint64_t)-1;
     }
 
+    /* 动态链接：解析主程序 .dynamic，加载 DT_NEEDED 依赖并重定位。
+     * elfbuf 保留为 modules[0].img（进程生命周期内用于符号解析）。 */
+    if (!elf_link_dynamic(t, new_as, elf_data, elf_len, res.base, res.entry)) {
+        vmm_destroy_address_space(new_as);
+        t->nmodules = 0;   /* 清空模块表，避免悬空 img 引用 */
+        kfree(elfbuf);
+        exec_free_args(argv_k, argc, envp_k, envc);
+        return (uint64_t)-1;
+    }
+
     /* 切换地址空间：先切内核，再销毁旧用户空间，避免悬空 CR3 */
     vmm_switch(vmm_kernel_pml4());
     vma_destroy_all(t);                    /* P0-5：旧映像的 VMA 登记随空间作废 */
@@ -632,7 +643,6 @@ static uint64_t sys_execve(uint64_t path_uptr, uint64_t argv_uptr,
     t->scr_rsp = res.stack_top;
     vmm_switch(new_as);                    /* iretq 后用户态用新地址空间 */
 
-    kfree(elfbuf);
     exec_free_args(argv_k, argc, envp_k, envc);
     return 0;                              /* 返回用户态新程序 */
 }
@@ -673,11 +683,12 @@ static uint64_t sys_task_spawn(uint64_t path_uptr, uint64_t argv_uptr,
     task_t *child = task_create_user_args(elf_data, elf_len, argc,
                                           (const char *const *)argv_k, envc,
                                           (const char *const *)envp_k, bn);
-    kfree(elfbuf);
     exec_free_args(argv_k, argc, envp_k, envc);
     if (!child) {
+        kfree(elfbuf);   /* 失败：elfbuf 未被保留为模块映像，安全释放 */
         return (uint64_t)-1;
     }
+    /* elfbuf 已作为 child 主程序 modules[0].img 保留，此处不再释放 */
 
     /* 记录父子关系（用 PID，避免父退出后悬空指针） */
     child->parent_id = sched_current()->id;
@@ -686,6 +697,47 @@ static uint64_t sys_task_spawn(uint64_t path_uptr, uint64_t argv_uptr,
             (unsigned long)sched_current()->id, child->name,
             (unsigned long)child->id);
     return child->id;
+}
+
+/* ========================================================================== */
+/* 动态链接运行时接口（dlopen / dlsym / dlclose / dlerror，系统调用 126..129）  */
+/* ========================================================================== */
+
+static uint64_t sys_dl_open(uint64_t path_uptr)
+{
+    task_t *t = sched_current();
+    char path[256];
+    int64_t l = copy_str_from_user(path, (const char *)path_uptr, sizeof(path) - 1);
+    if (l < 0) {
+        return 0;   /* 失败：句柄 0 视为无效 */
+    }
+    path[l] = '\0';
+    int h = elf_dlopen(t, path);
+    return (uint64_t)h;
+}
+
+static uint64_t sys_dl_sym(uint64_t h, uint64_t name_uptr)
+{
+    task_t *t = sched_current();
+    char name[256];
+    int64_t l = copy_str_from_user(name, (const char *)name_uptr, sizeof(name) - 1);
+    if (l < 0) {
+        return 0;
+    }
+    name[l] = '\0';
+    return elf_dlsym(t, (int)h, name);
+}
+
+static uint64_t sys_dl_close(uint64_t h)
+{
+    task_t *t = sched_current();
+    return (uint64_t)elf_dlclose(t, (int)h);
+}
+
+static uint64_t sys_dl_error(void)
+{
+    /* 错误字符串由用户态 libdl 维护，内核仅返回 0 */
+    return 0;
 }
 
 /* 9: sys_wait —— 阻塞等待子任务 pid 退出，返回其退出码。
@@ -1027,6 +1079,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_OOL_UNMAP:       return ipc_ool_unmap_user(a1);
     case SYS_PORT_ALLOC:      return sys_port_alloc();
     case SYS_PORT_FREE:       return sys_port_free(a1);
+    /* ---- 动态链接运行时接口（126..129）---- */
+    case SYS_DL_OPEN:         return sys_dl_open(a1);
+    case SYS_DL_SYM:          return sys_dl_sym(a1, a2);
+    case SYS_DL_CLOSE:        return sys_dl_close(a1);
+    case SYS_DL_ERROR:        return sys_dl_error();
     /* 线程创建（pthread 基座）：在 shared 地址空间内造新 task，跳入 trampoline。 */
     case SYS_CLONE:           return sys_clone(a1, a2, a3, a4, a5, a6);
     default: {

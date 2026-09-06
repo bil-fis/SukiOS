@@ -503,6 +503,28 @@ static void boot_late_init(void *arg)
                      (size_t)(user_dltest_end - user_dltest_start),
                      "dltest");
 
+    /* Rust 工具链开机自检（Part 2 验收，见 results/step70.md）：
+     * 把 cargo 编译的 SukiOS ELF（make make-rust-env + cargo build 产物）作为
+     * 内嵌 blob 直接 spawn，验证 Rust 程序可被内核 ELF 加载器装载、走 syscall
+     * ABI 打印 "hello from rust on SukiOS" 并经串口输出。仅当 blob 存在（weak
+     * 符号非空）时执行；缺失则跳过、不影响启动。 */
+    {
+        extern const uint8_t _binary_rusthello_start[] __attribute__((weak));
+        extern const uint8_t _binary_rusthello_end[]   __attribute__((weak));
+        const uint8_t *rb = _binary_rusthello_start;
+        const uint8_t *re = _binary_rusthello_end;
+        if (rb && re && re > rb) {
+            task_t *rt = task_create_user(rb, (size_t)(re - rb), "RUSTHELLO");
+            if (rt)
+                kprintf("[rust-boot] spawned RUSTHELLO pid=%lu\n",
+                        (unsigned long)rt->id);
+            else
+                kprintf("[rust-boot] warn: RUSTHELLO spawn failed\n");
+        } else {
+            kprintf("[rust-boot] (skipped: rust ELF blob not built)\n");
+        }
+    }
+
     kprintf("[boot] core services spawned (input+display); shell deferred "
             "until display layer ready.\n\n");
 

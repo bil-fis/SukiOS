@@ -281,7 +281,17 @@ $(BUILD)/apps/pchfnt.o: user/apps/pchfnt.c
 	$(USER_CC) $(APP_CFLAGS) $(FONT_CFLAGS) -c $< -o $@
 
 
-OBJS := $(patsubst %,$(BUILD)/%.o,$(C_SRCS) $(S_SRCS)) $(USER_BLOBS)
+# Rust 示例 ELF（cargo build 生成）；不存在则留空，不影响其余程序构建。
+# 注：RUST_DIR 在下方 rust 区段才定义，此处用相对项目根的字面前缀路径。
+RUST_BIN := $(wildcard rust/target/x86_64-sukios/debug/sukios-hello)
+# Rust 示例 ELF 的内嵌 blob（供内核开机自检 spawn；不存在则留空，weak 符号跳过）。
+ifeq ($(RUST_BIN),)
+RUST_BLOB :=
+else
+RUST_BLOB := $(BUILD)/user/rusthello.blob.o
+endif
+
+OBJS := $(patsubst %,$(BUILD)/%.o,$(C_SRCS) $(S_SRCS)) $(USER_BLOBS) $(RUST_BLOB)
 
 # ---- 磁盘镜像 (FAT32) ----
 DISK := $(BUILD)/disk.img
@@ -439,6 +449,10 @@ make-rust-env: $(RUST_LIB)
 rust-env: make-rust-env
 	@true
 
+# 构建 rust/ 下的示例工程（cargo 需在 PATH 中；make make-rust-env 已装 rustup）。
+rust-build:
+	@export PATH="$$HOME/.cargo/bin:$$PATH"; cd $(RUST_DIR) && cargo build
+
 # ---- 用户程序编译规则（必须先于内核通配规则） ----
 $(BUILD)/user/%.S.o: user/%.S
 	@mkdir -p $(dir $@)
@@ -526,6 +540,20 @@ $(BUILD)/user/%.ssvc.blob.o: $(BUILD)/user/%.elf
 	# GNU_STACK 缺省为「可执行栈」(安全弱点)。补一个空(=non-exec)的
 	# .note.GNU-stack 段，确保内核栈不可执行。
 	objcopy --add-section .note.GNU-stack=/dev/null $@ $@.nostack && mv $@.nostack $@
+
+# Rust 示例 ELF -> 内核内嵌 blob（符号 _binary_rusthello_start/_end，kmain 经 weak 引用）。
+# 仅当 cargo build 产物存在时构建；否则 RUST_BLOB 为空，内核跳过该自检。
+ifneq ($(RUST_BIN),)
+$(RUST_BLOB): $(RUST_BIN)
+	@mkdir -p $(dir $@)
+	cp $(RUST_BIN) $(BUILD)/user/rusthello.bin
+	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
+		--redefine-sym _binary_build_user_rusthello_bin_start=_binary_rusthello_start \
+		--redefine-sym _binary_build_user_rusthello_bin_end=_binary_rusthello_end \
+		--redefine-sym _binary_build_user_rusthello_bin_size=_binary_rusthello_size \
+		$(BUILD)/user/rusthello.bin $@
+	objcopy --add-section .note.GNU-stack=/dev/null $@ $@.nostack && mv $@.nostack $@
+endif
 
 # dltest 是独立程序（user/apps/dltest.c → build/apps/dltest.elf），但内核内嵌
 # blob 规则（USER_PROGS）按 user/<name>.elf 命名。这里把 app 产物拷成
@@ -656,7 +684,7 @@ $(ISO): $(KERNEL) grub/grub.cfg configs/display.cfg
 # PLAYAUDIO 超过 8.3 短名 → mtools 自动创建长文件名(LFN)，FS_SERVER 已支持
 # 读取 LFN，故 shell 可用 `exec BIN/playaudio` 装载。
 disk: $(DISK)
-$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) others_tests/moonhalo.mp3
+$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) others_tests/moonhalo.mp3 $(RUST_BIN)
 	@mkdir -p $(BUILD)
 	truncate -s 64M $@
 	mformat -i $@ -F -v SUKIOS ::
@@ -703,6 +731,14 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) others_tests/moonhalo.mp3
 		echo "  disk: BIN/$$up.SKA  <= $(BUILD)/apps/$$p.elf"; \
 		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up.SKA; \
 	done
+	# Rust 示例程序（make make-rust-env + cargo build 产物，见 results/step69.md）。
+	# 仅当该 SukiOS ELF 已存在时放入镜像；缺失则跳过（不影响其余程序）。
+	@if [ -f $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello ]; then \
+		echo "  disk: BIN/RUSTHELLO.SKA <= $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello"; \
+		mcopy -i $@ $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello ::BIN/RUSTHELLO.SKA; \
+	else \
+		echo "  disk: skip RUSTHELLO.SKA (rust binary not built; run make make-rust-env + make rust-build)"; \
+	fi
 	@echo "==> Built FAT32 disk $(DISK)"
 
 # ---- 运行 (带图形窗口，需 X/GTK) ----

@@ -11,8 +11,9 @@
 #include "lib/suki.h"
 #include "lib/suki_gui.h"
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argv;
     u_print("[winhello] starting GUI self-test\n");
 
     suki_window_t *w = suki_create_window("WinHello", 120, 80, 128, 120,
@@ -43,18 +44,29 @@ int main(void)
     suki_flush(w, 0, 0, w->w, w->h);
     u_print("[winhello] flushed frame to WM (OOL)\n");
 
-    /* 事件端口：验证 WM -> 应用事件分发 */
+    /* 事件端口：验证 WM -> 应用事件分发。
+     * 区分运行模式：
+     *   - 自动自检（argc==0，开机由内核拉起）：轮询 200 次后退出并打印 PASS；
+     *   - 手动启动（argc>0，经 shell `exec BIN/WINHELLO.SKA`）：
+     *     常驻显示窗口，直到收到窗口关闭事件或轮询上限，便于肉眼观察。 */
     uint32_t ep = sys_port_alloc();
     if (ep) {
         sys_port_claim(ep);
         suki_set_event_port(w, ep);
         u_print("[winhello] event port registered, polling...\n");
+        bool manual = (argc > 0);
+        if (manual) u_print("[winhello] MANUAL mode: window stays until closed\n");
         suki_event_t ev;
-        for (int i = 0; i < 200; i++) {
+        int limit = manual ? 30000 : 200;
+        for (int i = 0; i < limit; i++) {
             if (suki_poll_event(w, &ev)) {
                 u_print("[winhello] event type=");
                 char b2[16]; u_print(u_utoa_s(ev.type, b2, sizeof(b2)));
                 u_print("\n");
+                if (ev.type == SUKI_EVENT_WINDOW_CLOSE) {
+                    u_print("[winhello] window close requested\n");
+                    break;
+                }
             }
             sys_yield();
         }

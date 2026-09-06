@@ -350,3 +350,29 @@ timeout 90 qemu-system-x86_64 -machine pc -cpu qemu64 -smp 1 -m 2G -no-shutdown 
 feat(gui): Win32 风格窗口 API + WM/OOL 零拷贝合成 + winhello 自检 (step72)
 ```
 涵盖：libsuki_gui 客户端库（创建/绘制/flush/事件）、gui_ipc 协议、display_server 兼任 WM+合成器、WM_PORT=14 预留、winhello 端到端自检、Makefile 构建 libsuki_gui.sl 与 winhello。验证：QEMU 无头串口日志确认窗口创建→OOL 合成→事件轮询→销毁全链路贯通，零 panic。
+
+---
+
+## 13. 追加：winhello 支持 shell 手动启动（自动 + 手动双模式）
+
+原 winhello 仅作为开机自检由内核 `task_create_user` 自动拉起（内嵌 blob，不在磁盘），用户无法手动启动。现扩展为**既可开机自动自检、也可从 shell 手动 `exec` 启动**的双模式程序，手动模式常驻显示便于观察。
+
+### 改动
+- `user/apps/winhello.c`：
+  - `main` 改为 `int main(int argc, char **argv)`（crt0 已可靠传 argc/argv，见 kernel/elf/elf.c:168 注释）。
+  - 用 `argc` 区分模式：`argc==0`（内核 `task_create_user` 固定传 0）→ **自动自检模式**，轮询 200 次后退出并打印 `PASS`；`argc>0`（shell `exec` 传入路径）→ **手动模式**，打印 `MANUAL mode` 并常驻轮询（上限 30000 次，约数分钟），收到 `SUKI_EVENT_WINDOW_CLOSE` 即退出。
+  - 内核侧 `task_create_user` → `task_create_user_args(..., 0, NULL, 0, NULL, ...)`（kernel/sched/sched.c:563）确保内嵌实例 `argc==0`；shell `exec`→`sys_task_spawn` 经用户态 `exec_copy_args`→`elf_build_stack` 传 argv，故 `argc>=1`（已核对 kernel/elf/elf.c 与 kernel/syscall/syscall.c:348）。
+- `Makefile`：
+  - `APP_PROGS` 增加 `winhello`，使 `make disk` 自动装入 `::BIN/WINHELLO.SKA`（第 734–738 行循环）。
+  - 新增专用链接规则 `$(BUILD)/apps/winhello.elf`：静态链入 `user/gui.c.o`（自包含 GUI 客户端，**不依赖**动态 `libsuki_gui.sl`），与内嵌版链接方式一致。
+
+### 手动启动命令（shell 内）
+```
+exec BIN/WINHELLO.SKA
+```
+> 大小写敏感：磁盘文件名为 `WINHELLO.SKA`；shell 的 `exec` 找不到原路径时会自动补 `.ska` 后缀，故 `exec BIN/WINHELLO` 亦可。运行时 `argc>=1` 进入常驻手动模式；想退出可关闭窗口（WM 转发 `SUKI_EVENT_WINDOW_CLOSE`）或等待轮询上限。
+
+### 验证
+- 自动自检：`[winhello] window created id=1` → `flushed frame to WM (OOL)` → `[wm] window created id=1` → `[winhello] PASS: window lifecycle complete`，零 panic（沿用 §8）。
+- 磁盘版 ELF：`file` 确认 `ELF 64-bit LSB executable, x86-64, statically linked, EXEC`，46000 字节；已 `mcopy` 进 `build/disk.img ::BIN/WINHELLO.SKA`。
+- 手动模式实跑：QEMU 在无头/管道 `-serial stdio` 下不把管道输入转发给 guest（项目铁律禁止复杂编排脚本注入键盘/串口），故 `exec` 的实际交互运行须由用户在图形窗口的真实终端中手动执行验证（同 §11.2 限制约定）。代码路径已通过 argc/argv 机制审查确认正确。

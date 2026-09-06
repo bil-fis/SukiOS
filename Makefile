@@ -201,7 +201,7 @@ USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.ssvc.blob.o,$(USER_PROGS))
 #   * 可使用浮点 / SSE（minimp3 MP3 解码依赖），故启用 -msse2 且去掉
 #     -mgeneral-regs-only（内核 switch.S 已 fxsave/fxrstor 保存 Ring3 SSE 上下文）。
 #   * -Os 优先缩小体积，以适配内核 execve 单条 OOL(16 页=64KiB) 的加载上限。
-APP_PROGS    := hello playaudio audiotest bmploader nettest dltest
+APP_PROGS    := hello playaudio audiotest bmploader nettest dltest winhello
 APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -mno-red-zone -msse -msse2 \
                 -ffunction-sections -fdata-sections \
@@ -257,6 +257,15 @@ $(BUILD)/user/winhello.elf: $(BUILD)/user/winhello.c.o $(BUILD)/user/gui.c.o $(U
 		-Wl,--no-warn-rwx-segments -T user/user.ld \
 		-o $@ $(BUILD)/user/winhello.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
+
+# winhello 磁盘版：与内嵌自动自检同源，但作为可由 shell 手动 `exec` 的 .SKA 程序。
+# 静态链入 gui.c.o（自包含 GUI 客户端，不依赖动态 libsuki_gui.sl）。
+# 运行期 argc>0（shell exec 传入路径）即进入「常驻手动模式」（见 winhello.c）。
+$(BUILD)/apps/winhello.elf: $(BUILD)/apps/winhello.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $(BUILD)/apps/winhello.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
+	@echo "==> standalone GUI self-test $@ ($$(stat -c%s $@) bytes)"
 
 # ---- FreeType 静态库（字体服务 pchfnt/fontsrv 的字形光栅化引擎）----
 # 仅编入 TrueType 渲染必需模块（base/sfnt/truetype/smooth/raster/autofit/

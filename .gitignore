@@ -64,9 +64,12 @@ node_modules/
 .gdbinit
 *.mp4
 
-# ---- Rust 开发环境（由 make make-rust-env 生成，不入库）----
+# ---- Rust 开发环境（由 make make-rust-env 生成，不入库；源码 Cargo.toml/rust-toolchain.toml/src 入库）----
+# 以下均为脚本生成物：目标规格 / 运行时静态库 / cargo 配置 / 锁文件 / 构建产物。
 /rust/x86_64-sukios.json
 /rust/libsuki.a
+/rust/.cargo/
+/rust/Cargo.lock
 /rust/target/
 
 # ---- 私有签名证书 ----

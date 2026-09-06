@@ -135,6 +135,13 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - ISO（BIOS+UEFI 双启动，GRUB）、FAT32 磁盘镜像（mtools）、QEMU 运行目标（`run` / `run-headless` / `run-ahci` / `run-uefi` / `run-q`）。
 - 交叉工具链（`x86_64-elf-gcc`）自动探测，缺失回退主机 `gcc` + `-ffreestanding`。
 
+### 2.10 Rust 开发工具链与运行时
+- **一键环境**：`make make-rust-env`（别名 `rust-env`）自动探查/安装 rustup（nightly + `rust-src`）、构建 SukiOS 用户态运行时静态库 `libsuki.a`（来自 `user/lib/*.c`，提供 `malloc/free/pthread/syscall` 等），并生成 `rust/x86_64-sukios.json` 自定义目标规格与 `rust/.cargo/config.toml`（指向本仓库交叉链接器 `x86_64-sukios-elf-gcc` + `user/user.ld` + `libsuki.a`）。详见 `results/step69.md`。
+- **编译示例**：`make rust-build`（等价 `cd rust && cargo build`）产出 `rust/target/x86_64-sukios/debug/sukios-hello` —— 一个合法的 SukiOS ELF（ET_EXEC，入口 `0x400000`）。
+- **运行时验证（开机自检）**：该 Rust ELF 作为**内核内嵌 blob** 在 `boot_late_init` 由 `task_create_user()` 确定性 spawn（与 `posixtest` 同款路径，不依赖 shell）；其 `_start` 经标准 x86_64 `syscall` 指令（System V AMD64 ABI，`%rax`=号、`%rdi/%rsi/%rdx/%r10/%r8/%r9`=参数）调用 `SYS_DEBUG_WRITE(4)` 打印 `hello from rust on SukiOS`、再调 `SYS_TASK_EXIT(2,0)`，内核串口日志可见 `RUSTHELLO` 装载于 `0x400000`（W^X）、退出码 0、零 panic。详见 `results/step70.md`。
+- **磁盘路径**：`make disk` 会（在 rust 二进制存在时）把它拷入 FAT32 磁盘 `::BIN/RUSTHELLO.SKA`，可在 shell 里 `exec BIN/rusthello` 经真实「从磁盘 exec」路径运行。
+- 当前 Rust 支持为 **`#![no_std]` + 自定义 bare-metal 目标 + 经 FFI 复用 `libsuki.a`**；Rust `std` 库（Servo 前置）尚未移植（见 §3）。
+
 ---
 
 ## 3. 尚未实现 / 早期
@@ -151,6 +158,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **kdr 动态加载器**：`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现；当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
+- **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
 
 ---
 
@@ -166,6 +174,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 | `mtools`（`mformat`/`mcopy`/`mmd`） | 生成 FAT32 磁盘镜像 | `make disk` 依赖 |
 | `qemu-system-x86_64` | 运行模拟器 | 建议 `/dev/kvm` 启用硬件加速 |
 | `python3` | KASLR 重定位表生成（`tools/gen_relk.py`） | 构建期依赖 |
+| Rust 工具链（`rustup`/`rustc`/`cargo`，nightly） | 构建 Rust 组件（`make make-rust-env` 自动安装） | 仅开发 Rust 程序时需要；纯 C 内核/服务构建不依赖 |
 | （可选）`OVMF`（`/usr/share/OVMF/OVMF_CODE_4M.fd`） | UEFI 启动 | `make run-uefi` 需要 |
 
 ### 4.2 构建命令
@@ -194,6 +203,15 @@ make run-uefi        # OVMF UEFI 启动验证
 make run-q           # PVH 直启（qemu -kernel，不经 GRUB）
 make info            # 打印当前工具链/对象信息
 ```
+
+#### Rust 程序开发（可选，步骤见 `results/step69.md`）
+```bash
+make make-rust-env   # 一键安装 rustup(nightly)+rust-src、构建 libsuki.a、生成目标规格
+make rust-build      # cd rust && cargo build -> rust/target/x86_64-sukios/debug/sukios-hello
+make disk            # 把 rust 二进制拷入 ::BIN/RUSTHELLO.SKA（存在时）
+make run-headless    # 开机自检自动 spawn RUSTHELLO，串口见 "hello from rust on SukiOS"
+```
+> 仅构建/运行纯 C 内核与用户态服务**不需要** Rust 工具链；Rust 为可选项，缺失时 `make iso`/`make disk` 忽略 Rust 部分并正常产出。
 
 ### 4.3 运行（QEMU）
 
@@ -375,6 +393,7 @@ tail -8 /tmp/sukios.log
 | newlib（参考，不入库） | `lib/newlib-4.6.0.20260123/` | BSD 风格（Red Hat / UC Berkeley 等） |
 | FatFs | `drivers/FatFs/` | 1-clause BSD 风格（ChaN） |
 | Resource Han Rounded | `resources/ResourceHanRoundedCN-Medium.ttf` | SIL OFL-1.1（Cyano Hao） |
+| Rust 工具链（rustup / rustc / cargo） | 本地安装（不随仓库分发） | MIT OR Apache-2.0（Rust Project Developers） |
 
 ---
 

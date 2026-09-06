@@ -133,7 +133,7 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest dltest
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest dltest winhello
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -231,6 +231,32 @@ $(LIBTEST_SL): $(BUILD)/libs/libtest.c.o
 	$(USER_LD) -shared -export-dynamic --no-warn-rwx-segments \
 		--no-dynamic-linker -o $@ $<
 	@echo "==> shared lib $@ ($$(stat -c%s $@) bytes)"
+
+# ---- 共享库 libsuki_gui.sl（用户态 GUI 客户端库，供磁盘应用动态链接）----
+# 与 libtest.sl 同构：用 ld -shared 生成 ET_DYN；编译单元 gui.c 亦以静态对象
+# 形式链入内嵌自检 winhello（见 $(BUILD)/user/winhello.elf 专用规则）。
+LIBSUKI_GUI_SL := $(BUILD)/libsuki_gui.sl
+$(BUILD)/libs/gui.c.o: user/lib/gui.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(LIB_SL_CFLAGS) -c $< -o $@
+$(LIBSUKI_GUI_SL): $(BUILD)/libs/gui.c.o
+	@mkdir -p $(dir $@)
+	$(USER_LD) -shared -export-dynamic --no-warn-rwx-segments \
+		--no-dynamic-linker -o $@ $<
+	@echo "==> shared lib $@ ($$(stat -c%s $@) bytes)"
+
+# winhello（内嵌自检）需要 GUI 客户端静态链入，故单独给出 .c.o 与 .elf 规则：
+$(BUILD)/user/winhello.c.o: user/apps/winhello.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+$(BUILD)/user/gui.c.o: user/lib/gui.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+$(BUILD)/user/winhello.elf: $(BUILD)/user/winhello.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $(BUILD)/user/winhello.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
+	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # ---- FreeType 静态库（字体服务 pchfnt/fontsrv 的字形光栅化引擎）----
 # 仅编入 TrueType 渲染必需模块（base/sfnt/truetype/smooth/raster/autofit/
@@ -684,7 +710,7 @@ $(ISO): $(KERNEL) grub/grub.cfg configs/display.cfg
 # PLAYAUDIO 超过 8.3 短名 → mtools 自动创建长文件名(LFN)，FS_SERVER 已支持
 # 读取 LFN，故 shell 可用 `exec BIN/playaudio` 装载。
 disk: $(DISK)
-$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) others_tests/moonhalo.mp3 $(RUST_BIN)
+$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/moonhalo.mp3 $(RUST_BIN)
 	@mkdir -p $(BUILD)
 	truncate -s 64M $@
 	mformat -i $@ -F -v SUKIOS ::
@@ -713,6 +739,7 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) others_tests/moonhalo.mp3 $(RUST
 	# 共享库目录：动态链接 / dlopen 运行时加载
 	mmd -i $@ ::LIB 2>/dev/null || true
 	mcopy -i $@ $(LIBTEST_SL) ::LIB/libtest.sl
+	mcopy -i $@ $(LIBSUKI_GUI_SL) ::LIB/libsuki_gui.sl
 	# 同一份库以不同文件名再装一份：供 dltest 运行期 dlopen("/LIB/libtest2.sl")
 	# 触发「纯 dlopen（非加载期依赖）」路径，从而验证 dlclose 物理页回收与槽位复用。
 	mcopy -i $@ $(LIBTEST_SL) ::LIB/libtest2.sl

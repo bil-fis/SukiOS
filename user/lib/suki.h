@@ -160,6 +160,16 @@ static inline uint64_t sys_port_claim(uint32_t port)
     return suki_syscall5(SYS_PORT_CLAIM, (uint64_t)port, 0, 0, 0, 0);
 }
 
+/* 动态分配一个接收端口（返回端口号，0=失败）；反之 sys_port_free 释放 */
+static inline uint64_t sys_port_alloc(void)
+{
+    return suki_syscall5(SYS_PORT_ALLOC, 0, 0, 0, 0, 0);
+}
+static inline void sys_port_free(uint32_t port)
+{
+    suki_syscall5(SYS_PORT_FREE, (uint64_t)port, 0, 0, 0, 0);
+}
+
 /* 加载并执行 ELF 映像，替换当前进程（内核从 FS 读取 path 指向的文件） */
 static inline int sys_execve(const char *path, char *const argv[],
                              char *const envp[])

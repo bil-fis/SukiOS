@@ -89,7 +89,8 @@ typedef struct mach_ool_desc {
  * 否则会与动态分配端口冲突。放在 NET_PORT 紧邻的 12 号位。 */
 #define NET_REPLY_PORT  12
 #define NS_PORT         13              /* net_server 对外暴露的 socket 服务端口 */
-#define PORT_FIRST_DYN  9               /* 动态分配起始（1..NS_PORT 均已预留） */
+#define WM_PORT         14              /* 窗口管理器端口（应用经此创建/提交/销毁窗口） */
+#define PORT_FIRST_DYN  9               /* 动态分配起始（1..WM_PORT 均已预留） */
 #define PORT_MAX        64
 /* 单端口消息队列长度上限（M5 修复）：防止失控/恶意任务狂发消息耗尽内核堆，
  * 超出即拒绝投递并返回 MACH_SEND_NO_BUFFER 形成背压。 */

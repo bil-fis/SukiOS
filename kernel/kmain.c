@@ -68,6 +68,7 @@ extern const uint8_t user_mouse_server_start[], user_mouse_server_end[];
 extern const uint8_t user_net_server_start[], user_net_server_end[];
 extern const uint8_t user_nettest_start[], user_nettest_end[];
 extern const uint8_t user_dltest_start[], user_dltest_end[];
+extern const uint8_t user_winhello_start[], user_winhello_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -487,21 +488,31 @@ static void boot_late_init(void *arg)
      * `make run-headless QEMU_SERIAL="-serial file:/tmp/x.log"` 收集。 */
     /* POSIX 一致性测试（含本次新增的 pthread/clone/futex 多线程用例），开机自检。
      * 输出经串口落盘，用于 QEMU 无头回归判定（验证多线程零 panic + 计数精确）。 */
-    task_create_user(user_posixtest_start,
+    task_t *sp1 = task_create_user(user_posixtest_start,
                      (size_t)(user_posixtest_end - user_posixtest_start),
                      "posixtest");
+    kprintf("[boot-dbg] posixtest spawn ret=%p\n", (void *)sp1);
 
     /* 网络子系统端到端验证：spawn nettest（UDP -> QEMU TFTP 10.0.2.2:69 往返 +
      * SukiNative 原生 socket 冒烟）。与 posixtest 同为开机自检，输出经串口落盘。 */
-    task_create_user(user_nettest_start,
+    task_t *sp2 = task_create_user(user_nettest_start,
                      (size_t)(user_nettest_end - user_nettest_start),
                      "nettest");
+    kprintf("[boot-dbg] nettest spawn ret=%p\n", (void *)sp2);
 
     /* 动态链接验证：spawn dltest（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
      * 验证内核 elf.c 的 ET_DYN 模块加载/重定位/符号解析（dlopen 路径）。 */
-    task_create_user(user_dltest_start,
+    task_t *sp3 = task_create_user(user_dltest_start,
                      (size_t)(user_dltest_end - user_dltest_start),
                      "dltest");
+    kprintf("[boot-dbg] dltest spawn ret=%p\n", (void *)sp3);
+
+    /* 窗口系统端到端自检：spawn winhello（libsuki_gui 创建窗口 + OOL 零拷贝合成）。
+     * 验证「应用 -> WM_PORT -> 显示服务合成 -> 帧缓冲」全链路，输出经串口落盘。 */
+    task_t *sp4 = task_create_user(user_winhello_start,
+                     (size_t)(user_winhello_end - user_winhello_start),
+                     "winhello");
+    kprintf("[boot-dbg] winhello spawn ret=%p\n", (void *)sp4);
 
     /* Rust 工具链开机自检（Part 2 验收，见 results/step70.md）：
      * 把 cargo 编译的 SukiOS ELF（make make-rust-env + cargo build 产物）作为

@@ -110,7 +110,7 @@ void ipc_init(void)
     g_ports[PORT_NULL].owner  = NULL;
     /* 预留知名端口（含 APP_PORT、FONT_PORT、NET_PORT、NET_REPLY_PORT、NS_PORT）。
      * 上界取 NS_PORT(13)：网络相关端口必须一并纳入预留，否则会与动态分配端口冲突。 */
-    for (uint32_t p = DISK_PORT; p <= NS_PORT; p++) {
+    for (uint32_t p = DISK_PORT; p <= WM_PORT; p++) {
         g_ports[p].in_use = true;
         g_ports[p].name = p;
     }

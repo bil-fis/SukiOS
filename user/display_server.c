@@ -54,6 +54,7 @@ static uint32_t g_fb_width  = 0;
 static uint32_t g_fb_height = 0;
 static uint32_t g_fb_pitch  = 0;         /* 字节/行 */
 static uint32_t g_stride    = 0;         /* 像素/行 = pitch/4 */
+static uint32_t *g_canvas   = NULL;      /* 合成画布（双缓冲后缓冲，指向 g_desk） */
 
 /* 桌面顶部装饰条高度（纯几何，无文字） */
 #define TITLE_H    40
@@ -69,7 +70,7 @@ static uint32_t g_stride    = 0;         /* 像素/行 = pitch/4 */
 static inline void fb_px(uint32_t x, uint32_t y, uint32_t rgb)
 {
     if (x >= g_fb_width || y >= g_fb_height) return;
-    g_fb[y * g_stride + x] = rgb;
+    g_canvas[y * g_stride + x] = rgb;
 }
 
 static void fill_rect_fb(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
@@ -78,7 +79,7 @@ static void fill_rect_fb(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_
         for (uint32_t i = 0; i < w; i++) {
             uint32_t px = x + i, py = y + j;
             if (px >= g_fb_width || py >= g_fb_height) continue;
-            g_fb[py * g_stride + px] = rgb;
+            g_canvas[py * g_stride + px] = rgb;
         }
 }
 
@@ -151,7 +152,7 @@ static void wm_handle_create(const wm_create_req_t *req, mach_msg_header_t *hdr)
     wm_create_resp_t resp; memset(&resp, 0, sizeof(resp));
     if (g_win_count >= WM_MAX_WINDOWS) goto fail;
     uint64_t need = (uint64_t)req->w * req->height * 4;
-    if (need == 0 || need > 16 * 4096) goto fail;
+    if (need == 0 || need > 256 * 4096) goto fail;
     uint32_t *px = (uint32_t *)sys_mmap(need, 3);
     if (!px) goto fail;
 
@@ -299,16 +300,17 @@ static void draw_cursor_on_fb(void)
             int32_t x = g_cur_x + i, y = g_cur_y + j;
             if (x < 0 || y < 0 || (uint32_t)x >= g_fb_width || (uint32_t)y >= g_fb_height) continue;
             if (g_cursor_mask[j][i])
-                g_fb[y * g_stride + x] = (g_cur_buttons & 1) ? 0x00FF3030 : 0x00FFFFFF;
+                g_canvas[y * g_stride + x] = (g_cur_buttons & 1) ? 0x00FF3030 : 0x00FFFFFF;
         }
 }
 
 static void composite(void)
 {
     if (!g_fb || !g_desk) return;
-    /* 1) 背景层整体 blit */
-    memcpy((void *)g_fb, g_desk, (size_t)g_fb_height * g_stride * sizeof(uint32_t));
-    /* 2) 窗口（Z-order = 创建顺序，后者在上） */
+    /* 双缓冲：合成到 g_desk（g_canvas）后一次性提交到帧缓冲 */
+    g_canvas = g_desk;
+    draw_desktop();
+    /* 窗口（Z-order = 创建顺序，后者在上） */
     for (int i = 0; i < g_win_count; i++) {
         wm_window_t *w = &g_wins[i];
         if (!w->visible) continue;
@@ -322,7 +324,7 @@ static void composite(void)
         int32_t cy1 = (y0 + (int32_t)hh > (int32_t)g_fb_height) ? (int32_t)g_fb_height : y0 + (int32_t)hh;
         for (int32_t y = cy0; y < cy1; y++)
             for (int32_t x = cx0; x < cx1; x++)
-                g_fb[y * g_stride + x] = w->pixels[(y - y0) * ww + (x - x0)];
+                g_canvas[y * g_stride + x] = w->pixels[(y - y0) * ww + (x - x0)];
         /* 窗口装饰：边框 + 标题栏（纯几何，无文字）+ 关闭按钮 */
         uint32_t border = 2;
         fill_rect_fb((uint32_t)x0, (uint32_t)y0, ww, border, COL_ACCENT);
@@ -342,17 +344,19 @@ static void composite(void)
                     fill_rect_fb((uint32_t)bx, (uint32_t)by, 16, 16, COL_CLOSEBG);
                     for (int32_t i = 3; i < 13; i++) {
                         if (bx + i < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
-                            g_fb[(by + i) * g_stride + (bx + i)] = COL_CLOSEFG;
+                            g_canvas[(by + i) * g_stride + (bx + i)] = COL_CLOSEFG;
                         if (bx + (15 - i) >= 0 && bx + (15 - i) < (int32_t)g_fb_width &&
                             by + i < (int32_t)g_fb_height)
-                            g_fb[(by + i) * g_stride + (bx + (15 - i))] = COL_CLOSEFG;
+                            g_canvas[(by + i) * g_stride + (bx + (15 - i))] = COL_CLOSEFG;
                     }
                 }
             }
         }
     }
-    /* 3) 光标（最上层） */
+    /* 光标（最上层） */
     draw_cursor_on_fb();
+    /* 提交完整帧到帧缓冲（单次拷贝，杜绝逐像素写屏撕裂） */
+    memcpy((void *)g_fb, g_desk, (size_t)g_fb_height * g_stride * sizeof(uint32_t));
 }
 
 int main(void)
@@ -379,7 +383,8 @@ int main(void)
 
     u_print("display: fb mapped @32bpp, pure compositor ready\n");
 
-    /* 3) 绘制背景层 */
+    /* 3) 画布指向背景缓冲，绘制背景层（双缓冲：合成到 g_desk 后一次性提交） */
+    g_canvas = g_desk;
     draw_desktop();
 
     /* 4) 通知内核：显示服务已接管帧缓冲（纯合成器，不再渲染字符） */

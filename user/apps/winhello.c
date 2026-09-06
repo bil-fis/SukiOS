@@ -16,7 +16,7 @@ int main(int argc, char **argv)
     (void)argv;
     u_print("[winhello] starting GUI self-test\n");
 
-    suki_window_t *w = suki_create_window("WinHello", 120, 80, 128, 120,
+    suki_window_t *w =     suki_create_window("WinHello", 120, 80, 360, 240,
                                           SUKI_WS_DEFAULT);
     if (!w) {
         u_print("[winhello] FAIL: suki_create_window returned NULL\n");

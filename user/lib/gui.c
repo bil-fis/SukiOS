@@ -8,7 +8,7 @@
  *   - 作为普通 .o 静态链入内嵌自检程序（winhello）以便开机自动验证。
  *
  * 所有跨特权/跨进程交互均走合法 syscall + Mach IPC，绝不直接访问硬件。
- * 窗口离屏缓冲由本库用 sys_mmap 分配（页对齐、≤16 页），提交经 OOL 零拷贝。
+ * 窗口离屏缓冲由本库用 sys_mmap 分配（页对齐），提交经 OOL 零拷贝（上限 256 页=2MiB）。
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -56,7 +56,7 @@ suki_window_t *suki_create_window(const char *title, int x, int y,
                                   uint32_t w, uint32_t h, uint32_t style)
 {
     uint64_t need = (uint64_t)w * h * 4;
-    if (need == 0 || need > 16 * GUI_PAGE) return NULL;   /* OOL ≤16 页上限 */
+    if (need == 0 || need > 256 * GUI_PAGE) return NULL;  /* OOL ≤256 页上限（2MiB） */
 
     if (g_gui_wins_used >= GUI_MAX_WINDOWS) return NULL;
     suki_window_t *win = &g_gui_wins[g_gui_wins_used++];

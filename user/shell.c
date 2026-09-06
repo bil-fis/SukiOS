@@ -66,11 +66,11 @@ static int  g_prompt_col = 0;   /* 编辑行起点列（提示符之后） */
 /* ---- 窗口化：shell 作为 WM 管理的窗口程序 ----
  * 启动后创建窗口并注册事件端口；键盘经 WM 转发到本窗口（焦点模型），
  * 输出渲染到窗口离屏缓冲（同时镜像 serial，便于无图形/headless 观测）。
- * 因 OOL 缓冲限制（≤16 页=64KiB），窗口最大约 128×128 像素（8×8 字体下 16×16 字符）。 */
+ * 窗口尺寸与字符网格已放大（OOL 上限提升至 256 页=2MiB），不再受 128×128 限制。 */
 static suki_window_t *g_win = NULL;
 static uint32_t       g_ep  = 0;
-#define TERM_COLS 16
-#define TERM_ROWS 16
+#define TERM_COLS 80
+#define TERM_ROWS 34
 static char     g_tgrid[TERM_ROWS][TERM_COLS];
 static int      g_tcx = 0, g_tcy = 0;   /* 终端网格光标（列/行） */
 static bool     g_term_dirty = false;
@@ -1100,11 +1100,12 @@ static void term_render(void)
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++)
             fb[y*W + x] = 0x002b2b30;   /* 终端背景 */
-    for (int r = 0; r < TERM_ROWS && (r+1)*8 <= H; r++) {
+    /* 顶部 20px 被 WM 标题栏覆盖，字符从 y=20 起绘制 */
+    for (int r = 0; r < TERM_ROWS && (r+1)*8 + 20 <= H; r++) {
         for (int cidx = 0; cidx < TERM_COLS && (cidx+1)*8 <= W; cidx++) {
             char ch = g_tgrid[r][cidx];
             if (!ch) continue;
-            int px = cidx*8, py = r*8;
+            int px = cidx*8, py = r*8 + 20;
             const uint8_t *g = font8x8_basic[(uint8_t)ch];
             for (int ry = 0; ry < 8; ry++)
                 for (int cx = 0; cx < 8; cx++)
@@ -1168,7 +1169,7 @@ int main(int argc, char **argv)
 
     /* shell 作为 WM 管理的窗口程序：创建窗口 + 事件端口，并主动请求焦点。
      * 之后键盘由 WM 转发到本窗口（焦点模型）；close 按钮触发 SUKI_EVENT_WINDOW_CLOSE。 */
-    g_win = suki_create_window("Shell", 64, 96, 128, 128, SUKI_WS_DEFAULT);
+    g_win = suki_create_window("Shell", 40, 60, 660, 380, SUKI_WS_DEFAULT);
     if (g_win) {
         g_ep = sys_port_alloc();
         if (g_ep) {

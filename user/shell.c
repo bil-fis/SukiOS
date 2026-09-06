@@ -151,6 +151,7 @@ static void edit_insert(char c)
         memmove(g_line + g_cur + 1, g_line + g_cur, g_len - g_cur);
     g_line[g_cur] = c;
     g_len++; g_cur++;
+    g_line[g_len] = '\0';   /* 维持 C 串终止，避免旧命令残留字节被 redraw_full_line 印出 */
     redraw_from_cursor();   /* 统一整行重绘，正确反映插入字符与光标位置 */
 }
 
@@ -160,6 +161,7 @@ static void edit_backspace(void)           /* 删光标前一个字符 */
     g_cur--;
     memmove(g_line + g_cur, g_line + g_cur + 1, g_len - g_cur);
     g_len--;
+    g_line[g_len] = '\0';   /* 截断，避免删后旧字符残留被重绘 */
     redraw_from_cursor();
 }
 
@@ -168,6 +170,7 @@ static void edit_delete(void)              /* 删光标后一个字符 (Del) */
     if (g_cur >= g_len) return;
     memmove(g_line + g_cur, g_line + g_cur + 1, g_len - g_cur);
     g_len--;
+    g_line[g_len] = '\0';   /* 截断，避免删后旧字符残留被重绘 */
     redraw_from_cursor();
 }
 

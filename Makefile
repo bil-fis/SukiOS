@@ -34,12 +34,15 @@ TOOLCHAIN := native (host gcc, freestanding)
 # 用户态：优先专属工具链，回退宿主 gcc
 ifeq ($(wildcard $(SUKIOS_CC)),$(SUKIOS_CC))
   USER_CC := x86_64-sukios-elf-gcc
+  USER_LD := x86_64-sukios-elf-ld
   USER_TOOLCHAIN := cross (x86_64-sukios-elf)
 else ifeq ($(wildcard $(ELF_CC)),$(ELF_CC))
   USER_CC := x86_64-elf-gcc
+  USER_LD := x86_64-elf-ld
   USER_TOOLCHAIN := cross (x86_64-elf)
 else
   USER_CC := gcc
+  USER_LD := ld
   USER_TOOLCHAIN := native (host gcc, freestanding)
 endif
 # 将专属工具链目录加入 PATH（供后续 recipe 中的 ld/as/objcopy 等被找到）
@@ -215,7 +218,7 @@ APP_ELFS     := $(patsubst %,$(BUILD)/apps/%.elf,$(APP_PROGS))
 LIBTEST_SL     := $(BUILD)/libtest.sl
 LIB_SL_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
-                   -mcmodel=small -fPIC -fPIE -fno-stack-protector \
+                   -mcmodel=small -fPIC -fno-stack-protector \
                    -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
                    -I user/lib/shims -include $(CONFIG_H)
 $(BUILD)/libs/libtest.c.o: user/libs/libtest.c
@@ -223,9 +226,10 @@ $(BUILD)/libs/libtest.c.o: user/libs/libtest.c
 	$(USER_CC) $(LIB_SL_CFLAGS) -c $< -o $@
 $(LIBTEST_SL): $(BUILD)/libs/libtest.c.o
 	@mkdir -p $(dir $@)
-	$(USER_CC) -pie $(LIB_SL_CFLAGS) -Wl,--no-warn-rwx-segments -Wl,--no-dynamic-linker \
-		-Wl,--export-dynamic \
-		-o $@ $<
+	# 直接用 ld -shared 产出真正的 ET_DYN 共享对象（gcc -shared 在本交叉工具链会
+	# 退化为 ET_EXEC，无法作为 -l 链接输入）。内核 elf_load 按 ET_DYN 处理。
+	$(USER_LD) -shared -export-dynamic --no-warn-rwx-segments \
+		--no-dynamic-linker -o $@ $<
 	@echo "==> shared lib $@ ($$(stat -c%s $@) bytes)"
 
 # ---- FreeType 静态库（字体服务 pchfnt/fontsrv 的字形光栅化引擎）----
@@ -485,15 +489,18 @@ $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(USER_LIB_OBJS) user/user.ld
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> standalone app $@ ($$(stat -c%s $@) bytes)"
 
-# dltest：动态链接验证程序（加载时 DT_NEEDED libtest.sl + 运行期 dlopen）。
-# 主程序仍为固定基址 ET_EXEC（-static -no-pie），通过 -Wl,-Bdynamic -l:libtest.sl
-# 记录 DT_NEEDED，由内核 elf_link_dynamic 在 execve 时自动加载并重定位。
-# dltest：动态链接验证程序（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
-# 纯静态可执行，不链接 libtest 符号，全部经内核 dlopen 系统调用(126/127)完成加载与解析。
+# dltest：动态链接验证程序。
+# 编译期经 -Bdynamic -l:libtest.sl 记录 DT_NEEDED=libtest.sl，使链接器对主程序
+# 引用到的 libtest.sl 全局变量（sl_const）生成 R_X86_64_COPY 拷贝重定位
+# （验证：加载期把库初始值 42 拷入主程序 .bss 副本）。运行期再经
+# dlopen("/LIB/libtest2.sl") + dlsym + dlclose 验证「物理页回收」与「槽位复用」。
+# --no-dynamic-linker：本系统无用户态动态链接器，由内核 elf_link_dynamic 在
+# execve 时完成加载/重定位，故必须去掉 PT_INTERP（否则 elf_validate 拒绝 ET_EXEC）。
 $(BUILD)/apps/dltest.elf: $(BUILD)/apps/dltest.o $(USER_LIB_OBJS) user/user.ld $(LIBTEST_SL)
-	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--no-warn-rwx-segments -T user/user.ld \
-		-o $@ $< $(USER_LIB_OBJS) -lgcc
+	$(USER_CC) -nostdlib -no-pie -fno-pic -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -Wl,--no-dynamic-linker \
+		-Wl,-Bdynamic -L$(dir $(LIBTEST_SL)) -l:libtest.sl \
+		-T user/user.ld -o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> dynamic-link test $@ ($$(stat -c%s $@) bytes)"
 
 # 字体程序（fontsrv/pchfnt）额外链接 FreeType 静态库。
@@ -621,6 +628,9 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) others_tests/moonhalo.mp3
 	# 共享库目录：动态链接 / dlopen 运行时加载
 	mmd -i $@ ::LIB 2>/dev/null || true
 	mcopy -i $@ $(LIBTEST_SL) ::LIB/libtest.sl
+	# 同一份库以不同文件名再装一份：供 dltest 运行期 dlopen("/LIB/libtest2.sl")
+	# 触发「纯 dlopen（非加载期依赖）」路径，从而验证 dlclose 物理页回收与槽位复用。
+	mcopy -i $@ $(LIBTEST_SL) ::LIB/libtest2.sl
 	mcopy -i $@ others_tests/moonhalo.mp3 ::MOONHALO.MP3
 	# 字体文件目录：把 resources/ 下 .ttf 放入 ::FONTS/，供字体服务内存加载
 	mmd -i $@ ::FONTS 2>/dev/null || true

@@ -199,7 +199,10 @@ typedef struct elf_module {
     uint32_t      relacount;
     elf64_rela_t *rela_plt;     /* .rela.plt */
     uint32_t      relapltcount;
-    int           refcount;      /* dlopen 引用计数 */
+    int           refcount;      /* dlopen 引用计数（load-time 依赖 +1，dlopen +1）*/
+    int           resident;      /* 槽位是否已加载（dlclose 归零后留作空闲槽复用）*/
+    int           img_owned;     /* img 是否为 kmalloc 副本（dlopen 加载=1，需释放；
+                                    * 主程序的内嵌静态 blob=0，不可 kfree，否则损坏内核堆）*/
 } elf_module_t;
 
 /*
@@ -240,7 +243,12 @@ int elf_dlopen(struct task *t, const char *path);
 /* 在模块 h 中按名查找符号，返回其运行时地址（base+st_value），未找到返回 0。 */
 uint64_t elf_dlsym(struct task *t, int h, const char *name);
 
-/* dlclose：引用计数减一，归零暂不卸载（返回 0）。 */
+/* dlclose：引用计数减一，归零则真正卸载（解映射用户页、释放物理页与
+ * 内核 ELF 副本，槽位标记为空闲可复用）。返回 0 成功，-1 非法句柄。 */
 int elf_dlclose(struct task *t, int h);
+
+/* 进程退出时释放全部已加载模块的 ELF 副本缓冲（kmalloc 内存），避免
+ * 内核堆泄漏。地址空间物理页由 vmm_destroy_address_space 负责回收。 */
+void elf_free_modules(struct task *t);
 
 #endif /* _SUKI_KERNEL_ELF_H */

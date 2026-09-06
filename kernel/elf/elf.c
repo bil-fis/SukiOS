@@ -24,25 +24,56 @@
 #include <mm/kmalloc.h>
 
 /* 把内核缓冲写入目标地址空间的某段用户虚拟内存（跨页安全）。
- * 依赖内核高半区已映射全部物理内存，故可用 PHYS_TO_VIRT 访问用户页。 */
+ * 依赖内核高半区已映射全部物理内存，故可用 PHYS_TO_VIRT 访问用户页。
+ * 注意：vmm_translate() 的返回值【已含页内偏移】，因此取到物理地址后直接用
+ * PHYS_TO_VIRT 即定位到目标字节，绝不可再加一次 (va & (PAGE_SIZE-1)) 偏移，
+ * 否则会写成「页基址 + 2×页内偏移」的错位地址（COPY 重定位失效的根因）。 */
 static void elf_write_user(uint64_t as, uint64_t va, const void *src, size_t n)
 {
     const uint8_t *s = (const uint8_t *)src;
     while (n) {
-        uint64_t page_off = va & (PAGE_SIZE - 1);
-        uint64_t phys = vmm_translate(as, va);
+        uint64_t phys = vmm_translate(as, va);   /* 已含页内偏移 */
         if (!phys) {
             return;                 /* 不应发生：调用方已建立映射 */
         }
-        uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(phys);
-        size_t chunk = PAGE_SIZE - page_off;
+        uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(phys);   /* 已定位到目标字节 */
+        size_t chunk = PAGE_SIZE - (va & (PAGE_SIZE - 1));
         if (chunk > n) {
             chunk = n;
         }
-        memcpy(kva + page_off, s, chunk);
+        memcpy(kva, s, chunk);
         s += chunk;
         va += chunk;
         n  -= chunk;
+    }
+}
+
+/* 在地址空间 as 内，把 src 用户虚拟地址处的 n 字节拷贝到 dst 用户虚拟地址处。
+ * 用内核高半区映射（PHYS_TO_VIRT(vmm_translate)）读 src，再用 elf_write_user
+ * 写 dst，借助弹跳缓冲解耦读写，正确处理跨页与 src/dst 重叠。用于 R_X86_64_COPY。
+ * 同样：vmm_translate 已含页内偏移，读取时 PHYS_TO_VIRT(sphys) 即目标字节，
+ * 不得再叠加 (src & (PAGE_SIZE-1))。 */
+static void elf_copy_user(uint64_t as, uint64_t dst, uint64_t src, size_t n)
+{
+    uint8_t buf[256];
+    while (n) {
+        uint64_t sphys = vmm_translate(as, src);   /* 已含页内偏移 */
+        if (!sphys) {
+            return;                 /* 源页未映射（不应发生）*/
+        }
+        const uint8_t *sp = (const uint8_t *)PHYS_TO_VIRT(sphys);  /* 目标字节 */
+        size_t chunk = PAGE_SIZE - (src & (PAGE_SIZE - 1));
+        if (chunk > n) {
+            chunk = n;
+        }
+        if (chunk > sizeof(buf)) {
+            chunk = sizeof(buf);
+        }
+        memcpy(buf, sp, chunk);
+        elf_write_user(as, dst, buf, chunk);
+        src += chunk;
+        dst += chunk;
+        n   -= chunk;
     }
 }
 
@@ -497,6 +528,32 @@ static bool elf_sym_name_eq(const elf_module_t *m, uint64_t name_off,
     return memcmp(p, name, nl) == 0 && p[nl] == '\0';
 }
 
+/* 把 ELF 虚拟地址换算为文件内偏移。ET_DYN 在文件里以 0 为基址（vaddr==offset），
+ * 换算后不变；而 ET_EXEC 的 .dynsym/.dynstr/.rela 等段里的 d_val 是「虚拟地址」，
+ * 与文件偏移相差一个段基址差，必须按 PT_LOAD 段换算回文件偏移，才能从内核持有的
+ * 文件副本（mod->img）正确读取这些表。否则 ET_EXEC 的 d_val（如 0x50xxxx）会远超
+ * 文件尺寸，被边界检查误判为非法。 */
+static uint64_t elf_vaddr_to_fileoff(const uint8_t *img, uint64_t size, uint64_t vaddr)
+{
+    (void)size;   /* 仅作接口一致性保留；换算只依赖程序头，无需文件总长 */
+    const elf64_hdr_t *h = (const elf64_hdr_t *)img;
+    if (h->e_phoff == 0 || h->e_phnum == 0) {
+        return vaddr;
+    }
+    const elf64_phdr_t *ph = (const elf64_phdr_t *)(img + h->e_phoff);
+    for (uint16_t i = 0; i < h->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) {
+            continue;
+        }
+        uint64_t lo = ph[i].p_vaddr;
+        uint64_t hi = ph[i].p_vaddr + ph[i].p_filesz;
+        if (vaddr >= lo && vaddr < hi) {
+            return vaddr - ph[i].p_vaddr + ph[i].p_offset;
+        }
+    }
+    return vaddr;   /* 不在任何段内（异常），交由上层边界检查拦截 */
+}
+
 /* 解析某模块的 .dynamic，把符号表/字符串表/重定位表指针（指向 img 内偏移）
  * 填入 mod。base 为实际加载基址，img 由调用方持有（供符号解析）。 */
 static bool elf_parse_dynamic(elf_module_t *mod, const uint8_t *img,
@@ -514,9 +571,11 @@ static bool elf_parse_dynamic(elf_module_t *mod, const uint8_t *img,
     }
     mod->dynamic = dyn;
 
-    uint64_t strtab_off = elf_dyn_get(dyn, DT_STRTAB, 0);
-    uint64_t symtab_off = elf_dyn_get(dyn, DT_SYMTAB, 0);
-    uint64_t rela_off   = elf_dyn_get(dyn, DT_RELA, 0);
+    /* d_val 是虚拟地址，须换算成文件内偏移才能从 img 正确索引（见
+     * elf_vaddr_to_fileoff 说明）。 */
+    uint64_t strtab_off = elf_vaddr_to_fileoff(img, size, elf_dyn_get(dyn, DT_STRTAB, 0));
+    uint64_t symtab_off = elf_vaddr_to_fileoff(img, size, elf_dyn_get(dyn, DT_SYMTAB, 0));
+    uint64_t rela_off   = elf_vaddr_to_fileoff(img, size, elf_dyn_get(dyn, DT_RELA, 0));
     uint64_t relasz     = elf_dyn_get(dyn, DT_RELASZ, 0);
     uint64_t relaent    = elf_dyn_get(dyn, DT_RELAENT, sizeof(elf64_rela_t));
 
@@ -533,7 +592,7 @@ static bool elf_parse_dynamic(elf_module_t *mod, const uint8_t *img,
     /* PLT 重定位（仅支持 RELA） */
     uint64_t pltrel = elf_dyn_get(dyn, DT_PLTREL, 0);
     if (pltrel == DT_RELA) {
-        uint64_t jmprel = elf_dyn_get(dyn, DT_JMPREL, 0);
+        uint64_t jmprel = elf_vaddr_to_fileoff(img, size, elf_dyn_get(dyn, DT_JMPREL, 0));
         uint64_t pltsz  = elf_dyn_get(dyn, DT_PLTRELSZ, 0);
         if (jmprel > size || jmprel + pltsz > size) {
             return false;
@@ -544,8 +603,8 @@ static bool elf_parse_dynamic(elf_module_t *mod, const uint8_t *img,
 
     /* 符号数：优先 DT_HASH.nchain，其次 DT_GNU_HASH 精确解析，最后以文件缓冲
      * 边界作为上限（防越界读）。三者逐级回退，确保 symcount 既不太小也不越界。 */
-    uint64_t hash_off  = elf_dyn_get(dyn, DT_HASH, 0);
-    uint64_t gnu_off   = elf_dyn_get(dyn, DT_GNU_HASH, 0);
+    uint64_t hash_off  = elf_vaddr_to_fileoff(img, size, elf_dyn_get(dyn, DT_HASH, 0));
+    uint64_t gnu_off   = elf_vaddr_to_fileoff(img, size, elf_dyn_get(dyn, DT_GNU_HASH, 0));
     if (hash_off && hash_off + 8 <= size) {
         const uint32_t *h = (const uint32_t *)(img + hash_off);
         mod->symcount = h[1];   /* nchain == nsyms */
@@ -564,6 +623,54 @@ static bool elf_parse_dynamic(elf_module_t *mod, const uint8_t *img,
         mod->symcount = 0;
     }
     return true;
+}
+
+/* 解映射并释放某已加载模块在用户地址空间 as 内的全部 PT_LOAD 物理页。
+ * 段范围从模块自身的 ELF 副本（mod->img）重新解析程序头取得，无需在
+ * elf_module_t 中额外缓存段表。按页解除 PTE 并 pmm_decref（与
+ * vmm_destroy_address_space 一致，正确处理共享页引用计数）。 */
+static void elf_unmap_module(uint64_t as, elf_module_t *mod)
+{
+    const elf64_hdr_t *h = (const elf64_hdr_t *)mod->img;
+    if (!h || h->e_phoff == 0 || h->e_phnum == 0) {
+        return;
+    }
+    const elf64_phdr_t *ph = (const elf64_phdr_t *)(mod->img + h->e_phoff);
+    for (uint16_t i = 0; i < h->e_phnum; i++) {
+        if (ph[i].p_type != PT_LOAD) {
+            continue;
+        }
+        uint64_t vstart = mod->base + ph[i].p_vaddr;
+        uint64_t vend   = vstart + ph[i].p_memsz;
+        uint64_t va     = vstart & ~((uint64_t)PAGE_SIZE - 1);
+        uint64_t end    = (vend + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
+        for (; va < end; va += PAGE_SIZE) {
+            uint64_t phys = vmm_translate(as, va);
+            if (phys) {
+                pmm_decref((void *)phys);
+            }
+            vmm_unmap_page(as, va);
+        }
+    }
+}
+
+/* 进程退出时释放全部已加载模块的 ELF 副本缓冲（kmalloc 内存）。
+ * 物理页/页表由 vmm_destroy_address_space 负责回收，此处只回收内核堆，
+ * 避免每个 dlopen 的 .sl 副本（几十~上百 KB）随进程生命周期持续泄漏。 */
+void elf_free_modules(struct task *t)
+{
+    for (int i = 0; i < t->nmodules; i++) {
+        elf_module_t *m = &t->modules[i];
+        /* 仅释放 dlopen/load_all_deps 经 exec_read_file 分配的 kmalloc 副本；
+         * 主程序的内嵌静态 blob（user_*.start）不可 kfree，否则损坏内核堆。 */
+        if (m->img && m->img_owned) {
+            kfree(m->img);
+        }
+        m->img = NULL;
+        m->img_owned = 0;
+        m->resident = 0;
+    }
+    t->nmodules = 0;
 }
 
 /* 跨全部已加载模块按名解析符号，返回运行时地址（base+st_value）；未找到返回 0。 */
@@ -602,6 +709,53 @@ static bool elf_apply_reloc(uint64_t as, elf_module_t *mod,
     uint64_t addr   = mod->base + r->r_offset;
     uint64_t S = 0;
 
+    /* R_X86_64_COPY：跨模块数据复制重定位（拷贝重定位）。
+     * 重定位项所在的模块（通常是主程序）在自身 .dynsym 中用一个 UNDEF 符号
+     * 引用某个共享库里的全局变量；运行时链接器需在其它已加载模块中找到该符号
+     * 的「定义」，将其初始值复制到本模块 r_offset 处的自有副本（.bss）。
+     * 关键：拷贝大小必须取自「定义方」符号的 st_size——本模块的 UNDEF 引用
+     * st_size 为 0，不能直接用；否则会误判大小未知而丢弃该重定位。 */
+    if (type == R_X86_64_COPY) {
+        if (symidx == 0) {
+            return false;   /* COPY 必须绑定一个符号以确定源/大小 */
+        }
+        elf64_sym_t *sym = &mod->symtab[symidx];
+        const char *nm = mod->strtab + sym->st_name;
+        uint64_t src = 0;
+        size_t   sz  = 0;
+        for (int k = 0; k < n; k++) {
+            elf_module_t *dm = &mods[k];
+            if (dm == mod) {
+                continue;   /* COPY 的源必须是「其它模块」（共享库）的定义；
+                              * 当前模块自身的同名符号只是目标副本占位符
+                              *（st_shndx 非 UNDEF、st_value 指向 .bss 副本），
+                              * 若以它作源会复制未初始化的 0，导致 COPY 失效。 */
+            }
+            if (!dm->resident || !dm->symtab || !dm->strtab) {
+                continue;
+            }
+            for (uint32_t s = 1; s < dm->symcount; s++) {
+                elf64_sym_t *ds = &dm->symtab[s];
+                if (ds->st_shndx == SHN_UNDEF) {
+                    continue;   /* 跳过未定义；只取真正定义 */
+                }
+                if (ds->st_name && elf_sym_name_eq(dm, ds->st_name, nm)) {
+                    src = dm->base + ds->st_value;   /* 定义方运行时地址 */
+                    sz  = (size_t)ds->st_size;       /* 拷贝大小取自定义方 */
+                    break;
+                }
+            }
+            if (src) {
+                break;
+            }
+        }
+        if (src == 0 || sz == 0) {
+            return false;   /* 找不到定义或大小未知，拒绝以防越界 */
+        }
+        elf_copy_user(as, addr, src, sz);
+        return true;
+    }
+
     if (symidx != 0) {
         elf64_sym_t *sym = &mod->symtab[symidx];
         if (sym->st_shndx == SHN_UNDEF) {
@@ -622,7 +776,6 @@ static bool elf_apply_reloc(uint64_t as, elf_module_t *mod,
     case R_X86_64_GLOB_DAT:
     case R_X86_64_JUMP_SLOT:
     case R_X86_64_64:         val = S + (uint64_t)r->r_addend; break;
-    case R_X86_64_COPY:       return true;   /* 跨模块数据复制暂跳过（测试库不含）*/
     default:                  return false;   /* 不支持的重定位类型 */
     }
     elf_write_user(as, addr, &val, 8);
@@ -691,14 +844,17 @@ static bool elf_load_all_deps(struct task *t, uint64_t as)
             size_t llen = 0;
             uint8_t *lbuf = exec_read_file(path, (size_t)pl, &ldata, &llen);
             if (!lbuf) {
+                kprintf("[elf] load_all_deps: exec_read_file('%s') failed\n", path);
                 return false;
             }
             if (!elf_validate(lbuf, llen)) {
+                kprintf("[elf] load_all_deps: elf_validate('%s') failed\n", path);
                 kfree(lbuf);
                 return false;
             }
             elf_load_result_t r;
             if (!elf_load(as, lbuf, llen, 0, NULL, 0, NULL, 0, 0, &r)) {
+                kprintf("[elf] load_all_deps: elf_load('%s') failed\n", path);
                 kfree(lbuf);
                 return false;
             }
@@ -709,6 +865,8 @@ static bool elf_load_all_deps(struct task *t, uint64_t as)
             }
             strncpy(nm->name, libname, sizeof(nm->name) - 1);
             nm->name[sizeof(nm->name) - 1] = '\0';
+            nm->resident = 1;   /* 标记已加载（供 dlclose/重定位跳过空闲槽）*/
+            nm->img_owned = 1;   /* lbuf 由 exec_read_file kmalloc，退出时释放 */
             t->nmodules++;
         }
     }
@@ -723,17 +881,24 @@ bool elf_link_dynamic(struct task *t, uint64_t as,
     t->nmodules = 0;
     elf_module_t *mm = &t->modules[0];
     if (!elf_parse_dynamic(mm, main_elf, main_size, main_base)) {
+        kprintf("[elf] link_dynamic: parse MAIN FAILED (size=%lu)\n", (unsigned long)main_size);
         return false;
     }
     strncpy(mm->name, "main", sizeof(mm->name) - 1);
     mm->name[sizeof(mm->name) - 1] = '\0';
+    mm->resident = 1;
     t->nmodules = 1;
 
     if (!elf_load_all_deps(t, as)) {
+        kprintf("[elf] link_dynamic: load_all_deps FAILED\n");
         return false;
     }
     for (int i = 0; i < t->nmodules; i++) {
+        if (!t->modules[i].resident) {
+            continue;   /* 跳过已卸载的空闲槽 */
+        }
         if (!elf_relocate(as, &t->modules[i], t->modules, t->nmodules)) {
+            kprintf("[elf] link_dynamic: relocate module %d ('%s') FAILED\n", i, t->modules[i].name);
             return false;
         }
     }
@@ -742,49 +907,95 @@ bool elf_link_dynamic(struct task *t, uint64_t as,
 
 int elf_dlopen(struct task *t, const char *path)
 {
-    if (t->nmodules >= ELF_MODULE_MAX) {
-        return 0;
-    }
     size_t pl = strlen(path);
     const uint8_t *ldata = NULL;
     size_t llen = 0;
-    uint8_t *lbuf = exec_read_file(path, pl, &ldata, &llen);
-    if (!lbuf) {
-        return 0;
-    }
-    if (!elf_validate(lbuf, llen)) {
-        kfree(lbuf);
-        return 0;
-    }
-    elf_load_result_t r;
-    if (!elf_load(t->cr3, lbuf, llen, 0, NULL, 0, NULL, 0, 0, &r)) {
-        kfree(lbuf);
-        return 0;
-    }
-    elf_module_t *mod = &t->modules[t->nmodules];
-    if (!elf_parse_dynamic(mod, lbuf, llen, r.base)) {
-        kfree(lbuf);
-        return 0;
-    }
+
+    /* 提取基名（去掉目录），用于「已加载去重」：同名库多次 dlopen 返回同一句柄。 */
     const char *bn = path;
     for (const char *p = path; *p; p++) {
         if (*p == '/') {
             bn = p + 1;
         }
     }
+
+    /* 去重：同名库已加载则引用计数 +1，返回既有句柄（POSIX dlopen 语义），
+     * 避免同一 .sl 被重复加载、重复占用地址空间。 */
+    for (int k = 0; k < t->nmodules; k++) {
+        if (t->modules[k].resident && strcmp(t->modules[k].name, bn) == 0) {
+            t->modules[k].refcount++;
+            return k;
+        }
+    }
+
+    /* 选槽位：优先复用已卸载（非 resident）的空闲槽，否则在末尾新开（受 MAX 限制）。
+     * 复用空闲槽可避免句柄表无限增长，dlclose 后该句柄即视为失效。 */
+    int slot = -1, new_slot = 0;
+    for (int k = 0; k < t->nmodules; k++) {
+        if (!t->modules[k].resident) {
+            slot = k;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (t->nmodules >= ELF_MODULE_MAX) {
+            return 0;
+        }
+        slot = t->nmodules;
+        new_slot = 1;
+        t->nmodules = slot + 1;   /* 预留范围；失败回退（resident 仍为 0，无害）*/
+    }
+
+    uint8_t *lbuf = exec_read_file(path, pl, &ldata, &llen);
+    if (!lbuf) {
+        if (new_slot) t->nmodules = slot;
+        return 0;
+    }
+    if (!elf_validate(lbuf, llen)) {
+        kfree(lbuf);
+        if (new_slot) t->nmodules = slot;
+        return 0;
+    }
+    elf_load_result_t r;
+    if (!elf_load(t->cr3, lbuf, llen, 0, NULL, 0, NULL, 0, 0, &r)) {
+        kfree(lbuf);
+        if (new_slot) t->nmodules = slot;
+        return 0;
+    }
+    elf_module_t *mod = &t->modules[slot];
+    if (!elf_parse_dynamic(mod, lbuf, llen, r.base)) {
+        elf_unmap_module(t->cr3, mod);   /* 解映射已加载的用户页 */
+        kfree(lbuf);
+        if (new_slot) t->nmodules = slot;
+        return 0;
+    }
     strncpy(mod->name, bn, sizeof(mod->name) - 1);
     mod->name[sizeof(mod->name) - 1] = '\0';
-    t->nmodules++;
+    mod->resident = 1;   /* 标记已加载（句柄 slot 生效）；refcount 已由 parse 置 1 */
+    mod->img_owned = 1;   /* lbuf 由 exec_read_file kmalloc，退出时释放 */
 
     if (!elf_load_all_deps(t, t->cr3)) {
+        elf_unmap_module(t->cr3, mod);
+        kfree(mod->img);
+        mod->img = NULL;
+        mod->resident = 0;
+        if (new_slot) t->nmodules = slot;
         return 0;
     }
     for (int i = 0; i < t->nmodules; i++) {
+        if (!t->modules[i].resident) {
+            continue;
+        }
         if (!elf_relocate(t->cr3, &t->modules[i], t->modules, t->nmodules)) {
+            elf_unmap_module(t->cr3, mod);
+            kfree(mod->img);
+            mod->img = NULL;
+            mod->resident = 0;
+            if (new_slot) t->nmodules = slot;
             return 0;
         }
     }
-    return t->nmodules - 1;   /* handle（0 保留给主程序）*/
+    return slot;   /* handle（0 保留给主程序）*/
 }
 
 uint64_t elf_dlsym(struct task *t, int h, const char *name)
@@ -793,8 +1004,8 @@ uint64_t elf_dlsym(struct task *t, int h, const char *name)
         return 0;
     }
     elf_module_t *m = &t->modules[h];
-    if (!m->symtab || !m->strtab) {
-        return 0;
+    if (!m->resident || !m->symtab || !m->strtab) {
+        return 0;   /* 句柄失效（已 dlclose）或非法 */
     }
     for (uint32_t s = 1; s < m->symcount; s++) {
         elf64_sym_t *sym = &m->symtab[s];
@@ -816,8 +1027,36 @@ int elf_dlclose(struct task *t, int h)
     if (h <= 0 || h >= t->nmodules) {
         return -1;
     }
-    if (t->modules[h].refcount > 0) {
-        t->modules[h].refcount--;
+    elf_module_t *m = &t->modules[h];
+    if (!m->resident) {
+        return -1;   /* 已卸载或非法句柄 */
     }
+    if (m->refcount > 0) {
+        m->refcount--;
+    }
+    if (m->refcount > 0) {
+        return 0;   /* 仍被其它引用持有（DT_NEEDED 依赖或重复 dlopen），暂不卸载 */
+    }
+
+    /* 引用归零：真正回收该模块占用的全部资源。 */
+    kprintf("[elf] dlclose: reclaim module '%s' base=%p img=%p\n",
+            m->name, (void *)m->base, (void *)m->img);
+    elf_unmap_module(t->cr3, m);     /* 解映射用户页 + 释放物理页（pmm_decref）*/
+    if (m->img && m->img_owned) {
+        kfree(m->img);               /* 释放内核侧 ELF 副本（kmalloc）*/
+        m->img = NULL;
+    }
+    m->img_owned = 0;
+    m->symtab   = NULL;
+    m->strtab   = NULL;
+    m->dynamic  = NULL;
+    m->rela     = NULL;
+    m->rela_plt = NULL;
+    m->symcount      = 0;
+    m->relacount     = 0;
+    m->relapltcount = 0;
+    m->resident = 0;
+    m->name[0]  = '\0';
+    /* nmodules 保持不变：该槽位留作空闲可复用，句柄 h 此后视为失效。 */
     return 0;
 }

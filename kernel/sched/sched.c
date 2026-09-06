@@ -525,12 +525,19 @@ task_t *task_create_user_args(const void *elf, size_t size,
     }
 
     /* 动态链接：解析主程序 .dynamic，加载 DT_NEEDED 依赖（约定 /LIB/<name>）并重定位。
-     * elf 缓冲（内核嵌入或 kmalloc）保留为 modules[0].img，供符号解析（进程生命周期内有效）。 */
-    if (!elf_link_dynamic(t, as, (const uint8_t *)elf, size, res.base, res.entry)) {
-        kprintf("[sched] task_create_user: elf_link_dynamic FAILED\n");
-        t->nmodules = 0;   /* 清空模块表，避免悬空 img 引用 */
-        vmm_destroy_address_space(as);
-        return NULL;
+     * elf 缓冲（内核嵌入或 kmalloc）保留为 modules[0].img，供符号解析（进程生命周期内有效）。
+     * 开机自启任务可能在 FS 完成磁盘挂载前被创建，而其依赖来自磁盘；此处失败时空出 CPU
+     * 重试若干轮，待 FS 服务就绪后再加载（与 posixtest::wait_fs_ready 同构）。 */
+    int link_tries = 0;
+    while (!elf_link_dynamic(t, as, (const uint8_t *)elf, size, res.base, res.entry)) {
+        if (++link_tries > 400) {
+            kprintf("[sched] task_create_user: elf_link_dynamic FAILED after %d tries\n",
+                    link_tries);
+            t->nmodules = 0;   /* 清空模块表，避免悬空 img 引用 */
+            vmm_destroy_address_space(as);
+            return NULL;
+        }
+        task_yield();   /* 让出 CPU，使 FS 服务能完成磁盘挂载 */
     }
 
     /* 修正跳板参数：r13 槽（arg）指向任务自身 */
@@ -1050,6 +1057,7 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
             vmm_destroy_address_space(t->cr3);
         }
     }
+    elf_free_modules(t);   /* 释放各模块 ELF 副本缓冲（kmalloc），避免内核堆泄漏 */
     t->cr3 = 0;
 
     /* POSIX 僵尸语义（P0-R7 修复）：

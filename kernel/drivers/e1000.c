@@ -38,7 +38,7 @@
 /* 轮询超时的时间基准上限（纳秒） */
 #define E1000_TX_TIMEOUT_NS     (100ull * 1000ull * 1000ull)   /* 100ms */
 #define E1000_SELFTEST_NS       (2000ull * 1000ull * 1000ull)  /* 2s    */
-#define E1000_RECV_WAIT_NS      (1000ull * 1000ull * 1000ull)  /* 1s    */
+#define E1000_RECV_WAIT_NS      (20ull * 1000ull * 1000ull)   /* 20ms（net_server 轮询频率） */
 
 /* ---- 驱动状态 ---- */
 static volatile uint8_t *g_mmio = NULL;      /* BAR0 MMIO 虚拟基址 */

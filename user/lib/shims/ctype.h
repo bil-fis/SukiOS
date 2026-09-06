@@ -24,4 +24,12 @@ int isprint(int c);
 int toupper(int c);
 int tolower(int c);
 
+/* lwIP 的 arch.h 用到 isxdigit（十六进制字符判定），以宏实现（无需 string.c
+ * 提供函数体，避免链接期未定义引用）。 */
+#ifndef isxdigit
+#define isxdigit(c) ( ((c) >= '0' && (c) <= '9') || \
+                      ((c) >= 'a' && (c) <= 'f') || \
+                      ((c) >= 'A' && (c) <= 'F') )
+#endif
+
 #endif /* _SUKI_SHIM_CTYPE_H */

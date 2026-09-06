@@ -27,6 +27,10 @@
 /* msgh_bits 标志 */
 #define MACH_MSGH_BITS_OOL    (1U << 31)    /* 携带 OOL 页描述符 */
 
+/* 与用户态 suki.h 共用同一守卫（MACH_MSG_HEADER_DEFINED），避免 net_server 等
+ * 同时包含两者的 TU 出现重定义。 */
+#ifndef MACH_MSG_HEADER_DEFINED
+#define MACH_MSG_HEADER_DEFINED
 typedef struct mach_msg_header {
     uint32_t msgh_bits;                     /* 标志位 */
     uint32_t msgh_size;                     /* 总大小（含头） */
@@ -35,6 +39,7 @@ typedef struct mach_msg_header {
     uint32_t msgh_id;                       /* 消息 ID（协议自定义） */
     uint32_t msgh_reserved;
 } mach_msg_header_t;
+#endif
 
 /* OOL 描述符：紧跟消息头之后（内核在投递时改写为接收方虚拟地址） */
 typedef struct mach_ool_desc {
@@ -76,7 +81,12 @@ typedef struct mach_ool_desc {
  * 这是 1..10（DISK..FONT）之后首个空闲号位；ipc_init() 的预留上界已同步提升为
  * NET_PORT，故 11 会被标记为 in_use，port_allocate 绝不会把它动态分配出去。 */
 #define NET_PORT        11
-#define PORT_FIRST_DYN  9               /* 动态分配起始（1..NET_PORT 均已预留） */
+/* 网络服务（用户态 lwIP 服务 net_server）向 NET_PORT 发请求（GET_MAC/SEND/RECV）
+ * 并以此为 msgh_local_port 收应答；该应答端口须由 net_server 认领且纳入预留，
+ * 否则会与动态分配端口冲突。放在 NET_PORT 紧邻的 12 号位。 */
+#define NET_REPLY_PORT  12
+#define NS_PORT         13              /* net_server 对外暴露的 socket 服务端口 */
+#define PORT_FIRST_DYN  9               /* 动态分配起始（1..NS_PORT 均已预留） */
 #define PORT_MAX        64
 /* 单端口消息队列长度上限（M5 修复）：防止失控/恶意任务狂发消息耗尽内核堆，
  * 超出即拒绝投递并返回 MACH_SEND_NO_BUFFER 形成背压。 */

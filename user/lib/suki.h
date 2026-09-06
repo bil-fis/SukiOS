@@ -39,6 +39,11 @@
 #define MOUSE_PORT      9               /* Ring3 鼠标驱动 -> 显示服务 的光标事件端口 */
 #define FONT_PORT       10              /* 字体服务（FreeType 渲染）端口 */
 
+/* MACH_MSG_HEADER_DEFINED：mach_msg_header 在用户态(suki.h)与内核(port.h)各定义
+ * 一份（布局一致）。net_server 同TU同时包含两者，故用统一守卫避免重定义冲突
+ * （谁先包含谁定义，另一份跳过）。 */
+#ifndef MACH_MSG_HEADER_DEFINED
+#define MACH_MSG_HEADER_DEFINED
 typedef struct mach_msg_header {
     uint32_t msgh_bits;
     uint32_t msgh_size;
@@ -47,6 +52,7 @@ typedef struct mach_msg_header {
     uint32_t msgh_id;
     uint32_t msgh_reserved;
 } mach_msg_header_t;
+#endif
 
 /* OOL 描述符（布局与内核 port.h 的 mach_ool_desc_t 一致）：当 msgh_bits 含
  * MACH_MSGH_BITS_OOL 时，紧跟消息头的是此描述符，address 为接收方用户 VA，

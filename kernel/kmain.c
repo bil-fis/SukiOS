@@ -65,6 +65,7 @@ extern const uint8_t user_display_server_start[], user_display_server_end[];
 extern const uint8_t user_shell_start[], user_shell_end[];
 extern const uint8_t user_posixtest_start[], user_posixtest_end[];
 extern const uint8_t user_mouse_server_start[], user_mouse_server_end[];
+extern const uint8_t user_net_server_start[], user_net_server_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -393,6 +394,20 @@ static void boot_late_init(void *arg)
      * 全程 task_yield 让出），不应阻塞早期引导的关键路径。
      * 网络服务（lwIP）后续经 NET_PORT 收发帧，并需 port_grant_send 授权。 */
     net_srv_start();
+
+    /* Ring3 网络服务（lwIP 协议栈）：作为 NET_PORT 的【客户端】收发帧。
+     * 须授权其向 NET_PORT 发送（net_srv_task 已在 e1000_init 把 NET_PORT 设为
+     * 服务端）。net_server 自身会 sys_port_claim(NET_REPLY_PORT) 收应答。 */
+    {
+        task_t *net_task = task_create_user(user_net_server_start,
+                (size_t)(user_net_server_end - user_net_server_start),
+                "net-server");
+        if (net_task) {
+            port_grant_send(NET_PORT, net_task);
+            kprintf("[boot] net-server spawned (pid=%lu), lwIP stack coming up\n",
+                    (unsigned long)net_task->id);
+        }
+    }
 
     /* ---- Ring3 输入服务 + 显示服务（Shell 暂不启动）----
      * 用户明确要求：「显示服务启动时，shell 不应该启动」。

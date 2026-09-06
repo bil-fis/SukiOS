@@ -130,13 +130,43 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
-                -I user/lib/shims \
-                -include $(CONFIG_H)
+                -I user/lib/shims -include $(CONFIG_H)
+
+# ---- lwIP 2.2.1（vendor 在 lib/） ----
+# NO_SYS=1 下编译的核心/接口源文件（关闭 altcp/ipv6/igmp/autoip/socket）。
+LWIP_DIR   := lib/lwip-2.2.1
+LWIP_INC   := -I $(LWIP_DIR)/src/include -I user/lib
+LWIP_SRCS  := $(LWIP_DIR)/src/core/def.c \
+              $(LWIP_DIR)/src/core/inet_chksum.c \
+              $(LWIP_DIR)/src/core/init.c \
+              $(LWIP_DIR)/src/core/mem.c \
+              $(LWIP_DIR)/src/core/memp.c \
+              $(LWIP_DIR)/src/core/netif.c \
+              $(LWIP_DIR)/src/core/pbuf.c \
+              $(LWIP_DIR)/src/core/raw.c \
+              $(LWIP_DIR)/src/core/stats.c \
+              $(LWIP_DIR)/src/core/sys.c \
+              $(LWIP_DIR)/src/core/tcp.c \
+              $(LWIP_DIR)/src/core/tcp_in.c \
+              $(LWIP_DIR)/src/core/tcp_out.c \
+              $(LWIP_DIR)/src/core/timeouts.c \
+              $(LWIP_DIR)/src/core/udp.c \
+              $(LWIP_DIR)/src/core/ip.c \
+              $(LWIP_DIR)/src/core/dns.c \
+              $(LWIP_DIR)/src/core/ipv4/dhcp.c \
+              $(LWIP_DIR)/src/core/ipv4/etharp.c \
+              $(LWIP_DIR)/src/core/ipv4/icmp.c \
+              $(LWIP_DIR)/src/core/ipv4/ip4.c \
+              $(LWIP_DIR)/src/core/ipv4/ip4_addr.c \
+              $(LWIP_DIR)/src/core/ipv4/ip4_frag.c \
+              $(LWIP_DIR)/src/netif/ethernet.c
+LWIP_OBJS  := $(patsubst $(LWIP_DIR)/%,$(BUILD)/lwip/%,$(LWIP_SRCS:.c=.c.o))
+
 USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/errno.c.o $(BUILD)/user/lib/string.c.o \
                   $(BUILD)/user/lib/stdlib.c.o $(BUILD)/user/lib/stdio.c.o \
@@ -366,6 +396,26 @@ $(BUILD)/user/fs_server.elf: $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATF
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--no-warn-rwx-segments -T user/user.ld \
 		-o $@ $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS) -lgcc
+	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
+
+# ---- lwIP 编译/链接（net_server） ----
+# lwIP 源文件：独立规则，带 lwIP 头路径（arch/cc.h、lwipopts.h 位于 user/lib）。
+$(BUILD)/lwip/%.c.o: $(LWIP_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) $(LWIP_INC) -c $< -o $@
+
+# net_server 需要 lwIP 头路径（arch/cc.h / lwipopts.h）。
+$(BUILD)/user/net_server.c.o: user/net_server.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) $(LWIP_INC) -c $< -o $@
+
+# net_server 专用：链接 lwIP 对象 + 用户库。
+# --allow-multiple-definition：lwIP 与用户库个别符号（如 htons/memset 内建）可能
+# 重复，容忍之，与 FreeType 库的处理方式一致。
+$(BUILD)/user/net_server.elf: $(BUILD)/user/net_server.c.o $(USER_LIB_OBJS) $(LWIP_OBJS) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $(BUILD)/user/net_server.c.o $(USER_LIB_OBJS) $(LWIP_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # 把 ELF 文件作为原始字节流嵌入内核镜像（objcopy -I binary 生成

@@ -533,6 +533,11 @@ typedef struct suki_fd_set {
  * syscall_dispatch 的 switch 会优先命中 SYS_PORT_ALLOC/FREE 而拦截 fork/getpid，
  * 造成全局进程管理失效（getpid 恒返回 0、fork 返回端口号）。故动态端口分配/
  * 释放使用 88..129 区段末端的空闲号位 97/98。 */
+/* 内核 IPC/mach-port 动态端口分配（非网络 socket，故不归入 150-166 网络区）。
+ * 号位 97/98 在 SukiOS 内部号位表中经全量扫描确认为唯一空闲，未与任何宏冲突。
+ * 注意：Linux x86_64 在 97/98 是 getrlimit/getrusage，但 SukiOS 为独立 ABI
+ *（其 getrlimit=37、getrusage=39），此处复用 97/98 不冲突；仅当未来承诺 Linux
+ * 二进制兼容时才需另作映射。绝不可复用 17/18（已被核心 ABI SYS_FORK/SYS_GETPID 占用）。 */
 #define SYS_PORT_ALLOC      97   /* 分配一个动态接收端口，返回端口号（0=失败） */
 #define SYS_PORT_FREE       98   /* 释放动态端口（a1=端口号） */
 #define SYS_EXECVE          8

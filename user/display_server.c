@@ -405,17 +405,31 @@ int main(void)
                 g_cur_x = m->x; g_cur_y = m->y;
                 if (h->msgh_id == MOUSE_MSG_BUTTON) g_cur_buttons = m->buttons;
 
+                wm_window_t *hit = wm_hit_test(m->x, m->y);
+
                 /* 拖拽进行中：直接跟随光标移动窗口（忽略命中） */
                 if (g_drag) {
                     if (h->msgh_id == MOUSE_MSG_MOVE) {
                         g_drag->x = m->x - g_drag_offx;
                         g_drag->y = m->y - g_drag_offy;
                         composite();
+                    } else if (h->msgh_id == MOUSE_MSG_BUTTON) {
+                        /* 左键释放 -> 结束拖拽；并视情况下发 MOUSE_UP 给窗口 */
+                        if (!(m->buttons & 1)) {
+                            g_drag = NULL;
+                            if (hit) {
+                                suki_event_t ev; memset(&ev, 0, sizeof(ev));
+                                ev.type = SUKI_EVENT_MOUSE_UP;
+                                ev.u.mouse.x = m->x - hit->x;
+                                ev.u.mouse.y = m->y - hit->y;
+                                ev.u.mouse.buttons = m->buttons;
+                                wm_forward_event(hit, &ev);
+                            }
+                            composite();
+                        }
                     }
                     continue;
                 }
-
-                wm_window_t *hit = wm_hit_test(m->x, m->y);
 
                 if (h->msgh_id == MOUSE_MSG_BUTTON && (m->buttons & 1)) {
                     /* 左键按下：标题栏 -> 关闭按钮 / 拖拽；客户区 -> 聚焦 + 下发 */

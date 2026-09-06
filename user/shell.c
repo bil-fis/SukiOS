@@ -79,6 +79,8 @@ static bool     g_term_dirty = false;
 static int run_builtin_raw(char *line);
 static void prompt(void);
 static void term_puts(const char *s);   /* 终端仿真输出（定义见下方窗口化段） */
+static void shell_out(const char *s);    /* 双写：终端网格 + 串口镜像 */
+static void shell_outn(const char *s, size_t n);
 
 /* ============ 行内编辑（光标感知） ============ */
 /* ---- 终端光标列 g_scr_x 由 term_emit_char 直接维护（见下方终端仿真） ---- */
@@ -293,9 +295,9 @@ static void edit_tab_complete(void)
         for (int i = 0; add[i]; i++) edit_insert(add[i]);
     }
     /* 列出候选 */
-    u_print("\r\n");
+    shell_out("\r\n");
     for (int i = 0; i < nmatch; i++) {
-        u_print("  "); u_print(matches[i]); u_print("\r\n");
+        shell_out("  "); shell_out(matches[i]); shell_out("\r\n");
     }
     prompt();
     /* prompt() 之后光标位于编辑行起点（提示符之后），g_scr_x 已重置。
@@ -321,9 +323,9 @@ static void prompt(void)
      * 旧字符残留（如 "lsear"）。先 \r\n 复位可彻底规避这一类失步。 */
     ed_raw("\r\n");
     g_scr_x = 0;
-    u_print("SukiOS:");
-    u_print(g_cwd);
-    u_print("> ");
+    shell_out("SukiOS:");
+    shell_out(g_cwd);
+    shell_out("> ");
     /* 编辑行起点列 = 提示符长度（"SukiOS:" = 7 + "> " = 2 = 9）+ cwd 长度。
      * 同时初始化终端列镜像，使后续 redraw_from_cursor() 的「回退到行首」计算正确。 */
     g_prompt_col = 9 + (int)strlen(g_cwd);
@@ -366,7 +368,7 @@ static void fs_wait_and_print(uint32_t expect_id, bool raw)
             continue;                        /* 等待期间丢弃按键 */
         }
         if (h->msgh_id == MSG_ID_SERVICE_DOWN) {
-            u_print("fs: service unavailable (fs-server down)\n");
+            shell_out("fs: service unavailable (fs-server down)\n");
             return;                          /* 立即回提示符，不再永久等待 */
         }
         if (h->msgh_id != expect_id) {
@@ -375,13 +377,13 @@ static void fs_wait_and_print(uint32_t expect_id, bool raw)
         fs_resp_t *fr = (fs_resp_t *)(g_rx + sizeof(*h));
         char *data = (char *)g_rx + sizeof(*h) + sizeof(*fr);
         if (fr->status == FS_ERR_NOENT) {
-            u_print("cat: file not found\n");
+            shell_out("cat: file not found\n");
         } else if (fr->status != FS_OK) {
-            u_print("fs: I/O error\n");
+            shell_out("fs: I/O error\n");
         } else {
-            u_printn(data, fr->length);
+            shell_outn(data, fr->length);
             if (raw && fr->length > 0 && data[fr->length - 1] != '\n') {
-                u_print("\n");
+                shell_out("\n");
             }
         }
         return;
@@ -432,7 +434,7 @@ static void fs_wait_status(uint32_t expect_id)
             continue;
         }
         if (h->msgh_id == MSG_ID_SERVICE_DOWN) {
-            u_print("fs: service unavailable (fs-server down)\n");
+            shell_out("fs: service unavailable (fs-server down)\n");
             return;
         }
         if (h->msgh_id != expect_id) {
@@ -440,11 +442,11 @@ static void fs_wait_status(uint32_t expect_id)
         }
         fs_resp_t *fr = (fs_resp_t *)(g_rx + sizeof(*h));
         if (fr->status == FS_OK) {
-            u_print("ok\n");
+            shell_out("ok\n");
         } else if (fr->status == FS_ERR_NOENT) {
-            u_print("fs: no such file\n");
+            shell_out("fs: no such file\n");
         } else {
-            u_print("fs: I/O error\n");
+            shell_out("fs: I/O error\n");
         }
         return;
     }
@@ -549,17 +551,17 @@ static void echo_print(const char *s, bool esc)
         if (esc && s[i] == '\\' && s[i + 1]) {
             char o = s[++i];
             switch (o) {
-                case 'n': u_print("\n"); break;
-                case 't': u_print("\t"); break;
-                case 'r': u_print("\r"); break;
-                case '\\': u_print("\\"); break;
-                case 'a': u_print("\a"); break;
-                case '0': u_print("\0"); break;   /* 实际不可见，忽略 */
-                default: { char b[2] = {o, 0}; u_print(b); } break;
+                case 'n': shell_out("\n"); break;
+                case 't': shell_out("\t"); break;
+                case 'r': shell_out("\r"); break;
+                case '\\': shell_out("\\"); break;
+                case 'a': shell_out("\a"); break;
+                case '0': shell_out("\0"); break;   /* 实际不可见，忽略 */
+                default: { char b[2] = {o, 0}; shell_out(b); } break;
             }
         } else {
             char b[2] = {s[i], 0};
-            u_print(b);
+            shell_out(b);
         }
     }
 }
@@ -616,8 +618,8 @@ static int do_command(char *line)
         }
         long r = suki_syscall1(SYS_CHDIR, (uint64_t)target);
         if (r < 0) {
-            u_print("cd: "); u_print(target); u_print(": ");
-            u_print(strerror((int)(-r))); u_print("\n");
+            shell_out("cd: "); shell_out(target); shell_out(": ");
+            shell_out(strerror((int)(-r))); shell_out("\n");
             return 1;
         }
         char buf[PATH_MAX];
@@ -627,9 +629,9 @@ static int do_command(char *line)
     /* ---- pwd ---- */
     if (u_strcmp(name, "pwd") == 0) {
         char buf[PATH_MAX];
-        if (getcwd(buf, sizeof(buf))) u_print(buf);
-        else u_print("/");
-        u_print("\n");
+        if (getcwd(buf, sizeof(buf))) shell_out(buf);
+        else shell_out("/");
+        shell_out("\n");
         return 0;
     }
     /* ---- echo ---- */
@@ -643,17 +645,17 @@ static int do_command(char *line)
             break;
         }
         for (; i < ac; i++) {
-            if (i > (nflag || eflag ? 1 : 1) && i > 1) u_print(" ");
+            if (i > (nflag || eflag ? 1 : 1) && i > 1) shell_out(" ");
             echo_print(argv[i], eflag);
         }
-        if (!nflag) u_print("\n");
+        if (!nflag) shell_out("\n");
         return 0;
     }
     /* ---- export ---- */
     if (u_strcmp(name, "export") == 0) {
-        if (ac < 2) { u_print("usage: export VAR=val\n"); return 1; }
+        if (ac < 2) { shell_out("usage: export VAR=val\n"); return 1; }
         char *eq = strchr(argv[1], '=');
-        if (!eq) { u_print("usage: export VAR=val\n"); return 1; }
+        if (!eq) { shell_out("usage: export VAR=val\n"); return 1; }
         *eq = '\0';
         setenv(argv[1], eq + 1, 1);
         *eq = '=';   /* 还原（argv 在 expanded 缓冲，后面不再用） */
@@ -662,23 +664,23 @@ static int do_command(char *line)
     /* ---- env / set ---- */
     if (u_strcmp(name, "env") == 0 || u_strcmp(name, "set") == 0) {
         if (environ) {
-            for (int i = 0; environ[i]; i++) u_print(environ[i]), u_print("\n");
+            for (int i = 0; environ[i]; i++) shell_out(environ[i]), shell_out("\n");
         }
         return 0;
     }
     /* ---- clear ---- */
     if (u_strcmp(name, "clear") == 0) {
-        u_print("\033[2J\033[H");
+        shell_out("\033[2J\033[H");
         return 0;
     }
     /* ---- history ---- */
     if (u_strcmp(name, "history") == 0) {
         for (int i = 0; i < g_hist_count; i++) {
             char num[12];
-            u_print(u_utoa_s((uint64_t)(i + 1), num, sizeof(num)));
-            u_print("  ");
-            u_print(g_hist[i]);
-            u_print("\n");
+            shell_out(u_utoa_s((uint64_t)(i + 1), num, sizeof(num)));
+            shell_out("  ");
+            shell_out(g_hist[i]);
+            shell_out("\n");
         }
         return 0;
     }
@@ -705,7 +707,7 @@ static int run_builtin_raw(char *line)
     }
 
     if (u_strcmp(line, "help") == 0) {
-        u_print("SukiOS shell (Ring3). Built-in commands:\n"
+        shell_out("SukiOS shell (Ring3). Built-in commands:\n"
                 "  help                 - show this help\n"
                 "  ls [-l]              - list FAT32 directory (via FS_SERVER)\n"
                 "  cat <FILE>           - print file content (8.3 name)\n"
@@ -734,21 +736,21 @@ static int run_builtin_raw(char *line)
         fs_wait_and_print(FS_MSG_LIST, false);
     } else if (u_strcmp(line, "cat") == 0) {
         if (!*arg) {
-            u_print("usage: cat <FILE>\n");
+            shell_out("usage: cat <FILE>\n");
         } else {
             upcase(arg);
             fs_request(FS_MSG_READ, arg);
             fs_wait_and_print(FS_MSG_READ, true);
         }
     } else if (u_strcmp(line, "reboot") == 0) {
-        u_print("rebooting...\n");
+        shell_out("rebooting...\n");
         suki_syscall5(SYS_REBOOT, 0, 0, 0, 0, 0);
     } else if (u_strcmp(line, "poweroff") == 0 || u_strcmp(line, "shutdown") == 0) {
-        u_print("powering off (ACPI S5)...\n");
+        shell_out("powering off (ACPI S5)...\n");
         suki_syscall5(SYS_REBOOT, 1, 0, 0, 0, 0);   /* mode=1 -> acpi_poweroff */
     } else if (u_strcmp(line, "exec") == 0) {
         if (!*arg) {
-            u_print("usage: exec <FILE> [args...]\n");
+            shell_out("usage: exec <FILE> [args...]\n");
         } else {
             char *argv[8];
             for (int zi = 0; zi < 8; zi++) argv[zi] = NULL;
@@ -776,29 +778,29 @@ static int run_builtin_raw(char *line)
                 }
             }
             if (pid < 0) {
-                u_print("exec failed: file not found or invalid ELF\n");
+                shell_out("exec failed: file not found or invalid ELF\n");
             } else {
                 uint64_t rc = sys_wait((uint64_t)pid);
-                u_print("  [shell] child pid=");
+                shell_out("  [shell] child pid=");
                 char db[24];
-                u_print(u_utoa_s((uint64_t)pid, db, sizeof(db)));
-                u_print(" exited (code=");
-                u_print(u_utoa_s(rc, db, sizeof(db)));
-                u_print(")\n");
+                shell_out(u_utoa_s((uint64_t)pid, db, sizeof(db)));
+                shell_out(" exited (code=");
+                shell_out(u_utoa_s(rc, db, sizeof(db)));
+                shell_out(")\n");
             }
         }
     } else if (u_strcmp(line, "mkfile") == 0) {
-        if (!*arg) { u_print("usage: mkfile <FILE>\n"); }
+        if (!*arg) { shell_out("usage: mkfile <FILE>\n"); }
         else { upcase(arg); fs_request(FS_MSG_CREATE, arg); fs_wait_status(FS_MSG_CREATE); }
     } else if (u_strcmp(line, "mkdir") == 0) {
-        if (!*arg) { u_print("usage: mkdir <DIR>\n"); }
+        if (!*arg) { shell_out("usage: mkdir <DIR>\n"); }
         else { upcase(arg); fs_request(FS_MSG_MKDIR, arg); fs_wait_status(FS_MSG_MKDIR); }
     } else if (u_strcmp(line, "write") == 0) {
-        if (!*arg) { u_print("usage: write <FILE> <TEXT>\n"); }
+        if (!*arg) { shell_out("usage: write <FILE> <TEXT>\n"); }
         else {
             char *f = arg, *sp = arg;
             while (*sp && *sp != ' ' && *sp != '\t') sp++;
-            if (!*sp) { u_print("usage: write <FILE> <TEXT>\n"); }
+            if (!*sp) { shell_out("usage: write <FILE> <TEXT>\n"); }
             else {
                 *sp++ = 0; while (*sp == ' ' || *sp == '\t') sp++;
                 upcase(f);
@@ -809,14 +811,14 @@ static int run_builtin_raw(char *line)
             }
         }
     } else if (u_strcmp(line, "rm") == 0) {
-        if (!*arg) { u_print("usage: rm <FILE>\n"); }
+        if (!*arg) { shell_out("usage: rm <FILE>\n"); }
         else { upcase(arg); fs_request(FS_MSG_UNLINK, arg); fs_wait_status(FS_MSG_UNLINK); }
     } else if (u_strcmp(line, "rename") == 0) {
-        if (!*arg) { u_print("usage: rename <OLD> <NEW>\n"); }
+        if (!*arg) { shell_out("usage: rename <OLD> <NEW>\n"); }
         else {
             char *o = arg, *sp = arg;
             while (*sp && *sp != ' ' && *sp != '\t') sp++;
-            if (!*sp) { u_print("usage: rename <OLD> <NEW>\n"); }
+            if (!*sp) { shell_out("usage: rename <OLD> <NEW>\n"); }
             else {
                 *sp++ = 0; while (*sp == ' ' || *sp == '\t') sp++;
                 upcase(o); upcase(sp);
@@ -839,11 +841,11 @@ static int run_builtin_raw(char *line)
             }
         }
     } else if (u_strcmp(line, "truncate") == 0) {
-        if (!*arg) { u_print("usage: truncate <FILE> <SIZE>\n"); }
+        if (!*arg) { shell_out("usage: truncate <FILE> <SIZE>\n"); }
         else {
             char *f = arg, *sp = arg;
             while (*sp && *sp != ' ' && *sp != '\t') sp++;
-            if (!*sp) { u_print("usage: truncate <FILE> <SIZE>\n"); }
+            if (!*sp) { shell_out("usage: truncate <FILE> <SIZE>\n"); }
             else {
                 *sp++ = 0; while (*sp == ' ' || *sp == '\t') sp++;
                 upcase(f);
@@ -868,9 +870,9 @@ static int run_builtin_raw(char *line)
             }
         }
     } else {
-        u_print("unknown command: ");
-        u_print(line);
-        u_print("  (try 'help')\n");
+        shell_out("unknown command: ");
+        shell_out(line);
+        shell_out("  (try 'help')\n");
         return 127;
     }
     return 0;
@@ -967,12 +969,12 @@ static void libc_selftest(void)
     /* 1) getenv/setenv/unsetenv 闭环 */
     setenv("LIBCTEST", "hello", 1);
     const char *v = getenv("LIBCTEST");
-    if (v && u_strcmp(v, "hello") == 0) pass++; else { fail++; u_print("[libc-test] FAIL getenv/setenv\n"); }
+    if (v && u_strcmp(v, "hello") == 0) pass++; else { fail++; shell_out("[libc-test] FAIL getenv/setenv\n"); }
     setenv("LIBCTEST", "world", 1);
     v = getenv("LIBCTEST");
-    if (v && u_strcmp(v, "world") == 0) pass++; else { fail++; u_print("[libc-test] FAIL setenv overwrite\n"); }
+    if (v && u_strcmp(v, "world") == 0) pass++; else { fail++; shell_out("[libc-test] FAIL setenv overwrite\n"); }
     unsetenv("LIBCTEST");
-    if (getenv("LIBCTEST") == NULL) pass++; else { fail++; u_print("[libc-test] FAIL unsetenv\n"); }
+    if (getenv("LIBCTEST") == NULL) pass++; else { fail++; shell_out("[libc-test] FAIL unsetenv\n"); }
 
     /* 2) getopt 短选项解析（-a -b ARG -c） */
     char *av[] = {"prog", "-a", "-b", "val", "-c", NULL};
@@ -985,7 +987,7 @@ static void libc_selftest(void)
         else if (ch == 'c') c = 1;
     }
     if (a && b && c && barg && u_strcmp(barg, "val") == 0) pass++;
-    else { fail++; u_print("[libc-test] FAIL getopt\n"); }
+    else { fail++; shell_out("[libc-test] FAIL getopt\n"); }
 
     /* 3) getopt_long 长选项解析 */
     struct option lopts[] = {
@@ -1001,7 +1003,7 @@ static void libc_selftest(void)
         else if (ch == 'o') { oflag = 1; ofile = optarg; }
     }
     if (vflag && oflag && ofile && u_strcmp(ofile, "out.txt") == 0) pass++;
-    else { fail++; u_print("[libc-test] FAIL getopt_long\n"); }
+    else { fail++; shell_out("[libc-test] FAIL getopt_long\n"); }
 
     /* 4) opendir/readdir 真实目录遍历（/ 经 SYS_OPENDIR 后端） */
     int found_files = 0;
@@ -1013,11 +1015,11 @@ static void libc_selftest(void)
         }
         closedir(d);
     }
-    if (found_files > 0) pass++; else { fail++; u_print("[libc-test] FAIL opendir/readdir\n"); }
+    if (found_files > 0) pass++; else { fail++; shell_out("[libc-test] FAIL opendir/readdir\n"); }
 
     /* 5) strerror 字符串非空 */
     if (strerror(ENOENT) && u_strlen(strerror(ENOENT)) > 0) pass++;
-    else { fail++; u_print("[libc-test] FAIL strerror\n"); }
+    else { fail++; shell_out("[libc-test] FAIL strerror\n"); }
 
     /* 6) expand_vars：$VAR 与 $? 展开 */
     setenv("GREET", "hi", 1);
@@ -1025,15 +1027,15 @@ static void libc_selftest(void)
     static char ev[128];
     expand_vars(ev, sizeof(ev), "x=$GREET y=$?");
     if (u_strcmp(ev, "x=hi y=7") == 0) pass++;
-    else { fail++; u_print("[libc-test] FAIL expand_vars ("); u_print(ev); u_print(")\n"); }
+    else { fail++; shell_out("[libc-test] FAIL expand_vars ("); shell_out(ev); shell_out(")\n"); }
     unsetenv("GREET");
 
     /* 汇总 */
-    u_print("[libc-test] PASS=");
-    u_print(u_utoa_s((uint64_t)pass, nbuf, sizeof(nbuf)));
-    u_print(" FAIL=");
-    u_print(u_utoa_s((uint64_t)fail, nbuf, sizeof(nbuf)));
-    u_print(fail == 0 ? "  ALL OK\n" : "  SOME FAILED\n");
+    shell_out("[libc-test] PASS=");
+    shell_out(u_utoa_s((uint64_t)pass, nbuf, sizeof(nbuf)));
+    shell_out(" FAIL=");
+    shell_out(u_utoa_s((uint64_t)fail, nbuf, sizeof(nbuf)));
+    shell_out(fail == 0 ? "  ALL OK\n" : "  SOME FAILED\n");
 }
 
 /* ===========================================================================
@@ -1051,6 +1053,7 @@ static void term_scroll(void)
 
 static void term_emit_char(char c)
 {
+    if (!g_win) return;   /* 窗口未创建（启动/自检期）不写网格，避免污染终端缓冲 */
     static int t_esc = 0;       /* 0=普通,1=ESC,2=ESC[ */
     static int t_esc_num = 0;
     if (t_esc == 1) {
@@ -1089,6 +1092,21 @@ static void term_puts(const char *s)
 {
     for (; s && *s; s++) term_emit_char(*s);
     g_term_dirty = true;
+}
+
+/* 双写输出：写入终端网格（窗口显示，需窗口已创建）+ 串口镜像（headless 可观测）。
+ * 窗口创建前（g_win==NULL）term_emit_char 直接返回，故自检/启动日志不会污染网格，
+ * 仅经 u_print 落 serial；窗口创建后所有命令/交互输出同时可见。 */
+static void shell_out(const char *s)
+{
+    term_puts(s);
+    u_print(s);
+}
+static void shell_outn(const char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++) term_emit_char(s[i]);
+    g_term_dirty = true;
+    u_printn(s, n);
 }
 
 static void term_render(void)
@@ -1163,7 +1181,7 @@ int main(int argc, char **argv)
     setenv("SHELL", "/BIN/SHELL.SKA", 1);
     setenv("PATH", "/BIN", 1);
 
-    u_print("\n[shell] SukiOS shell online (Ring3, bash-like)\n");
+    shell_out("\n[shell] SukiOS shell online (Ring3, bash-like)\n");
     libc_selftest();
     sys_port_claim(SHELL_PORT);    /* 仍认领 SHELL_PORT：接收 FS_SERVER 应答（命令执行同步等待） */
 
@@ -1177,22 +1195,22 @@ int main(int argc, char **argv)
             suki_set_event_port(g_win, g_ep);
         }
         suki_set_focus(g_win);
-        u_print("[shell] windowed mode: window id=");
-        char b[16]; u_print(u_utoa_s(g_win->id, b, sizeof(b)));
-        u_print("\n");
+        shell_out("[shell] windowed mode: window id=");
+        char b[16]; shell_out(u_utoa_s(g_win->id, b, sizeof(b)));
+        shell_out("\n");
     } else {
-        u_print("[shell] warn: window creation failed, serial-only fallback\n");
+        shell_out("[shell] warn: window creation failed, serial-only fallback\n");
     }
 
     /* 后台拉起常驻字体服务（FreeType 渲染），供 pchfnt 等程序调用 */
-    u_print("[shell] boot: launching font service + selftest\n");
+    shell_out("[shell] boot: launching font service + selftest\n");
     {
         char *fargv[] = { (char*)"/BIN/FONTSRV.SKA", NULL };
         int fpid = sys_task_spawn((char*)"/BIN/FONTSRV.SKA", fargv, NULL);
         if (fpid < 0)
-            u_print("[shell] warn: fontsrv spawn failed\n");
+            shell_out("[shell] warn: fontsrv spawn failed\n");
         else
-            u_print("[shell] font service spawned\n");
+            shell_out("[shell] font service spawned\n");
 
         /* 启动自检：用 pchfnt 渲染一行文本，验证「加载字体→光栅化→合成」链路
          * （headless 下 fontsrv 降级仅输出统计，仍证明端到端可用） */
@@ -1207,16 +1225,16 @@ int main(int argc, char **argv)
         };
         int tpid = sys_task_spawn((char*)"/BIN/PCHFNT.SKA", pargv, NULL);
         if (tpid < 0)
-            u_print("[shell] warn: pchfnt selftest spawn failed\n");
+            shell_out("[shell] warn: pchfnt selftest spawn failed\n");
         else
-            u_print("[shell] pchfnt selftest spawned\n");
+            shell_out("[shell] pchfnt selftest spawned\n");
     }
 
     /* 注：nettest（网络子系统端到端验证）已由 kmain 作为内嵌 USER_PROG 在开机自检
      * 阶段确定性 spawn（输出经串口落盘，详见 kmain.c）。此处不再重复拉起，避免双
      * 实例造成 socket fd 清理与日志混乱。 */
 
-    u_print("Type 'help' for commands.\n\n");
+    shell_out("Type 'help' for commands.\n\n");
     g_len = 0; g_cur = 0; g_line[0] = 0; g_hist_idx = g_hist_count;
     prompt();
 
@@ -1229,7 +1247,7 @@ int main(int argc, char **argv)
                 if (ev.type == SUKI_EVENT_KEY_DOWN)
                     handle_key((char)(unsigned char)ev.u.key.keycode);
                 else if (ev.type == SUKI_EVENT_WINDOW_CLOSE) {
-                    u_print("[shell] window close requested, exiting shell\n");
+                    shell_out("[shell] window close requested, exiting shell\n");
                     if (g_win) { suki_destroy_window(g_win); g_win = NULL; }
                     sys_exit(0);
                 }

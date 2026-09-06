@@ -196,44 +196,18 @@ static void print_int(int64_t val)
 #define USER_PUTS_MAX 256   /* 单条转发文本上限（shell 行输出远小于此） */
 
 /* 用户态控制台输出（sys_debug_write -> 此处）。
- * 策略：
- *   - 显示服务已激活（g_display_active）且帧缓冲可用：把文本经 IPC 转交显示服务，
- *     由它在桌面内合成「终端窗口」渲染，内核【不再直接写帧缓冲】——否则会覆盖
- *     显示服务已经画好的合成桌面（这正是「画面还是控制台 shell」的根因）。
- *   - 未激活或转发失败（端口队列满/内存紧张）：降级为直接 fbcon/vga + 串口，
- *     保证文本在任何情况下都不丢失。
- * 串口日志恒定输出，便于无图形场景也能看到 Ring3 输出。 */
+ * 策略（窗口化纯合成器架构）：
+ *   - 显示服务已接管帧缓冲（g_display_active）：display-server 是【纯合成器】，
+ *     不渲染任何字符；各窗口应用自己把文本/图形绘制进离屏缓冲再经 OOL 提交。
+ *     因此用户态诊断输出【只走串口】（headless 可观测），绝不写帧缓冲，避免
+ *     覆盖合成桌面或越权绘制像素。
+ *   - 显示未激活且帧缓冲可用（启动早期/纯文本回退）：直接 fbcon 写屏 + 串口。
+ *   - 完全无图形（g_use_fb=false）：回退 VGA 文本 + 串口，保证文本不丢失。 */
 void user_puts(const char *s)
 {
-    if (g_display_active && g_use_fb) {
-        char buf[USER_PUTS_MAX];
-        uint32_t n = 0;
-        for (const char *p = s; *p && n < USER_PUTS_MAX - 1; p++) {
-            buf[n++] = *p;
-        }
-        buf[n] = 0;
-
-        uint8_t msg[sizeof(mach_msg_header_t) + USER_PUTS_MAX];
-        memset(msg, 0, sizeof(msg));
-        mach_msg_header_t *h = (mach_msg_header_t *)msg;
-        h->msgh_bits        = 0;
-        h->msgh_size        = sizeof(*h) + (uint32_t)strlen(buf) + 1;
-        h->msgh_remote_port = DISPLAY_PORT;
-        h->msgh_local_port  = PORT_NULL;
-        h->msgh_id          = DISP_MSG_TEXT;
-        h->msgh_reserved    = 0;
-        memcpy(msg + sizeof(*h), buf, n + 1);
-
-        if (ipc_send_kernel(DISPLAY_PORT, msg, h->msgh_size) == MACH_MSG_SUCCESS) {
-            serial_writestr(s);   /* 转发成功：仅串口留底，避免再写屏覆盖桌面 */
-            return;
-        }
-        /* 转发失败（队列满/未就绪）：降级直接写屏 + 串口 */
-    }
-
-    if (g_use_fb) {
+    if (g_use_fb && !g_display_active) {
         fbcon_write(s);
-    } else {
+    } else if (!g_use_fb) {
         vga_write(s);
     }
     serial_writestr(s);

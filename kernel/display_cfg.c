@@ -33,7 +33,7 @@ bool g_display_active = false;
 void display_set_active(void)
 {
     g_display_active = true;
-    serial_writestr("[display] active: kernel console text now routed to display server\n");
+    serial_writestr("[display] active: pure compositor (no text rendering); console -> serial only\n");
 }
 
 /* 常量（避免依赖不确定头文件） */

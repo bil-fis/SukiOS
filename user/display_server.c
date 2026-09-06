@@ -1,32 +1,30 @@
 /*
  * user/display_server.c
  * -----------------------------------------------------------------------------
- * Ring3 显示服务 / 窗口管理器 / 合成器（SukiOS 图形栈核心）。
+ * Ring3 显示服务 / 窗口管理器 / 纯合成器（SukiOS 图形栈核心）。
  *
- * 三重职责（单一帧缓冲拥有者，最稳）：
- *   1) 桌面 + 终端层：经 SYS_FRAMEBUFFER_MAP 取得帧缓冲用户态线性映射，并在一块
- *      同等大小的【离屏桌面缓冲 g_desk】上绘制桌面背景、标题栏与终端窗口；终端文本
- *      增量绘制到 g_desk，跨帧持久（合成时整体 blit 到帧缓冲，不会擦成字符）。
- *   2) 窗口合成：维护窗口注册表（Z-order = 创建顺序），每条窗口持有自有保留缓冲
- *      （win->pixels，由本服务 sys_mmap 分配）。应用经 WM_PORT 提交离屏帧时，本服务
- *      通过 OOL 零拷贝把应用的物理页映射到自身地址空间，拷入 win->pixels，再解映射；
- *      composite() 按 Z-order 把各窗口像素 blit 到帧缓冲并叠加边框/标题栏，最后绘光标。
- *   3) 输入分发：鼠标事件经 DISPLAY_PORT 到达（mouse_server 推送），本服务做命中测试
- *      （确定光标下窗口）、更新焦点，并把事件经窗口注册的事件端口推送给对应应用。
+ * 职责（单一帧缓冲拥有者）：
+ *   1) 合成器（compositor）：维护窗口注册表（Z-order = 创建顺序），每条窗口持有
+ *      自有保留缓冲 win->pixels（由本服务 sys_mmap 分配）。应用经 WM_PORT 提交离屏
+ *      帧时，本服务通过 OOL 零拷贝把应用的物理页映射到自身地址空间，拷入
+ *      win->pixels，再解映射；composite() 按 Z-order 把各窗口像素 blit 到帧缓冲，
+ *      并叠加边框/标题栏（纯几何）/关闭按钮/光标。
+ *   2) 窗口管理器（WM）：创建/销毁/置焦/拖拽/关闭、事件端口路由。
+ *   3) 输入分发：鼠标事件经 DISPLAY_PORT 到达（mouse_server 推送），本服务做命中
+ *      测试、更新焦点，并把事件经窗口注册的事件端口推送给对应应用。键盘事件同样
+ *      转发给当前焦点窗口。
  *
- * 像素格式：xRGB32（0xRRGGBB，每像素 4 字节）。所有绘制均落在 g_desk，composite()
- * 统一合成到真实帧缓冲 g_fb，避免重绘相互破坏。
+ * 关键设计（用户需求）：本服务【绝不渲染任何字符】。所有文本/图形内容都由各窗口
+ * 应用自行绘制进自己的离屏缓冲（例如 shell 的终端仿真、winhello 的自绘），再以图像
+ * 形式经 OOL 提交给本服务合成。内核 console / 启动日志 / 用户态 print 不再被本服务
+ * 捕获渲染——它们只走串口，由相关应用自行决定是否在其窗口内显示。
  */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <string.h>
 #include "lib/suki.h"
-#include "lib/font8x8.h"
 #include "lib/gui_ipc.h"
-
-/* 显示服务消息 id（与内核 console.c 转发文本消息一致） */
-#define DISP_MSG_TEXT 1
 
 /* 鼠标事件消息 id（与 user/mouse_server.c 保持一致） */
 #define MOUSE_MSG_MOVE   101
@@ -49,49 +47,29 @@ typedef struct fb_map_result {
     uint32_t cfg_height;
 } fb_map_result_t;
 
-/* ---- 帧缓冲与离屏桌面缓冲 ---- */
+/* ---- 帧缓冲与离屏背景缓冲 ---- */
 static volatile uint32_t *g_fb = NULL;   /* 真实帧缓冲（xRGB32） */
-static uint32_t *g_desk = NULL;          /* 离屏桌面+终端层（合成源） */
+static uint32_t *g_desk = NULL;          /* 离屏背景层（合成源，仅纯色背景） */
 static uint32_t g_fb_width  = 0;
 static uint32_t g_fb_height = 0;
 static uint32_t g_fb_pitch  = 0;         /* 字节/行 */
 static uint32_t g_stride    = 0;         /* 像素/行 = pitch/4 */
 
-/* 字形放大倍数：8x8 -> 16x16 */
-#define CON_SCALE  2
-#define CON_MARGIN 24
+/* 桌面顶部装饰条高度（纯几何，无文字） */
 #define TITLE_H    40
-#define CHAR_W     (8 * CON_SCALE)
-#define CHAR_H     (8 * CON_SCALE)
-
-/* 终端窗口客户区文本栅格 */
-static uint32_t g_term_x = 0;
-static uint32_t g_term_y = 0;
-static uint32_t g_term_cols = 0;
-static uint32_t g_term_rows = 0;
 
 /* 颜色（xRGB32） */
-#define COL_BG        0x002B2B3A
 #define COL_DESKTOP   0x00101926
 #define COL_BAR       0x003A2A4A
-#define COL_WINBG     0x0014141C
-#define COL_WINBORDER 0x00606080
-#define COL_FG        0x00E0E0E8
-#define COL_TITLE     0x00C0C0FF
 #define COL_ACCENT    0x00579BFE
+#define COL_CLOSEBG   0x00C0392B
+#define COL_CLOSEFG   0x00FFFFFF
 
-/* 像素写入离屏桌面层（含边界保护） */
-static inline void desk_px(uint32_t x, uint32_t y, uint32_t rgb)
+/* 像素写入真实帧缓冲（含边界保护） */
+static inline void fb_px(uint32_t x, uint32_t y, uint32_t rgb)
 {
     if (x >= g_fb_width || y >= g_fb_height) return;
-    g_desk[y * g_stride + x] = rgb;
-}
-
-static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
-{
-    for (uint32_t j = 0; j < h; j++)
-        for (uint32_t i = 0; i < w; i++)
-            desk_px(x + i, y + j, rgb);
+    g_fb[y * g_stride + x] = rgb;
 }
 
 static void fill_rect_fb(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
@@ -104,177 +82,13 @@ static void fill_rect_fb(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_
         }
 }
 
-/* 画 8x8 字形的 2x 放大版本到离屏桌面层 */
-static void draw_glyph(uint32_t ox, uint32_t oy, uint8_t ch, uint32_t fg)
-{
-    if (ch >= 128) ch = '?';
-    const uint8_t *g = font8x8_basic[ch];
-    for (uint32_t row = 0; row < 8; row++) {
-        uint8_t bits = g[row];
-        for (uint32_t col = 0; col < 8; col++) {
-            if (bits & (1u << col)) {
-                desk_px(ox + col * CON_SCALE,     oy + row * CON_SCALE,     fg);
-                desk_px(ox + col * CON_SCALE + 1, oy + row * CON_SCALE,     fg);
-                desk_px(ox + col * CON_SCALE,     oy + row * CON_SCALE + 1, fg);
-                desk_px(ox + col * CON_SCALE + 1, oy + row * CON_SCALE + 1, fg);
-            }
-        }
-    }
-}
-
-/* 在真实帧缓冲上画 8x8 字形（合成窗口标题栏用） */
-static void draw_glyph_fb(uint32_t ox, uint32_t oy, uint8_t ch, uint32_t fg)
-{
-    if (ch >= 128) ch = '?';
-    const uint8_t *g = font8x8_basic[ch];
-    for (uint32_t row = 0; row < 8; row++) {
-        uint8_t bits = g[row];
-        for (uint32_t col = 0; col < 8; col++) {
-            if (bits & (1u << col)) {
-                uint32_t px = ox + col, py = oy + row;
-                if (px >= g_fb_width || py >= g_fb_height) continue;
-                g_fb[py * g_stride + px] = fg;
-            }
-        }
-    }
-}
-
-/* ---- ANSI/VT100 CSI 转义序列解析（保证 shell 输出不乱码） ---- */
-#define CSI_NONE 0
-#define CSI_ESC  1
-#define CSI_BRK  2
-static int g_esc_state = CSI_NONE;
-static int g_csi_n = 0;
-static int g_csi_has_n = 0;
-
-static void clear_cols(uint32_t row, uint32_t x0, uint32_t x1)
-{
-    if (x1 > g_term_cols) x1 = g_term_cols;
-    if (x0 >= x1) return;
-    uint32_t px = CON_MARGIN + x0 * CHAR_W;
-    uint32_t py = TITLE_H + CON_MARGIN + row * CHAR_H;
-    fill_rect(px, py, (x1 - x0) * CHAR_W, CHAR_H, COL_WINBG);
-}
-
-static void clear_screen_area(void)
-{
-    fill_rect(CON_MARGIN + 2, TITLE_H + CON_MARGIN + 2,
-              g_fb_width - CON_MARGIN * 2 - 4,
-              g_fb_height - TITLE_H - CON_MARGIN * 2 - 4, COL_WINBG);
-    g_term_x = 0; g_term_y = 0;
-}
-
-static void term_scroll_up(void)
-{
-    if (g_term_rows == 0) return;
-    uint32_t left     = CON_MARGIN;
-    uint32_t top      = TITLE_H + CON_MARGIN;
-    uint32_t width_px = g_fb_width - CON_MARGIN * 2;
-    uint32_t row_px   = CHAR_H;
-    for (uint32_t y = 0; y + 1 < g_term_rows; y++) {
-        uint32_t *dst = g_desk + (top + y * row_px) * g_stride + left;
-        uint32_t *src = g_desk + (top + (y + 1) * row_px) * g_stride + left;
-        memcpy(dst, src, (size_t)width_px * row_px * sizeof(uint32_t));
-    }
-    uint32_t *dst = g_desk + (top + (g_term_rows - 1) * row_px) * g_stride + left;
-    for (uint32_t i = 0; i < width_px * row_px; i++) dst[i] = COL_WINBG;
-}
-
-static void csi_dispatch(char final)
-{
-    int n = g_csi_has_n ? g_csi_n : 1;
-    switch (final) {
-    case 'A': g_term_y = (g_term_y >= (uint32_t)n) ? g_term_y - (uint32_t)n : 0; break;
-    case 'B':
-        g_term_y += (uint32_t)n;
-        if (g_term_y >= g_term_rows) g_term_y = g_term_rows ? g_term_rows - 1 : 0;
-        break;
-    case 'C':
-        g_term_x += (uint32_t)n;
-        if (g_term_x >= g_term_cols) g_term_x = g_term_cols ? g_term_cols - 1 : 0;
-        break;
-    case 'D': g_term_x = (g_term_x >= (uint32_t)n) ? g_term_x - (uint32_t)n : 0; break;
-    case 'G':
-        g_term_x = (g_csi_has_n && g_csi_n >= 1) ? (uint32_t)(g_csi_n - 1) : 0;
-        if (g_term_x >= g_term_cols) g_term_x = g_term_cols ? g_term_cols - 1 : 0;
-        break;
-    case 'H': g_term_x = 0; g_term_y = 0; break;
-    case 'J':
-        if (g_csi_has_n && g_csi_n == 1 && g_term_y > 0) {
-            for (uint32_t r = 0; r < g_term_y; r++) clear_cols(r, 0, g_term_cols);
-            clear_cols(g_term_y, 0, g_term_x);
-        } else clear_screen_area();
-        break;
-    case 'K':
-        if (g_csi_has_n && g_csi_n == 2)      clear_cols(g_term_y, 0, g_term_cols);
-        else if (g_csi_has_n && g_csi_n == 1) clear_cols(g_term_y, 0, g_term_x + 1);
-        else                                  clear_cols(g_term_y, g_term_x, g_term_cols);
-        break;
-    default: break;
-    }
-}
-
-static void term_putc(char c)
-{
-    if (g_esc_state == CSI_ESC) {
-        if (c == '[') { g_esc_state = CSI_BRK; g_csi_n = 0; g_csi_has_n = 0; }
-        else g_esc_state = CSI_NONE;
-        return;
-    }
-    if (g_esc_state == CSI_BRK) {
-        if (c >= '0' && c <= '9') {
-            if (g_csi_n < 9999) g_csi_n = g_csi_n * 10 + (c - '0');
-            g_csi_has_n = 1;
-            return;
-        }
-        if (c == ';' || c == '?') return;
-        g_esc_state = CSI_NONE;
-        if (c >= '@' && c <= '~') csi_dispatch(c);
-        return;
-    }
-    if (c == 0x1B) { g_esc_state = CSI_ESC; return; }
-
-    if (c == '\r') { g_term_x = 0; return; }
-    if (c == '\n') { g_term_x = 0; g_term_y++; }
-    else if (c == '\t') {
-        uint32_t ntab = 8 - (g_term_x % 8);
-        for (uint32_t i = 0; i < ntab; i++) term_putc(' ');
-        return;
-    } else if (c == '\b') {
-        if (g_term_x > 0) g_term_x--;
-        else if (g_term_y > 0) { g_term_y--; g_term_x = g_term_cols - 1; }
-        else return;
-        uint32_t px = CON_MARGIN + g_term_x * CHAR_W;
-        uint32_t py = TITLE_H + CON_MARGIN + g_term_y * CHAR_H;
-        fill_rect(px, py, CHAR_W, CHAR_H, COL_WINBG);
-        return;
-    } else {
-        uint32_t px = CON_MARGIN + g_term_x * CHAR_W;
-        uint32_t py = TITLE_H + CON_MARGIN + g_term_y * CHAR_H;
-        draw_glyph(px, py, (uint8_t)c, COL_FG);
-        g_term_x++;
-    }
-    if (g_term_x >= g_term_cols) { g_term_x = 0; g_term_y++; }
-    if (g_term_y >= g_term_rows) { term_scroll_up(); g_term_y = g_term_rows - 1; g_term_x = 0; }
-}
-
-static void term_puts(const char *s) { for (; *s; s++) term_putc(*s); }
-
+/* 仅绘制纯色背景 + 顶部装饰条（不渲染任何字符 / 终端窗口） */
 static void draw_desktop(void)
 {
-    fill_rect(0, 0, g_fb_width, g_fb_height, COL_DESKTOP);
-    fill_rect(0, 0, g_fb_width, TITLE_H, COL_BAR);
-    const char *title = "SukiOS";
-    uint32_t tx = CON_MARGIN;
-    for (const char *p = title; *p; p++) { draw_glyph(tx, (TITLE_H - CHAR_H) / 2, (uint8_t)*p, COL_TITLE); tx += CHAR_W; }
-    uint32_t wx = CON_MARGIN, wy = TITLE_H + CON_MARGIN;
-    uint32_t ww = g_fb_width  - CON_MARGIN * 2;
-    uint32_t wh = g_fb_height - TITLE_H - CON_MARGIN * 2;
-    fill_rect(wx, wy, ww, wh, COL_WINBORDER);
-    fill_rect(wx + 2, wy + 2, ww - 4, wh - 4, COL_WINBG);
-    g_term_cols = (ww - 4) / CHAR_W;
-    g_term_rows = (wh - 4) / CHAR_H;
-    g_term_x = 0; g_term_y = 0;
+    for (uint32_t y = 0; y < g_fb_height; y++)
+        for (uint32_t x = 0; x < g_fb_width; x++)
+            g_desk[y * g_stride + x] = COL_DESKTOP;
+    fill_rect_fb(0, 0, g_fb_width, TITLE_H, COL_BAR);
 }
 
 /* ===========================================================================
@@ -302,7 +116,7 @@ static suki_window_id_t g_win_next_id = 1;
 /* 窗口标题栏高度（与 composite 绘制保持一致） */
 #define WIN_TITLE_H 20
 
-/* 焦点窗口与拖拽状态（定义在窗口注册表之后，供 wm_handle_destroy/create 直接访问） */
+/* 焦点窗口与拖拽状态 */
 static wm_window_t *g_focus     = NULL;
 static wm_window_t *g_drag      = NULL;
 static int32_t      g_drag_offx = 0, g_drag_offy = 0;
@@ -314,10 +128,8 @@ static wm_window_t *wm_find(suki_window_id_t id)
     return NULL;
 }
 
-/* 前向声明：wm_handle_create 创建窗口后需立即置为焦点（定义见上方 wm_set_focus） */
+/* 前向声明 */
 static void wm_set_focus(wm_window_t *w);
-
-/* 前向声明：合成器在窗口管理回调中被调用 */
 static void composite(void);
 
 /* 命中测试：返回光标下最上层（最后绘制）的可见窗口 */
@@ -349,7 +161,6 @@ static void wm_handle_create(const wm_create_req_t *req, mach_msg_header_t *hdr)
     w->style = req->style; w->z = (uint32_t)g_win_count;
     w->event_port = req->event_port; w->visible = true; w->has_focus = false;
     w->pixels = px;
-    /* freestanding 下无 strncpy，手动拷贝窗口标题（长度受限） */
     for (uint32_t i = 0; i < sizeof(w->title) - 1 && req->title[i]; i++)
         w->title[i] = req->title[i];
     w->title[sizeof(w->title) - 1] = '\0';
@@ -495,7 +306,7 @@ static void draw_cursor_on_fb(void)
 static void composite(void)
 {
     if (!g_fb || !g_desk) return;
-    /* 1) 桌面 + 终端层整体 blit */
+    /* 1) 背景层整体 blit */
     memcpy((void *)g_fb, g_desk, (size_t)g_fb_height * g_stride * sizeof(uint32_t));
     /* 2) 窗口（Z-order = 创建顺序，后者在上） */
     for (int i = 0; i < g_win_count; i++) {
@@ -512,7 +323,7 @@ static void composite(void)
         for (int32_t y = cy0; y < cy1; y++)
             for (int32_t x = cx0; x < cx1; x++)
                 g_fb[y * g_stride + x] = w->pixels[(y - y0) * ww + (x - x0)];
-        /* 窗口修饰：边框 + 标题栏（覆盖应用顶部 20px） */
+        /* 窗口装饰：边框 + 标题栏（纯几何，无文字）+ 关闭按钮 */
         uint32_t border = 2;
         fill_rect_fb((uint32_t)x0, (uint32_t)y0, ww, border, COL_ACCENT);
         fill_rect_fb((uint32_t)x0, (uint32_t)y0 + hh - border, ww, border, COL_ACCENT);
@@ -521,22 +332,20 @@ static void composite(void)
         if (w->style & SUKI_WS_TITLEBAR) {
             uint32_t bar_h = WIN_TITLE_H;
             if (hh >= bar_h) {
-                fill_rect_fb((uint32_t)x0 + border, (uint32_t)y0 + border, ww - border * 2, bar_h - border, COL_BAR);
-                uint32_t tx = (uint32_t)x0 + border + 4, ty = (uint32_t)y0 + border + 6;
-                for (uint32_t k = 0; k < sizeof(w->title) && w->title[k]; k++)
-                    draw_glyph_fb(tx + k * 8, ty, (uint8_t)w->title[k],
-                                 w->has_focus ? 0x00FFFFFF : 0x009090A0);
-                /* 关闭按钮（标题栏右上角）：红底 + 白色 X */
+                fill_rect_fb((uint32_t)x0 + border, (uint32_t)y0 + border,
+                             ww - border * 2, bar_h - border,
+                             w->has_focus ? COL_ACCENT : COL_BAR);
+                /* 关闭按钮（标题栏右上角）：红底 + 白色 X（纯几何，非字符渲染） */
                 int32_t bx = (int32_t)x0 + (int32_t)ww - 18;
                 int32_t by = (int32_t)y0 + 2;
                 if (bx >= 0 && by >= 0) {
-                    fill_rect_fb((uint32_t)bx, (uint32_t)by, 16, 16, 0x00C0392B);
+                    fill_rect_fb((uint32_t)bx, (uint32_t)by, 16, 16, COL_CLOSEBG);
                     for (int32_t i = 3; i < 13; i++) {
                         if (bx + i < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
-                            g_fb[(by + i) * g_stride + (bx + i)] = 0x00FFFFFF;
+                            g_fb[(by + i) * g_stride + (bx + i)] = COL_CLOSEFG;
                         if (bx + (15 - i) >= 0 && bx + (15 - i) < (int32_t)g_fb_width &&
                             by + i < (int32_t)g_fb_height)
-                            g_fb[(by + i) * g_stride + (bx + (15 - i))] = 0x00FFFFFF;
+                            g_fb[(by + i) * g_stride + (bx + (15 - i))] = COL_CLOSEFG;
                     }
                 }
             }
@@ -544,19 +353,6 @@ static void composite(void)
     }
     /* 3) 光标（最上层） */
     draw_cursor_on_fb();
-}
-
-/* 启动日志（类似 dmesg） */
-static void drain_console_pipe(void)
-{
-    static char buf[512];
-    for (;;) {
-        uint64_t n = suki_syscall2(SYS_CONSOLE_READ, (uint64_t)buf, sizeof(buf) - 1);
-        if (n == (uint64_t)-1 || n == 0) break;
-        buf[n] = '\0';
-        term_puts(buf);
-        if (n < sizeof(buf) - 1) break;
-    }
 }
 
 int main(void)
@@ -577,37 +373,29 @@ int main(void)
     g_fb_pitch  = res.pitch;
     g_stride    = res.pitch / 4;
 
-    /* 离屏桌面缓冲（与帧缓冲同尺寸） */
+    /* 离屏背景缓冲（与帧缓冲同尺寸） */
     g_desk = (uint32_t *)sys_mmap((uint64_t)g_fb_height * g_stride * sizeof(uint32_t), 3);
     if (!g_desk) { u_print("display: desk alloc failed\n"); sys_exit(1); }
 
-    u_print("display: fb mapped @32bpp, wm ready\n");
+    u_print("display: fb mapped @32bpp, pure compositor ready\n");
 
-    /* 3) 绘制桌面（到 g_desk），写启动提示 */
+    /* 3) 绘制背景层 */
     draw_desktop();
-    term_puts("SukiOS display + window manager ready.\n");
-    term_puts("Kernel boot log:\n");
 
-    /* 4) 通知内核：显示服务已接管帧缓冲 */
+    /* 4) 通知内核：显示服务已接管帧缓冲（纯合成器，不再渲染字符） */
     suki_syscall1(SYS_DISPLAY_READY, 0);
 
-    /* 5) 刷内核启动日志 */
-    drain_console_pipe();
-
-    /* 6) 消息循环：同时轮询 DISPLAY_PORT（文本/鼠标）与 WM_PORT（窗口管理） */
+    /* 5) 消息循环：同时轮询 DISPLAY_PORT（鼠标/键盘）与 WM_PORT（窗口管理） */
     static uint8_t msgbuf[512];
     typedef struct { mach_msg_header_t h; int32_t x; int32_t y; uint8_t buttons; int8_t wheel; uint8_t _pad[3]; } mouse_event_msg_t;
 
     for (;;) {
-        /* 显示端口：文本与鼠标事件 */
+        /* 显示端口：鼠标与键盘事件 */
         if (mach_msg_tryrecv(msgbuf, sizeof(msgbuf), DISPLAY_PORT) == 0) {
             mach_msg_header_t *h = (mach_msg_header_t *)msgbuf;
-            if (h->msgh_id == DISP_MSG_TEXT) {
-                term_puts((char *)msgbuf + sizeof(mach_msg_header_t));
-                composite();
-            } else if (h->msgh_id == MOUSE_MSG_MOVE ||
-                       h->msgh_id == MOUSE_MSG_BUTTON ||
-                       h->msgh_id == MOUSE_MSG_WHEEL) {
+            if (h->msgh_id == MOUSE_MSG_MOVE ||
+                h->msgh_id == MOUSE_MSG_BUTTON ||
+                h->msgh_id == MOUSE_MSG_WHEEL) {
                 mouse_event_msg_t *m = (mouse_event_msg_t *)msgbuf;
                 g_cur_x = m->x; g_cur_y = m->y;
                 if (h->msgh_id == MOUSE_MSG_BUTTON) g_cur_buttons = m->buttons;

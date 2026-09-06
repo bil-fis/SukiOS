@@ -15,9 +15,7 @@
 #define _SUKI_IPC_NET_PROTO_H
 
 #include <kernel/types.h>
-
-/* 知名端口：0=sentinel，1=DISK，2=FS，3=NET（新增） */
-#define NET_PORT            3
+#include <ipc/port.h>       /* NET_PORT 的规范定义（与知名端口号位表同源） */
 
 /* 消息 ID */
 #define NET_MSG_GET_MAC     1   /* 取 MAC 地址 + 链路状态 */

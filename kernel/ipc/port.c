@@ -108,13 +108,15 @@ void ipc_init(void)
     g_ports[PORT_NULL].in_use = true;
     g_ports[PORT_NULL].name   = PORT_NULL;
     g_ports[PORT_NULL].owner  = NULL;
-    /* 预留知名端口（含 APP_PORT、FONT_PORT，供独立 app / 字体服务认领） */
-    for (uint32_t p = DISK_PORT; p <= FONT_PORT; p++) {
+    /* 预留知名端口（含 APP_PORT、FONT_PORT；NET_PORT 由 Ring0 e1000 驱动认领）。
+     * 上界取 NET_PORT：新增 NET_PORT=11 后必须一并纳入预留，否则 11 仍是空闲槽，
+     * port_allocate() 会把它当动态端口分配出去，与网络服务产生冲突。 */
+    for (uint32_t p = DISK_PORT; p <= NET_PORT; p++) {
         g_ports[p].in_use = true;
         g_ports[p].name = p;
     }
-    kprintf("[ipc] port table ready (%d slots, well-known 1..8, 0=sentinel)\n",
-            PORT_MAX);
+    kprintf("[ipc] port table ready (%d slots, well-known 1..%d, 0=sentinel)\n",
+            PORT_MAX, NET_PORT);
 }
 
 kernel_port_t *port_lookup(uint32_t name)

@@ -28,7 +28,8 @@
 
 #define DISK_PORT       1
 #define FS_PORT         2
-#define NET_PORT        3
+/* 网络服务端口：11（注意不能占用 3 —— DISPLAY_PORT=3 已被显示服务使用） */
+#define NET_PORT        11
 #define DISPLAY_PORT    3
 #define INPUT_PORT      4
 #define CONSOLE_PORT    5

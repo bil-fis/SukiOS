@@ -70,7 +70,13 @@ typedef struct mach_ool_desc {
 #define FS_REPLY_PORT   7               /* FS_SERVER 接收磁盘应答 */
 #define APP_PORT        8               /* 通用客户端(独立 app)可认领的应答端口 */
 #define FONT_PORT       10              /* 字体服务（FreeType 渲染）端口 */
-#define PORT_FIRST_DYN  9               /* 动态分配起始（10 留给 FONT_PORT 预留） */
+/* 网络服务端口（Ring0 e1000 驱动 kernel/drivers/e1000.c::net_srv_task 认领）。
+ * 注意：曾是 3，与既有的 DISPLAY_PORT=3 冲突，导致 display-server 认领端口失败
+ * 而退出（"[boot] WARN: display-server did NOT become ready"）。现改为 11——
+ * 这是 1..10（DISK..FONT）之后首个空闲号位；ipc_init() 的预留上界已同步提升为
+ * NET_PORT，故 11 会被标记为 in_use，port_allocate 绝不会把它动态分配出去。 */
+#define NET_PORT        11
+#define PORT_FIRST_DYN  9               /* 动态分配起始（1..NET_PORT 均已预留） */
 #define PORT_MAX        64
 /* 单端口消息队列长度上限（M5 修复）：防止失控/恶意任务狂发消息耗尽内核堆，
  * 超出即拒绝投递并返回 MACH_SEND_NO_BUFFER 形成背压。 */

@@ -150,6 +150,38 @@ qemu-system-x86_64 -machine pc -cpu qemu64 -smp 1 -m 2G -no-shutdown \
 
 ---
 
+### 6.3 端口冲突回归：NET_PORT=3 抢占了 DISPLAY_PORT=3（已修复）
+现象（用户 `make clean` 后重跑暴露）：
+```
+display: port claim failed
+[syscall] task 'display-server' pid=7 exit(code=1)
+[boot] WARN: display-server did NOT become ready within timeout
+```
+根因：`user/lib/suki.h` 中 **`DISPLAY_PORT` 本就是 3**，而本轮新增的 `NET_PORT` 也定为 3。
+内核 `net-srv` 先执行 `port_set_owner(NET_PORT=3, ...)`，随后 `display_server.c:554`
+的 `sys_port_claim(DISPLAY_PORT)` 因端口已被占用而失败，显示服务退出。
+
+修复（4 处）：
+1. `include/ipc/port.h`：`NET_PORT` 定为 **11**（1..10 已被 DISK..FONT 占满），并作为
+   **规范定义**（与知名端口表同源）；
+2. `include/ipc/net_proto.h`：删除自有的 `NET_PORT` 定义，改为 `#include <ipc/port.h>`，
+   避免同一常量在两处漂移；
+3. `user/lib/suki.h`：`NET_PORT 3 -> 11`，并注明"不得占用 3（DISPLAY_PORT）"；
+4. `kernel/ipc/port.c`：`ipc_init()` 的预留上界由 `FONT_PORT` 提升为 **`NET_PORT`**——
+   否则 11 仍是空闲槽，会被 `port_allocate()`（`PORT_FIRST_DYN=9`）当动态端口分配出去，
+   造成新的冲突。
+
+验证：
+```
+[ipc] port table ready (64 slots, well-known 1..11, 0=sentinel)
+display: fb mapped 1280x720@32 at user va
+[display] active: kernel console text now routed to display server
+[boot] display-server ready (g_display_active=1, waited=0 yield rounds)
+[e1000] self-test: tx=ok rx=64 bytes (TX/RX loop verified)
+=== POSIX test summary: PASS=192 FAIL=0 ===
+```
+显示服务恢复正常，e1000 不受影响，完整回归 PASS=192 FAIL=0、零 panic。
+
 ## 7. 后续（下一步）
 
 1. 移植 lwIP（`lib/lwip-2.2.1` 已 vendor）：建 `lwipopts.h` + `sys_arch`（用 SukiOS

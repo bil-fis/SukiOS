@@ -1087,10 +1087,8 @@ static void term_emit_char(char c)
 
 static void term_puts(const char *s)
 {
-    const char *orig = s;
     for (; s && *s; s++) term_emit_char(*s);
     g_term_dirty = true;
-    if (orig) u_print(orig);   /* 镜像到 serial（headless 可观测） */
 }
 
 static void term_render(void)

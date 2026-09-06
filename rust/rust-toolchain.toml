@@ -1,0 +1,5 @@
+# SukiOS Rust 工具链固定为 nightly（后续 Servo 移植需 build-std 编译 std）。
+# 由 `make make-rust-env` 安装；rust-src 组件用于 build-std。
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]

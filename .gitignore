@@ -64,6 +64,11 @@ node_modules/
 .gdbinit
 *.mp4
 
+# ---- Rust 开发环境（由 make make-rust-env 生成，不入库）----
+/rust/x86_64-sukios.json
+/rust/libsuki.a
+/rust/target/
+
 # ---- 私有签名证书 ----
 *rootCA*
 *_sign*

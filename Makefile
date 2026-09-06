@@ -353,7 +353,7 @@ QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
 # ARP 请求会得到应答，从而端到端验证 TX/RX 通路；后续 lwIP 亦可借此联网。
 QEMU_NET    := -device e1000,netdev=net0 -netdev user,id=net0
 
-.PHONY: all iso run run-headless run-dbg run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk gcc FORCE
+.PHONY: all iso run run-headless run-dbg run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk gcc make-rust-env rust-env rust-libs FORCE
 
 all: $(KERNEL)
 # 默认目标固定为 all：本 Makefile 中 FreeType/字体程序的规则位于 all 之前，
@@ -381,6 +381,63 @@ gcc-only:
 
 cross-clean:
 	$(MAKE) -f cross/Makefile.gcc clean
+
+# =============================================================================
+# Rust 开发工具链（SukiOS 专属）
+# -----------------------------------------------------------------------------
+# `make make-rust-env` 给仓库其余用户一键创建 Rust 开发环境：
+#   1) 自动探查是否已安装 rust（rustup/rustc/cargo），未安装则经 rustup 安装
+#      nightly + rust-src（后续 Servo 移植需要 build-std 编译 std）；
+#   2) 构建 SukiOS 用户态运行时静态库 libsuki.a（供 Rust 链接，获得
+#      malloc/free/pthread/syscall 等能力，无需从零移植 std）；
+#   3) 生成 rust/x86_64-sukios.json 目标规格（含本仓库绝对路径 + 交叉链接器）
+#      与 rust/.cargo/config.toml（build.target 指向该规格）；
+#   4) 仓库已提交 rust/ 下的示例工程（rust-toolchain.toml / Cargo.toml /
+#      src/main.rs），用户 cd rust && cargo build 即可产出可在 SukiOS 运行的 ELF。
+# 该环境“属于 SukiOS”：用我们的交叉链接器 + user/user.ld + libsuki.a。
+# 仅生成目标规格/归档等产物，不改动内核/现有用户态程序。
+# =============================================================================
+
+# Rust 运行时归档：复用 USER_LIB_OBJS，剔除 crt0（Rust 自带 _start）。
+RUST_LIB_OBJS := $(filter-out $(BUILD)/user/lib/crt0.S.o,$(USER_LIB_OBJS))
+RUST_LIB      := $(BUILD)/libsuki.a
+RUST_DIR      := $(CURDIR)/rust
+
+# 归档工具：优先交叉 ar，回退宿主 ar。
+ifeq ($(wildcard $(CROSS_OPT)/bin/x86_64-sukios-elf-ar),$(CROSS_OPT)/bin/x86_64-sukios-elf-ar)
+  RUST_AR := x86_64-sukios-elf-ar
+else
+  RUST_AR := ar
+endif
+
+# 交叉链接器探测（与 USER_CC 同逻辑，供目标规格写入正确 linker）。
+ifeq ($(wildcard $(SUKIOS_CC)),$(SUKIOS_CC))
+  RUST_USER_CC := x86_64-sukios-elf-gcc
+else ifeq ($(wildcard $(ELF_CC)),$(ELF_CC))
+  RUST_USER_CC := x86_64-elf-gcc
+else
+  RUST_USER_CC := gcc
+endif
+
+# 确保用户态配置头先就位（USER_LIB_OBJS 编译依赖 -include $(CONFIG_H)）。
+$(RUST_LIB_OBJS): | $(CONFIG_H)
+
+$(RUST_LIB): $(RUST_LIB_OBJS) | $(CONFIG_H)
+	@mkdir -p $(dir $@)
+	$(RUST_AR) rcs $@ $(RUST_LIB_OBJS)
+	@echo "==> SukiOS Rust runtime archive $@ ($(words $(RUST_LIB_OBJS)) objects)"
+
+# 仅重建运行时归档。
+rust-libs: $(RUST_LIB)
+	@true
+
+# 一键创建 Rust 开发环境（探测/安装 rust + 生成规格 + 建归档）。
+make-rust-env: $(RUST_LIB)
+	@sh $(CURDIR)/tools/suki-rust-env.sh
+
+# 别名。
+rust-env: make-rust-env
+	@true
 
 # ---- 用户程序编译规则（必须先于内核通配规则） ----
 $(BUILD)/user/%.S.o: user/%.S

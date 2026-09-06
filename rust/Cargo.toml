@@ -1,0 +1,11 @@
+[package]
+name = "sukios-hello"
+version = "0.1.0"
+edition = "2021"
+
+# SukiOS 用户态为 freestanding，统一使用 panic=abort（避免 .eh_frame unwind 需求）。
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

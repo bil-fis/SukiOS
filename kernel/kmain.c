@@ -52,6 +52,7 @@ extern void sched_switch_to_idle0(void);
 static void boot_late_init(void *arg);
 #include <kernel/pci.h> /* P0-1/P0-2：ECAM、_PRT 路由、MSI 编程 */
 #include <kernel/hda.h>
+#include <kernel/e1000.h>
 
 /* L3：由 boot.S 在探测到 CPU 支持 SMAP 后置 1（见 syscall.c 的 copy_*_user
  * 围栏）。此处仅用于启动日志输出以验证 SMAP 是否真正生效。 */
@@ -265,6 +266,12 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     /* ---- 阶段八·补：Intel HDA 音频（内核态特例，类 ATA） ---- */
     hda_init();
 
+    /* ---- 网络：Intel 8254x(e1000) 网卡（内核态特例，类 ATA/HDA） ----
+     * 仅做【探测 + 复位 + 读 MAC + 建描述符环 + 使能收发】；原始帧收发服务
+     * 由 net_srv_start() 在 late-init 阶段以 NET_PORT 内核任务提供。
+     * 协议栈（lwIP）在用户态，符合混合内核红线。 */
+    e1000_init();
+
     /* ---- 阶段八/九：磁盘（内核态特例）与 Ring3 服务的加载 ----
      * 关键设计（用户明确要求：「内核基本完全稳定后，再开始加载用户态」）：
      *   内核侧所有核心子系统（SMP/调度/IPC/磁盘探测/音频/全部 selftest）此时
@@ -380,6 +387,12 @@ static void boot_late_init(void *arg)
         kprintf("[boot] no disk: FS_SERVER not started (POSIX file syscalls "
                 "will return -EIO)\n");
     }
+
+    /* ---- 网络：启动 NET_PORT 内核服务（e1000 原始帧收发）----
+     * 放在磁盘/FS_SERVER 之后：网卡自检会发送 ARP 并轮询等待应答（最多 2 秒，
+     * 全程 task_yield 让出），不应阻塞早期引导的关键路径。
+     * 网络服务（lwIP）后续经 NET_PORT 收发帧，并需 port_grant_send 授权。 */
+    net_srv_start();
 
     /* ---- Ring3 输入服务 + 显示服务（Shell 暂不启动）----
      * 用户明确要求：「显示服务启动时，shell 不应该启动」。

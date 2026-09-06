@@ -28,6 +28,7 @@
 
 #define DISK_PORT       1
 #define FS_PORT         2
+#define NET_PORT        3
 #define DISPLAY_PORT    3
 #define INPUT_PORT      4
 #define CONSOLE_PORT    5

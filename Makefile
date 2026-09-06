@@ -291,6 +291,12 @@ QEMU_AUDIODRV ?= pa
 QEMU_AUDIO  := -audiodev $(QEMU_AUDIODRV),id=snd0 \
                -device intel-hda -device hda-duplex,audiodev=snd0
 
+# ---- 网络：Intel 82540EM (e1000) + user 模式后端 ----
+# 内核驱动经 PCI class 0x02/subclass 0x00 探测该网卡（kernel/drivers/e1000.c）。
+# QEMU user 后端自带虚拟网关/DHCP(10.0.2.2)、DNS(10.0.2.3)，驱动启动自检发的
+# ARP 请求会得到应答，从而端到端验证 TX/RX 通路；后续 lwIP 亦可借此联网。
+QEMU_NET    := -device e1000,netdev=net0 -netdev user,id=net0
+
 .PHONY: all iso run run-headless run-dbg run-ahci run-ahci-headless run-uefi run-uefi-headless run-q run-q-debug debug clean info disk gcc FORCE
 
 all: $(KERNEL)
@@ -537,11 +543,11 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) others_tests/moonhalo.mp3
 # 若不指定 -boot d，-machine pc 会优先尝试硬盘导致无法启动。
 # 这样 `make run` 即可直接拉起一个完整可启动的 SukiOS 模拟环境。
 run: $(ISO) $(DISK)
-	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_DISK)
 
 # ---- 无头运行 (仅串口，用于自动化验证) ----
 run-headless: $(ISO) $(DISK)
-	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_DISK)
 
 # ---- 调试运行（带全部串口冗长诊断） ----
 # 通过递归子 make 把 DBG=1 作为全局变量传入，确保 build/config.h 生成
@@ -553,10 +559,10 @@ run-dbg:
 
 # P0-7：磁盘挂 AHCI（DMA+中断），验证 kernel/drivers/ahci.c
 run-ahci: $(ISO) $(DISK)
-	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 run-ahci-headless: $(ISO) $(DISK)
-	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 # ---- P0-6 UEFI：OVMF 启动（GRUB-EFI -> multiboot2 -> 同一 kernel.elf） ----
 # VARS 每次从模板复制（保持只读模板干净；EFI 变量写入进副本）。
@@ -567,14 +573,14 @@ $(OVMF_VARS): $(OVMF_VARS_SRC)
 	cp $< $@
 
 run-uefi: $(ISO) $(DISK) $(OVMF_VARS)
-	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_UEFI) $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_UEFI) $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 run-uefi-headless: $(ISO) $(DISK) $(OVMF_VARS)
-	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_UEFI) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_UEFI) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_AHCI_DISK)
 
 # ---- GDB 调试 (配合 .gdbinit) ----
 debug: $(ISO) $(DISK)
-	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) -boot d -cdrom $(ISO) $(QEMU_DISK) -s -S
+	$(QEMU) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_DISK) -s -S
 
 # ---- PVH 直启 (GRUB 不可用时)：qemu -kernel 走 PVH 协议加载同一 kernel.elf ----
 # 不经 ISO/GRUB；-kernel 扫描 ELF SHT_NOTE 段的 Xen PVH note 取得入口。

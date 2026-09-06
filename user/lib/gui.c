@@ -191,3 +191,39 @@ bool suki_poll_event(suki_window_t *w, suki_event_t *out)
     *out = e->event;
     return true;
 }
+
+int suki_set_focus(suki_window_t *w)
+{
+    if (!w || w->id == SUKI_WINDOW_ID_INVALID) return -1;
+    wm_set_focus_req_t req; memset(&req, 0, sizeof(req));
+    wm_set_focus_resp_t resp; memset(&resp, 0, sizeof(resp));
+    if (gui_ipc_call(WM_PORT, WM_MSG_SET_FOCUS, &req, sizeof(req),
+                     &resp, sizeof(resp)) != 0 || resp.status != 0)
+        return -1;
+    return 0;
+}
+
+void suki_set_window_pos(suki_window_t *w, int x, int y)
+{
+    if (!w || w->id == SUKI_WINDOW_ID_INVALID) return;
+    wm_set_pos_req_t m; memset(&m, 0, sizeof(m));
+    m.h.msgh_bits        = MACH_SEND_MSG;
+    m.h.msgh_size        = sizeof(m);
+    m.h.msgh_remote_port = WM_PORT;
+    m.h.msgh_local_port  = 0;
+    m.h.msgh_id          = WM_MSG_SET_POS;
+    m.id = w->id; m.x = (int32_t)x; m.y = (int32_t)y;
+    mach_msg_send(&m, sizeof(m));
+    w->x = (int32_t)x; w->y = (int32_t)y;
+}
+
+int suki_get_window_rect(suki_window_t *w, int32_t *x, int32_t *y,
+                         uint32_t *w_out, uint32_t *h_out)
+{
+    if (!w) return -1;
+    if (x)    *x    = w->x;
+    if (y)    *y    = w->y;
+    if (w_out)*w_out = w->w;
+    if (h_out)*h_out = w->h;
+    return 0;
+}

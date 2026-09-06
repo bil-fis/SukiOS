@@ -30,6 +30,9 @@
 #include "lib/suki.h"
 #include <ipc/fs_proto.h>
 #include "lib/libc.h"
+#include "lib/suki_gui.h"   /* 窗口化：shell 作为 WM 管理的窗口程序 */
+#include "lib/gui_ipc.h"
+#include "lib/font8x8.h"
 
 #define MSG_ID_KEYCHAR 100   /* 与 input_server 一致；避开 FS_MSG_* */
 #define LINE_MAX 256
@@ -60,44 +63,26 @@ static int  g_cur = 0;    /* 光标下标 0..g_len */
 static int  g_scr_x = 0;        /* 终端光标当前列（相对整行左缘） */
 static int  g_prompt_col = 0;   /* 编辑行起点列（提示符之后） */
 
+/* ---- 窗口化：shell 作为 WM 管理的窗口程序 ----
+ * 启动后创建窗口并注册事件端口；键盘经 WM 转发到本窗口（焦点模型），
+ * 输出渲染到窗口离屏缓冲（同时镜像 serial，便于无图形/headless 观测）。
+ * 因 OOL 缓冲限制（≤16 页=64KiB），窗口最大约 128×128 像素（8×8 字体下 16×16 字符）。 */
+static suki_window_t *g_win = NULL;
+static uint32_t       g_ep  = 0;
+#define TERM_COLS 16
+#define TERM_ROWS 16
+static char     g_tgrid[TERM_ROWS][TERM_COLS];
+static int      g_tcx = 0, g_tcy = 0;   /* 终端网格光标（列/行） */
+static bool     g_term_dirty = false;
+
 /* 前向声明 */
 static int run_builtin_raw(char *line);
 static void prompt(void);
+static void term_puts(const char *s);   /* 终端仿真输出（定义见下方窗口化段） */
 
 /* ============ 行内编辑（光标感知） ============ */
-/* ---- 终端光标镜像维护 ----
- * ed_raw() 在把字符串交给显示服务前，先按字符更新 g_scr_x（遇到 \n/\r/\t/\b
- * 及我们自身发出的 CSI 序列时同步推进，使 shell 侧的列号与显示服务 g_term_x
- * 始终一致）。这样 redraw_from_cursor() 就能算出「终端光标距编辑行起点的偏移」，
- * 先左移回起点、清行尾、重印整行、再把光标移回 g_cur，全程不依赖绝对定位，
- * 因此即便出现长行环绕也是最坏情况（单行内仍正确），不会出现错位或残留。 */
-static void ed_track(const char *s)
-{
-    for (; *s; s++) {
-        unsigned char ch = (unsigned char)*s;
-        if (ch == '\n' || ch == '\r') {
-            g_scr_x = 0;
-        } else if (ch == '\t') {
-            g_scr_x += 8 - (g_scr_x % 8);
-        } else if (ch == '\b') {
-            if (g_scr_x > 0) g_scr_x--;
-        } else if (ch == 0x1B) {                 /* 解析我们发出的 CSI */
-            if (s[1] == '[') {
-                const char *p = s + 2;
-                int n = 0;
-                while (*p >= '0' && *p <= '9') { n = n * 10 + (*p - '0'); p++; }
-                char fin = *p;
-                if (fin == 'D')      g_scr_x = (g_scr_x >= n ? g_scr_x - n : 0);
-                else if (fin == 'C') g_scr_x += n;
-                /* K / H 等不改变列号 */
-                s = p;                              /* 跳过整条 CSI */
-            }
-        } else {
-            g_scr_x++;
-        }
-    }
-}
-static void ed_raw(const char *s) { ed_track(s); u_print(s); }
+/* ---- 终端光标列 g_scr_x 由 term_emit_char 直接维护（见下方终端仿真） ---- */
+static void ed_raw(const char *s) { term_puts(s); }
 
 /* 发射左/右移光标的 CSI 序列（经 ed_raw 同步镜像） */
 static void ed_left(int n)
@@ -1051,6 +1036,125 @@ static void libc_selftest(void)
     u_print(fail == 0 ? "  ALL OK\n" : "  SOME FAILED\n");
 }
 
+/* ===========================================================================
+ * 终端仿真（最小 ANSI）：shell 输出经 term_puts 写入字符网格，再由
+ * term_render 光栅化为窗口离屏缓冲。仅实现 shell 实际发出的转义
+ * （CHA/EL/CUU/CUD/Home/ClearScreen/回车/退格/Tab），足以驱动行编辑。
+ * 输出 CSI 解析用独立的 t_esc/t_esc_num，与键盘 ESC 状态机(g_esc)隔离。
+ * ========================================================================= */
+static void term_scroll(void)
+{
+    for (int r = 0; r + 1 < TERM_ROWS; r++)
+        memcpy(g_tgrid[r], g_tgrid[r+1], TERM_COLS);
+    memset(g_tgrid[TERM_ROWS-1], 0, TERM_COLS);
+}
+
+static void term_emit_char(char c)
+{
+    static int t_esc = 0;       /* 0=普通,1=ESC,2=ESC[ */
+    static int t_esc_num = 0;
+    if (t_esc == 1) {
+        if (c == '[') { t_esc = 2; t_esc_num = 0; return; }
+        t_esc = 0; return;       /* 裸 ESC：丢弃 */
+    }
+    if (t_esc == 2) {
+        if (c == 0x1B) { t_esc = 1; t_esc_num = 0; return; }
+        if (c >= '0' && c <= '9') { t_esc_num = t_esc_num*10 + (c-'0'); return; }
+        if (c == ';') return;
+        t_esc = 0;
+        int n = t_esc_num >= 1 ? t_esc_num : 1;
+        switch (c) {
+            case 'G': g_tcx = (t_esc_num>=1 ? t_esc_num-1 : 0); if (g_tcx>=TERM_COLS) g_tcx=TERM_COLS-1; break;
+            case 'H': case 'f': g_tcx = 0; g_tcy = 0; break;
+            case 'K': for (int x = g_tcx; x < TERM_COLS; x++) g_tgrid[g_tcy][x] = 0; break;
+            case 'J': if (n==2){ for (int r=0;r<TERM_ROWS;r++) memset(g_tgrid[r],0,TERM_COLS); g_tcx=0; g_tcy=0; } break;
+            case 'D': g_tcx = g_tcx >= n ? g_tcx - n : 0; break;
+            case 'C': g_tcx += n; if (g_tcx >= TERM_COLS) g_tcx = TERM_COLS-1; break;
+            default: break;
+        }
+        g_scr_x = g_tcx;
+        return;
+    }
+    if (c == 0x1B) { t_esc = 1; return; }
+    if (c == '\n') { g_tcy++; if (g_tcy >= TERM_ROWS) { term_scroll(); g_tcy = TERM_ROWS-1; } g_tcx = 0; g_scr_x = 0; return; }
+    if (c == '\r') { g_tcx = 0; g_scr_x = 0; return; }
+    if (c == '\b') { if (g_tcx > 0) g_tcx--; g_scr_x = g_tcx; return; }
+    if (c == '\t') { g_tcx += 8 - (g_tcx % 8); if (g_tcx >= TERM_COLS) g_tcx = TERM_COLS-1; g_scr_x = g_tcx; return; }
+    if (c < 32) return;
+    if (g_tcx >= TERM_COLS) { g_tcx = 0; g_tcy++; if (g_tcy >= TERM_ROWS) { term_scroll(); g_tcy = TERM_ROWS-1; } }
+    g_tgrid[g_tcy][g_tcx] = c; g_tcx++; g_scr_x = g_tcx;
+}
+
+static void term_puts(const char *s)
+{
+    const char *orig = s;
+    for (; s && *s; s++) term_emit_char(*s);
+    g_term_dirty = true;
+    if (orig) u_print(orig);   /* 镜像到 serial（headless 可观测） */
+}
+
+static void term_render(void)
+{
+    if (!g_win) return;
+    uint32_t *fb = (uint32_t *)suki_get_buffer(g_win);
+    if (!fb) return;
+    int W = g_win->w, H = g_win->h;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            fb[y*W + x] = 0x002b2b30;   /* 终端背景 */
+    for (int r = 0; r < TERM_ROWS && (r+1)*8 <= H; r++) {
+        for (int cidx = 0; cidx < TERM_COLS && (cidx+1)*8 <= W; cidx++) {
+            char ch = g_tgrid[r][cidx];
+            if (!ch) continue;
+            int px = cidx*8, py = r*8;
+            const uint8_t *g = font8x8_basic[(uint8_t)ch];
+            for (int ry = 0; ry < 8; ry++)
+                for (int cx = 0; cx < 8; cx++)
+                    if (g[ry] & (1u << cx))
+                        fb[(py+ry)*W + (px+cx)] = 0x00e0e0e0;  /* 浅灰前景 */
+        }
+    }
+    suki_flush(g_win, 0, 0, W, H);
+}
+
+/* 键盘字符处理（从 WM 焦点窗口事件端口收到 KEY_DOWN 后调用）。
+ * 逻辑与原阻塞主循环一致，仅把回显输出改为 term_puts（窗口 + serial）。 */
+static void handle_key(char c)
+{
+    if (g_esc == ESC_ESC) {
+        if (c == '[') { g_esc = ESC_BRK; g_esc_num = 0; return; }
+        g_esc = ESC_NONE; return;
+    }
+    if (g_esc == ESC_BRK) {
+        if (c == 0x1B) { g_esc = ESC_ESC; g_esc_num = 0; return; }
+        if (c >= '0' && c <= '9') { g_esc_num = g_esc_num*10 + (c-'0'); return; }
+        if (c == '~') { if (g_esc_num == 3) edit_delete(); g_esc = ESC_NONE; g_esc_num = 0; return; }
+        int code = c; g_esc = ESC_NONE; g_esc_num = 0;
+        switch (code) {
+            case 'A': if (g_hist_count>0 && g_hist_idx>0){g_hist_idx--; line_replace(g_hist[g_hist_idx]);} break;
+            case 'B': if (g_hist_count>0 && g_hist_idx<g_hist_count){g_hist_idx++; if(g_hist_idx<g_hist_count) line_replace(g_hist[g_hist_idx]); else line_replace("");} break;
+            case 'C': edit_right(); break;
+            case 'D': edit_left(); break;
+            case 'H': edit_home(); break;
+            case 'F': edit_end(); break;
+            default: break;
+        }
+        return;
+    }
+    if (c == 0x1B) { g_esc = ESC_ESC; return; }
+    if (c == '\b' || c == 0x7F) { edit_backspace(); return; }
+    if (c == '\t') { edit_tab_complete(); return; }
+    if (c == '\n' || c == '\r') {
+        term_puts("\n");
+        g_line[g_len] = '\0';
+        if (g_len > 0) { hist_push(g_line); g_hist_idx = g_hist_count; run_command(g_line); }
+        g_len = 0; g_cur = 0; g_line[0] = 0;
+        prompt();
+        return;
+    }
+    if (c >= 32 && c < 127) { edit_insert((char)c); }
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -1062,7 +1166,24 @@ int main(int argc, char **argv)
 
     u_print("\n[shell] SukiOS shell online (Ring3, bash-like)\n");
     libc_selftest();
-    sys_port_claim(SHELL_PORT);    /* A2 项：认领 shell 接收端口 */
+    sys_port_claim(SHELL_PORT);    /* 仍认领 SHELL_PORT：接收 FS_SERVER 应答（命令执行同步等待） */
+
+    /* shell 作为 WM 管理的窗口程序：创建窗口 + 事件端口，并主动请求焦点。
+     * 之后键盘由 WM 转发到本窗口（焦点模型）；close 按钮触发 SUKI_EVENT_WINDOW_CLOSE。 */
+    g_win = suki_create_window("Shell", 64, 96, 128, 128, SUKI_WS_DEFAULT);
+    if (g_win) {
+        g_ep = sys_port_alloc();
+        if (g_ep) {
+            sys_port_claim(g_ep);
+            suki_set_event_port(g_win, g_ep);
+        }
+        suki_set_focus(g_win);
+        u_print("[shell] windowed mode: window id=");
+        char b[16]; u_print(u_utoa_s(g_win->id, b, sizeof(b)));
+        u_print("\n");
+    } else {
+        u_print("[shell] warn: window creation failed, serial-only fallback\n");
+    }
 
     /* 后台拉起常驻字体服务（FreeType 渲染），供 pchfnt 等程序调用 */
     u_print("[shell] boot: launching font service + selftest\n");
@@ -1100,94 +1221,23 @@ int main(int argc, char **argv)
     g_len = 0; g_cur = 0; g_line[0] = 0; g_hist_idx = g_hist_count;
     prompt();
 
+    /* shell 作为 WM 管理的窗口程序：键盘经 WM 转发至本窗口事件端口（焦点模型），
+     * 输出渲染到窗口离屏缓冲（同时镜像 serial 供 headless 观测）。 */
     for (;;) {
-        if (mach_msg_recv(g_rx, sizeof(g_rx), SHELL_PORT) != MACH_MSG_SUCCESS) {
-            continue;
-        }
-        mach_msg_header_t *h = (mach_msg_header_t *)g_rx;
-        if (h->msgh_id != MSG_ID_KEYCHAR) {
-            continue;                        /* 迟到的 FS 应答等，忽略 */
-        }
-        char c = *((char *)g_rx + sizeof(*h));
-
-        /* ---- 方向键转义序列状态机 ----
-         * input_server 把 PS/2 方向键编码为 ANSI 转义字节流逐字节送达：
-         *   ESC [ A  上      ESC [ B  下      ESC [ C  右
-         *   ESC [ D  左      ESC [ H  Home    ESC [ F  End
-         *   ESC [ 3 ~  Delete（带数字前缀，需缓存）             */
-        if (g_esc == ESC_ESC) {
-            if (c == '[') { g_esc = ESC_BRK; g_esc_num = 0; continue; }
-            /* 非 '['：放弃本条序列，且该字节一并丢弃（不能当普通字符插入，
-               否则 Alt+x 之类的组合会把 'x' 插进命令行）。 */
-            g_esc = ESC_NONE;
-            continue;
-        }
-        if (g_esc == ESC_BRK) {
-            if (c == 0x1B) {                  /* 序列中途又来一个 ESC：
-                                                 放弃当前半截序列，重新开始，
-                                                 避免 "[A" 之类残留被当文本插入 */
-                g_esc = ESC_ESC; g_esc_num = 0; continue;
+        if (g_win && g_ep) {
+            suki_event_t ev;
+            while (suki_poll_event(g_win, &ev)) {
+                if (ev.type == SUKI_EVENT_KEY_DOWN)
+                    handle_key((char)(unsigned char)ev.u.key.keycode);
+                else if (ev.type == SUKI_EVENT_WINDOW_CLOSE) {
+                    u_print("[shell] window close requested, exiting shell\n");
+                    if (g_win) { suki_destroy_window(g_win); g_win = NULL; }
+                    sys_exit(0);
+                }
             }
-            if (c >= '0' && c <= '9') {        /* 缓存数字（如 Delete 的 '3'） */
-                g_esc_num = g_esc_num * 10 + (c - '0');
-                continue;
-            }
-            if (c == '~') {                    /* 数字型末尾，如 ESC[3~ */
-                if (g_esc_num == 3) edit_delete();   /* Delete 键 */
-                g_esc = ESC_NONE; g_esc_num = 0; continue;
-            }
-            int code = c;
-            g_esc = ESC_NONE; g_esc_num = 0;
-            switch (code) {
-                case 'A':   /* 上：历史上一条 */
-                    if (g_hist_count > 0 && g_hist_idx > 0) {
-                        g_hist_idx--;
-                        line_replace(g_hist[g_hist_idx]);
-                    }
-                    break;
-                case 'B':   /* 下：历史下一条（到末尾则回到新行） */
-                    if (g_hist_count > 0 && g_hist_idx < g_hist_count) {
-                        g_hist_idx++;
-                        if (g_hist_idx < g_hist_count) line_replace(g_hist[g_hist_idx]);
-                        else line_replace("");        /* 回到空的新行 */
-                    }
-                    break;
-                case 'C':   edit_right();  break;   /* 右移光标 */
-                case 'D':   edit_left();   break;   /* 左移光标 */
-                case 'H':   edit_home();   break;   /* Home */
-                case 'F':   edit_end();    break;   /* End */
-                default: break;                       /* 其它忽略 */
-            }
-            continue;
         }
-        if (c == 0x1B) {  /* ESC：进入转义序列 */
-            g_esc = ESC_ESC;
-            continue;
-        }
-
-        if (c == '\b' || c == 0x7F) {   /* Backspace / DEL(0x7F) */
-            edit_backspace();
-            continue;
-        }
-        if (c == '\t') {                /* Tab：补全 */
-            edit_tab_complete();
-            continue;
-        }
-        if (c == '\n' || c == '\r') {
-            u_print("\n");
-            g_line[g_len] = '\0';
-            if (g_len > 0) {
-                hist_push(g_line);
-                g_hist_idx = g_hist_count;   /* 浏览游标回到“新行” */
-                run_command(g_line);
-            }
-            g_len = 0; g_cur = 0; g_line[0] = 0;
-            prompt();
-            continue;
-        }
-        if (c >= 32 && c < 127) {       /* 可打印字符：光标处插入 */
-            edit_insert((char)c);
-        }
+        if (g_term_dirty) { term_render(); g_term_dirty = false; }
+        sys_yield();
     }
     return 0;
 }

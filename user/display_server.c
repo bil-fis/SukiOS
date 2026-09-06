@@ -299,12 +299,23 @@ static wm_window_t g_wins[WM_MAX_WINDOWS];
 static int g_win_count = 0;
 static suki_window_id_t g_win_next_id = 1;
 
+/* 窗口标题栏高度（与 composite 绘制保持一致） */
+#define WIN_TITLE_H 20
+
+/* 焦点窗口与拖拽状态（定义在窗口注册表之后，供 wm_handle_destroy/create 直接访问） */
+static wm_window_t *g_focus     = NULL;
+static wm_window_t *g_drag      = NULL;
+static int32_t      g_drag_offx = 0, g_drag_offy = 0;
+
 static wm_window_t *wm_find(suki_window_id_t id)
 {
     for (int i = 0; i < g_win_count; i++)
         if (g_wins[i].id == id) return &g_wins[i];
     return NULL;
 }
+
+/* 前向声明：wm_handle_create 创建窗口后需立即置为焦点（定义见上方 wm_set_focus） */
+static void wm_set_focus(wm_window_t *w);
 
 /* 前向声明：合成器在窗口管理回调中被调用 */
 static void composite(void);
@@ -353,6 +364,7 @@ static void wm_handle_create(const wm_create_req_t *req, mach_msg_header_t *hdr)
     u_print("[wm] window created id=");
     char b[16]; u_print(u_utoa_s(w->id, b, sizeof(b)));
     u_print("\n");
+    wm_set_focus(w);
     composite();
     return;
 fail:
@@ -385,6 +397,9 @@ static void wm_handle_destroy(const wm_destroy_req_t *m)
     u_print("\n");
     wm_window_t *w = wm_find(m->id);
     if (!w) return;
+    /* 销毁前清理焦点/拖拽悬空引用，避免键盘/拖拽后续转发到已释放窗口 */
+    if (g_focus == w) g_focus = NULL;
+    if (g_drag  == w) g_drag  = NULL;
     uint64_t need = (uint64_t)w->w * w->h * 4;
     sys_munmap(w->pixels, need);
     /* 从数组中移除（保留顺序=Z 稳定） */
@@ -414,6 +429,36 @@ static void wm_forward_event(wm_window_t *w, suki_event_t *ev)
     m.window_id = w->id;
     m.event = *ev;
     mach_msg_send(&m, sizeof(m));
+}
+
+/* 关闭按钮命中（标题栏右上角 16x16 区域） */
+static bool wm_in_close_box(const wm_window_t *w, int32_t sx, int32_t sy)
+{
+    if (!(w->style & SUKI_WS_TITLEBAR)) return false;
+    int32_t bx = w->x + (int32_t)w->w - 18;
+    int32_t by = w->y + 2;
+    return (sx >= bx && sx < bx + 16 && sy >= by && sy < by + 16);
+}
+
+/* 设置焦点窗口并向相关窗口广播 SUKI_EVENT_WINDOW_FOCUS（buttons:1=得焦点,0=失焦点） */
+static void wm_set_focus(wm_window_t *w)
+{
+    if (g_focus == w) return;
+    if (g_focus) {
+        g_focus->has_focus = false;
+        suki_event_t ev; memset(&ev, 0, sizeof(ev));
+        ev.type = SUKI_EVENT_WINDOW_FOCUS;
+        ev.u.mouse.buttons = 0;
+        wm_forward_event(g_focus, &ev);
+    }
+    g_focus = w;
+    if (g_focus) {
+        g_focus->has_focus = true;
+        suki_event_t ev; memset(&ev, 0, sizeof(ev));
+        ev.type = SUKI_EVENT_WINDOW_FOCUS;
+        ev.u.mouse.buttons = 1;
+        wm_forward_event(g_focus, &ev);
+    }
 }
 
 /* ===========================================================================
@@ -474,13 +519,26 @@ static void composite(void)
         fill_rect_fb((uint32_t)x0, (uint32_t)y0, border, hh, COL_ACCENT);
         fill_rect_fb((uint32_t)x0 + ww - border, (uint32_t)y0, border, hh, COL_ACCENT);
         if (w->style & SUKI_WS_TITLEBAR) {
-            uint32_t bar_h = 20;
+            uint32_t bar_h = WIN_TITLE_H;
             if (hh >= bar_h) {
                 fill_rect_fb((uint32_t)x0 + border, (uint32_t)y0 + border, ww - border * 2, bar_h - border, COL_BAR);
                 uint32_t tx = (uint32_t)x0 + border + 4, ty = (uint32_t)y0 + border + 6;
                 for (uint32_t k = 0; k < sizeof(w->title) && w->title[k]; k++)
                     draw_glyph_fb(tx + k * 8, ty, (uint8_t)w->title[k],
                                  w->has_focus ? 0x00FFFFFF : 0x009090A0);
+                /* 关闭按钮（标题栏右上角）：红底 + 白色 X */
+                int32_t bx = (int32_t)x0 + (int32_t)ww - 18;
+                int32_t by = (int32_t)y0 + 2;
+                if (bx >= 0 && by >= 0) {
+                    fill_rect_fb((uint32_t)bx, (uint32_t)by, 16, 16, 0x00C0392B);
+                    for (int32_t i = 3; i < 13; i++) {
+                        if (bx + i < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
+                            g_fb[(by + i) * g_stride + (bx + i)] = 0x00FFFFFF;
+                        if (bx + (15 - i) >= 0 && bx + (15 - i) < (int32_t)g_fb_width &&
+                            by + i < (int32_t)g_fb_height)
+                            g_fb[(by + i) * g_stride + (bx + (15 - i))] = 0x00FFFFFF;
+                    }
+                }
             }
         }
     }
@@ -553,24 +611,81 @@ int main(void)
                 mouse_event_msg_t *m = (mouse_event_msg_t *)msgbuf;
                 g_cur_x = m->x; g_cur_y = m->y;
                 if (h->msgh_id == MOUSE_MSG_BUTTON) g_cur_buttons = m->buttons;
-                /* 命中测试 + 焦点 + 事件转发 */
-                wm_window_t *hit = wm_hit_test(m->x, m->y);
-                for (int i = 0; i < g_win_count; i++) g_wins[i].has_focus = false;
-                if (hit) {
-                    hit->has_focus = true;
-                    suki_event_t ev; memset(&ev, 0, sizeof(ev));
+
+                /* 拖拽进行中：直接跟随光标移动窗口（忽略命中） */
+                if (g_drag) {
                     if (h->msgh_id == MOUSE_MSG_MOVE) {
-                        ev.type = SUKI_EVENT_MOUSE_MOVE;
-                        ev.u.mouse.x = m->x - hit->x; ev.u.mouse.y = m->y - hit->y;
-                        ev.u.mouse.buttons = g_cur_buttons;
-                    } else {
-                        ev.type = (g_cur_buttons & 1) ? SUKI_EVENT_MOUSE_DOWN : SUKI_EVENT_MOUSE_UP;
-                        ev.u.mouse.x = m->x - hit->x; ev.u.mouse.y = m->y - hit->y;
-                        ev.u.mouse.buttons = g_cur_buttons;
+                        g_drag->x = m->x - g_drag_offx;
+                        g_drag->y = m->y - g_drag_offy;
+                        composite();
                     }
-                    wm_forward_event(hit, &ev);
+                    continue;
                 }
-                composite();
+
+                wm_window_t *hit = wm_hit_test(m->x, m->y);
+
+                if (h->msgh_id == MOUSE_MSG_BUTTON && (m->buttons & 1)) {
+                    /* 左键按下：标题栏 -> 关闭按钮 / 拖拽；客户区 -> 聚焦 + 下发 */
+                    if (hit && (hit->style & SUKI_WS_TITLEBAR)) {
+                        if (wm_in_close_box(hit, m->x, m->y)) {
+                            suki_event_t ev; memset(&ev, 0, sizeof(ev));
+                            ev.type = SUKI_EVENT_WINDOW_CLOSE;
+                            wm_forward_event(hit, &ev);
+                            composite();
+                            continue;
+                        }
+                        if (m->y >= hit->y && m->y < hit->y + (int32_t)WIN_TITLE_H) {
+                            g_drag = hit;
+                            g_drag_offx = m->x - hit->x;
+                            g_drag_offy = m->y - hit->y;
+                            wm_set_focus(hit);
+                            composite();
+                            continue;
+                        }
+                    }
+                    if (hit) wm_set_focus(hit);
+                    if (hit) {
+                        suki_event_t ev; memset(&ev, 0, sizeof(ev));
+                        ev.type = SUKI_EVENT_MOUSE_DOWN;
+                        ev.u.mouse.x = m->x - hit->x; ev.u.mouse.y = m->y - hit->y;
+                        ev.u.mouse.buttons = m->buttons;
+                        wm_forward_event(hit, &ev);
+                    }
+                    composite();
+                } else if (h->msgh_id == MOUSE_MSG_BUTTON) {
+                    /* 松开：结束拖拽并下发 MOUSE_UP */
+                    g_drag = NULL;
+                    if (hit) {
+                        suki_event_t ev; memset(&ev, 0, sizeof(ev));
+                        ev.type = SUKI_EVENT_MOUSE_UP;
+                        ev.u.mouse.x = m->x - hit->x; ev.u.mouse.y = m->y - hit->y;
+                        ev.u.mouse.buttons = m->buttons;
+                        wm_forward_event(hit, &ev);
+                    }
+                    composite();
+                } else {
+                    /* MOVE / WHEEL：转发给命中窗口 */
+                    if (hit) {
+                        suki_event_t ev; memset(&ev, 0, sizeof(ev));
+                        ev.type = (h->msgh_id == MOUSE_MSG_WHEEL)
+                                     ? SUKI_EVENT_MOUSE_WHEEL : SUKI_EVENT_MOUSE_MOVE;
+                        ev.u.mouse.x = m->x - hit->x; ev.u.mouse.y = m->y - hit->y;
+                        ev.u.mouse.buttons = g_cur_buttons;
+                        wm_forward_event(hit, &ev);
+                    }
+                    composite();
+                }
+            } else if (h->msgh_id == KEY_MSG_DOWN || h->msgh_id == KEY_MSG_UP) {
+                /* 键盘事件：转发给当前焦点窗口（由 WM 统一管束输入焦点） */
+                key_event_msg_t *k = (key_event_msg_t *)msgbuf;
+                if (g_focus && g_focus->event_port) {
+                    suki_event_t ev; memset(&ev, 0, sizeof(ev));
+                    ev.type = (h->msgh_id == KEY_MSG_DOWN) ? SUKI_EVENT_KEY_DOWN
+                                                           : SUKI_EVENT_KEY_UP;
+                    ev.u.key.keycode   = k->ascii;
+                    ev.u.key.modifiers = k->modifiers;
+                    wm_forward_event(g_focus, &ev);
+                }
             }
         }
 
@@ -590,6 +705,36 @@ int main(void)
             case WM_MSG_SET_EVENT:
                 wm_handle_set_event((const wm_set_event_req_t *)msgbuf);
                 break;
+            case WM_MSG_SET_FOCUS: {
+                wm_set_focus_req_t *r = (wm_set_focus_req_t *)msgbuf;
+                wm_set_focus(wm_find(r->id));
+                wm_set_focus_resp_t resp; memset(&resp, 0, sizeof(resp));
+                resp.h.msgh_bits        = MACH_SEND_MSG;
+                resp.h.msgh_size        = sizeof(resp);
+                resp.h.msgh_remote_port = h->msgh_local_port;
+                resp.h.msgh_local_port  = 0;
+                resp.h.msgh_id          = WM_MSG_SET_FOCUS_RESP;
+                resp.status             = 0;
+                mach_msg_send(&resp, sizeof(resp));
+                break;
+            }
+            case WM_MSG_SET_POS: {
+                wm_set_pos_req_t *r = (wm_set_pos_req_t *)msgbuf;
+                wm_window_t *w = wm_find(r->id);
+                if (w) { w->x = r->x; w->y = r->y; composite(); }
+                break;
+            }
+            case WM_MSG_GET_FOCUS: {
+                wm_get_focus_resp_t resp; memset(&resp, 0, sizeof(resp));
+                resp.h.msgh_bits        = MACH_SEND_MSG;
+                resp.h.msgh_size        = sizeof(resp);
+                resp.h.msgh_remote_port = h->msgh_local_port;
+                resp.h.msgh_local_port  = 0;
+                resp.h.msgh_id          = WM_MSG_GET_FOCUS_RESP;
+                resp.id = g_focus ? g_focus->id : 0;
+                mach_msg_send(&resp, sizeof(resp));
+                break;
+            }
             default:
                 break;
             }

@@ -523,6 +523,13 @@ $(BUILD)/user/%.elf: $(BUILD)/user/%.c.o $(USER_LIB_OBJS) user/user.ld
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
+# shell 专用：链接 gui.c.o（窗口程序，调用 suki_create_window 等）
+$(BUILD)/user/shell.elf: $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
+	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
+
 # fs_server 专用：追加 FatFs 核心对象
 $(BUILD)/user/fs_server.elf: $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \

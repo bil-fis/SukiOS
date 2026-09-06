@@ -49,6 +49,15 @@ void  suki_flush(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh);
 void suki_set_event_port(suki_window_t *w, uint32_t port);  /* 注册事件端口后 WM 主动推送 */
 bool suki_poll_event(suki_window_t *w, suki_event_t *out);  /* 非阻塞，无事件返回 false */
 
+/* ---- 焦点与窗口管理（由 WM 统一管理输入焦点 / 位置） ----
+ * 窗口管理遵循「谁聚焦谁收键盘」模型：WM 仅把键盘事件转发给当前焦点窗口，
+ * 故 shell 等需要键盘输入的程序务必先成为焦点（默认创建即获焦点，或显式
+ * 调用 suki_set_focus）。鼠标点击也会把命中窗口置为焦点。 */
+int  suki_set_focus(suki_window_t *w);                       /* 程序化置本窗口为焦点 */
+void suki_set_window_pos(suki_window_t *w, int x, int y);    /* 移动窗口（拖拽用） */
+int  suki_get_window_rect(suki_window_t *w, int32_t *x, int32_t *y,
+                          uint32_t *w_out, uint32_t *h_out); /* 取当前位置/尺寸 */
+
 /* ---- 颜色辅助 ---- */
 #define SUKI_RGB(r, g, b) (((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
 #define SUKI_BG_DESKTOP   SUKI_RGB(16, 25, 38)

@@ -31,10 +31,22 @@
 #define WM_MSG_DESTROY   0x302   /* 销毁窗口 */
 #define WM_MSG_SET_EVENT  0x303   /* 设置窗口事件端口 */
 #define WM_MSG_SET_TITLE  0x304   /* 更新窗口标题 */
+#define WM_MSG_SET_FOCUS  0x305   /* 设置焦点窗口（同步应答 WM_MSG_SET_FOCUS_RESP） */
+#define WM_MSG_SET_POS    0x306   /* 移动窗口位置（x,y） */
+#define WM_MSG_GET_FOCUS  0x307   /* 查询当前焦点窗口 id（同步应答 WM_MSG_GET_FOCUS_RESP） */
 /* WM -> 应用（应答端口） */
-#define WM_MSG_CREATE_RESP 0x380
+#define WM_MSG_CREATE_RESP     0x380
+#define WM_MSG_SET_FOCUS_RESP  0x381
+#define WM_MSG_GET_FOCUS_RESP  0x382
 /* WM -> 应用事件端口（窗口注册的事件端口） */
 #define WM_MSG_EVENT      0x400
+
+/* ---- 键盘事件：input_server -> WM（经 DISPLAY_PORT，id=KEY_MSG_DOWN/UP）----
+ * 键盘布局解析仍由 input_server(Ring3) 完成，本消息携带已解析的 ASCII 字符
+ * 与修饰键状态；WM 据此构造 SUKI_EVENT_KEY_DOWN/UP 转发给焦点窗口。
+ * 与鼠标事件（id 101/102/103）同走 DISPLAY_PORT，由 WM 主循环统一分发。 */
+#define KEY_MSG_DOWN  104
+#define KEY_MSG_UP    105
 
 /* ---- 窗口风格标志（参考 Win32 WS_*） ---- */
 #define SUKI_WS_VISIBLE  0x0001
@@ -82,6 +94,38 @@ typedef struct wm_set_event_req {
     uint32_t          event_port;
 } wm_set_event_req_t;
 
+/* 设置焦点窗口（应用侧 suki_set_focus 用） */
+typedef struct wm_set_focus_req {
+    mach_msg_header_t h;
+    suki_window_id_t  id;
+} wm_set_focus_req_t;
+
+typedef struct wm_set_focus_resp {
+    mach_msg_header_t h;
+    uint32_t          status;     /* 0=成功 */
+} wm_set_focus_resp_t;
+
+/* 移动窗口位置（拖拽 / 程序化定位用） */
+typedef struct wm_set_pos_req {
+    mach_msg_header_t h;
+    suki_window_id_t  id;
+    int32_t  x, y;
+} wm_set_pos_req_t;
+
+/* 查询当前焦点窗口 id */
+typedef struct wm_get_focus_resp {
+    mach_msg_header_t h;
+    suki_window_id_t  id;         /* 0=无焦点窗口 */
+} wm_get_focus_resp_t;
+
+/* 键盘事件消息（input_server -> WM，经 DISPLAY_PORT） */
+typedef struct key_event_msg {
+    mach_msg_header_t h;
+    uint8_t  ascii;        /* 已解析 ASCII（含 '\n' 回车、'\b' 退格等控制字符） */
+    uint8_t  modifiers;    /* bit0=Shift, bit1=CapsLock */
+    uint8_t  _pad[2];
+} key_event_msg_t;
+
 /* ---- 事件（WM -> 应用） ---- */
 typedef enum suki_event_type {
     SUKI_EVENT_KEY_DOWN = 1,
@@ -99,7 +143,7 @@ typedef struct suki_event {
     uint32_t type;
     uint64_t timestamp;
     union {
-        struct { uint32_t keycode; uint32_t modifiers; } key;
+        struct { uint32_t keycode; uint32_t modifiers; } key;  /* 焦点窗口键盘：keycode=已解析 ASCII */
         struct { int32_t x, y; uint32_t buttons; } mouse;  /* 相对窗口坐标 */
     } u;
 } suki_event_t;

@@ -11,6 +11,7 @@
  *           -> mach_msg -> SHELL_PORT -> shell。
  */
 #include "lib/suki.h"
+#include "lib/gui_ipc.h"   /* KEY_MSG_DOWN：键盘经 WM 转发到焦点窗口 */
 
 #define MSG_ID_KEYCHAR 100   /* 避免与 FS_MSG_*(1/2) 冲突 */
 
@@ -67,20 +68,25 @@ static const char *e0_seq(uint8_t c2)
     }
 }
 
+/* 把键盘字符经 WM 转发给【焦点窗口】（统一输入焦点模型）。
+ * 键盘布局解析仍由本服务完成，这里携带已解析 ASCII；WM 据此构造
+ * SUKI_EVENT_KEY_DOWN 推送给当前焦点窗口（shell 等窗口程序自行收取）。 */
 static void send_char(char c)
 {
     struct {
         mach_msg_header_t h;
-        char c;
-        char pad[7];
+        uint8_t  ascii;
+        uint8_t  modifiers;
+        uint8_t  _pad[2];
     } msg;
     msg.h.msgh_bits = 0;
     msg.h.msgh_size = sizeof(msg);
-    msg.h.msgh_remote_port = SHELL_PORT;
+    msg.h.msgh_remote_port = DISPLAY_PORT;   /* WM（DISPLAY_PORT 与鼠标事件同端口） */
     msg.h.msgh_local_port = INPUT_PORT;
-    msg.h.msgh_id = MSG_ID_KEYCHAR;
+    msg.h.msgh_id = KEY_MSG_DOWN;
     msg.h.msgh_reserved = 0;
-    msg.c = c;
+    msg.ascii = (uint8_t)(unsigned char)c;
+    msg.modifiers = 0;
     mach_msg_send(&msg, sizeof(msg));
 }
 

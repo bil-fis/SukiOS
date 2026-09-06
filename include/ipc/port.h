@@ -50,6 +50,9 @@ typedef struct mach_ool_desc {
 /* mach_msg option */
 #define MACH_SEND_MSG   0x1
 #define MACH_RECV_MSG   0x2
+/* 非阻塞接收：队列为空时立即返回 MACH_RCV_TIMED_OUT（不阻塞、不让出 CPU）。
+ * 供 net_server 主循环在不阻塞帧接收的前提下轮询 NS_PORT socket 请求。 */
+#define MACH_RCV_NONBLOCK 0x4
 
 /* 返回码 */
 #define MACH_MSG_SUCCESS        0

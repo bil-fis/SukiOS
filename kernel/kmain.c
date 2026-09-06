@@ -66,6 +66,7 @@ extern const uint8_t user_shell_start[], user_shell_end[];
 extern const uint8_t user_posixtest_start[], user_posixtest_end[];
 extern const uint8_t user_mouse_server_start[], user_mouse_server_end[];
 extern const uint8_t user_net_server_start[], user_net_server_end[];
+extern const uint8_t user_nettest_start[], user_nettest_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -393,6 +394,7 @@ static void boot_late_init(void *arg)
      * 放在磁盘/FS_SERVER 之后：网卡自检会发送 ARP 并轮询等待应答（最多 2 秒，
      * 全程 task_yield 让出），不应阻塞早期引导的关键路径。
      * 网络服务（lwIP）后续经 NET_PORT 收发帧，并需 port_grant_send 授权。 */
+#if 1
     net_srv_start();
 
     /* Ring3 网络服务（lwIP 协议栈）：作为 NET_PORT 的【客户端】收发帧。
@@ -408,6 +410,7 @@ static void boot_late_init(void *arg)
                     (unsigned long)net_task->id);
         }
     }
+#endif
 
     /* ---- Ring3 输入服务 + 显示服务（Shell 暂不启动）----
      * 用户明确要求：「显示服务启动时，shell 不应该启动」。
@@ -486,6 +489,12 @@ static void boot_late_init(void *arg)
     task_create_user(user_posixtest_start,
                      (size_t)(user_posixtest_end - user_posixtest_start),
                      "posixtest");
+
+    /* 网络子系统端到端验证：spawn nettest（UDP -> QEMU TFTP 10.0.2.2:69 往返 +
+     * SukiNative 原生 socket 冒烟）。与 posixtest 同为开机自检，输出经串口落盘。 */
+    task_create_user(user_nettest_start,
+                     (size_t)(user_nettest_end - user_nettest_start),
+                     "nettest");
 
     kprintf("[boot] core services spawned (input+display); shell deferred "
             "until display layer ready.\n\n");

@@ -12,6 +12,7 @@
  */
 #include "suki.h"
 #include <sukios/posix.h>
+#include <sukios/net.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -166,5 +167,216 @@ suki_status_t suki_mem_alloc(uint64_t size, suki_handle_t *out)
     if (h < 0)
         return (suki_status_t)h;
     *out = (suki_handle_t)h;
+    return 0;
+}
+
+/* ============================================================================
+ *  SukiNative 网络 socket 对象（POSIX 150..164 的「原生」平行接口）
+ *  一切皆对象、直接 IPC 到 NS_PORT，不经过内核 POSIX 层。客户端用 sys_port_alloc
+ *  取一个临时应答端口（每进程缓存一个，单线程同步调用安全）。
+ * ========================================================================== */
+static uint8_t  g_sreq[sizeof(mach_msg_header_t) + sizeof(sock_req_t)];
+static uint8_t  g_sresp[sizeof(mach_msg_header_t) + sizeof(sock_resp_t)];
+static uint32_t g_sock_rp;
+
+static void sock_req_header(uint32_t op, uint32_t sock)
+{
+    if (!g_sock_rp) {
+        g_sock_rp = (uint32_t)suki_syscall5(SYS_PORT_ALLOC, 0, 0, 0, 0, 0);
+    }
+    memset(g_sreq, 0, sizeof(g_sreq));
+    mach_msg_header_t *h = (mach_msg_header_t *)g_sreq;
+    h->msgh_size        = (uint32_t)sizeof(g_sreq);
+    h->msgh_id          = op;
+    h->msgh_remote_port = NS_PORT;
+    h->msgh_local_port  = g_sock_rp;
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    r->op   = op;
+    r->sock = sock;
+}
+
+static suki_status_t sock_ipc(void)
+{
+    if (mach_msg_send(g_sreq, (uint32_t)sizeof(g_sreq)) != MACH_MSG_SUCCESS)
+        return (suki_status_t)-1;
+    if (mach_msg_recv(g_sresp, (uint32_t)sizeof(g_sresp), g_sock_rp) != MACH_MSG_SUCCESS)
+        return (suki_status_t)-1;
+    return (suki_status_t)((sock_resp_t *)(g_sresp + sizeof(mach_msg_header_t)))->status;
+}
+
+static sock_resp_t *sock_resp(void)
+{
+    return (sock_resp_t *)(g_sresp + sizeof(mach_msg_header_t));
+}
+
+suki_status_t suki_socket_create(int domain, int type, int proto, suki_socket_t *out)
+{
+    sock_req_header(SOCK_MSG_CREATE, 0);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    r->domain = (uint32_t)domain; r->type = (uint32_t)type; r->proto = (uint32_t)proto;
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    *out = sock_resp()->result;
+    return 0;
+}
+
+suki_status_t suki_socket_bind(suki_socket_t s, const void *addr, uint32_t addrlen)
+{
+    sock_req_header(SOCK_MSG_BIND, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    if (addr && addrlen) { uint32_t n = addrlen > 16 ? 16 : addrlen; memcpy(r->addr, addr, n); r->addr_len = n; }
+    return sock_ipc();
+}
+
+suki_status_t suki_socket_connect(suki_socket_t s, const void *addr, uint32_t addrlen)
+{
+    sock_req_header(SOCK_MSG_CONNECT, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    if (addr && addrlen) { uint32_t n = addrlen > 16 ? 16 : addrlen; memcpy(r->addr, addr, n); r->addr_len = n; }
+    return sock_ipc();
+}
+
+suki_status_t suki_socket_listen(suki_socket_t s, int backlog)
+{
+    (void)backlog;
+    sock_req_header(SOCK_MSG_LISTEN, s);
+    return sock_ipc();
+}
+
+suki_status_t suki_socket_accept(suki_socket_t s, void *addr, uint32_t *addrlen, suki_socket_t *out)
+{
+    sock_req_header(SOCK_MSG_ACCEPT, s);
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    sock_resp_t *rp = sock_resp();
+    if (addr && addrlen && rp->addr_len) { uint32_t n = rp->addr_len > 16 ? 16 : rp->addr_len; memcpy(addr, rp->addr, n); *addrlen = rp->addr_len; }
+    *out = rp->result;
+    return 0;
+}
+
+suki_status_t suki_socket_send(suki_socket_t s, const void *buf, uint32_t len,
+                               uint32_t flags, uint32_t *out_nwritten)
+{
+    (void)flags;
+    sock_req_header(SOCK_MSG_SEND, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    uint32_t n = len > SOCK_MAX_DATA ? SOCK_MAX_DATA : len;
+    if (n && buf) memcpy(r->data, buf, n);
+    r->len = n;
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    if (out_nwritten) *out_nwritten = sock_resp()->result;
+    return 0;
+}
+
+suki_status_t suki_socket_recv(suki_socket_t s, void *buf, uint32_t len,
+                               uint32_t flags, uint32_t *out_nread)
+{
+    (void)flags;
+    sock_req_header(SOCK_MSG_RECV, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    r->len = len;
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    sock_resp_t *rp = sock_resp();
+    uint32_t n = rp->len > len ? len : rp->len;
+    if (n && buf) memcpy(buf, rp->data, n);
+    if (out_nread) *out_nread = n;
+    return 0;
+}
+
+suki_status_t suki_socket_sendto(suki_socket_t s, const void *buf, uint32_t len,
+                                 uint32_t flags, const void *addr, uint32_t addrlen,
+                                 uint32_t *out_nwritten)
+{
+    (void)flags;
+    sock_req_header(SOCK_MSG_SENDTO, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    uint32_t n = len > SOCK_MAX_DATA ? SOCK_MAX_DATA : len;
+    if (n && buf) memcpy(r->data, buf, n);
+    r->len = n;
+    if (addr && addrlen) { uint32_t an = addrlen > 16 ? 16 : addrlen; memcpy(r->addr, addr, an); r->addr_len = an; }
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    if (out_nwritten) *out_nwritten = sock_resp()->result;
+    return 0;
+}
+
+suki_status_t suki_socket_recvfrom(suki_socket_t s, void *buf, uint32_t len,
+                                   uint32_t flags, void *addr, uint32_t *addrlen,
+                                   uint32_t *out_nread)
+{
+    (void)flags;
+    sock_req_header(SOCK_MSG_RECVFROM, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    r->len = len;
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    sock_resp_t *rp = sock_resp();
+    uint32_t n = rp->len > len ? len : rp->len;
+    if (n && buf) memcpy(buf, rp->data, n);
+    if (addr && addrlen && rp->addr_len) { uint32_t an = rp->addr_len > 16 ? 16 : rp->addr_len; memcpy(addr, rp->addr, an); *addrlen = rp->addr_len; }
+    if (out_nread) *out_nread = n;
+    return 0;
+}
+
+suki_status_t suki_socket_close(suki_socket_t s)
+{
+    sock_req_header(SOCK_MSG_CLOSE, s);
+    return sock_ipc();
+}
+
+suki_status_t suki_socket_getsockname(suki_socket_t s, void *addr, uint32_t *addrlen)
+{
+    sock_req_header(SOCK_MSG_GETSOCKNAME, s);
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    sock_resp_t *rp = sock_resp();
+    if (addr && addrlen && rp->addr_len) { uint32_t n = rp->addr_len > 16 ? 16 : rp->addr_len; memcpy(addr, rp->addr, n); *addrlen = rp->addr_len; }
+    return 0;
+}
+
+suki_status_t suki_socket_getpeername(suki_socket_t s, void *addr, uint32_t *addrlen)
+{
+    sock_req_header(SOCK_MSG_GETPEERNAME, s);
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    sock_resp_t *rp = sock_resp();
+    if (addr && addrlen && rp->addr_len) { uint32_t n = rp->addr_len > 16 ? 16 : rp->addr_len; memcpy(addr, rp->addr, n); *addrlen = rp->addr_len; }
+    return 0;
+}
+
+suki_status_t suki_socket_shutdown(suki_socket_t s, int how)
+{
+    (void)how;
+    sock_req_header(SOCK_MSG_SHUTDOWN, s);
+    return sock_ipc();
+}
+
+suki_status_t suki_socket_setsockopt(suki_socket_t s, int level, int optname,
+                                     const void *optval, uint32_t optlen)
+{
+    sock_req_header(SOCK_MSG_SETSOCKOPT, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    r->domain = (uint32_t)level; r->type = (uint32_t)optname;
+    uint32_t n = optlen > 16 ? 16 : optlen;
+    if (optval && n) memcpy(r->addr, optval, n);
+    r->addr_len = n;
+    return sock_ipc();
+}
+
+suki_status_t suki_socket_getsockopt(suki_socket_t s, int level, int optname,
+                                     void *optval, uint32_t *optlen)
+{
+    sock_req_header(SOCK_MSG_GETSOCKOPT, s);
+    sock_req_t *r = (sock_req_t *)(g_sreq + sizeof(mach_msg_header_t));
+    r->domain = (uint32_t)level; r->type = (uint32_t)optname;
+    uint32_t inlen = optlen ? *optlen : 0;
+    uint32_t n = inlen > 16 ? 16 : inlen;
+    r->addr_len = n;
+    suki_status_t st = sock_ipc();
+    if (st != 0) return st;
+    sock_resp_t *rp = sock_resp();
+    if (optval && optlen) { uint32_t m = rp->len > n ? n : rp->len; if (m) memcpy(optval, rp->data, m); *optlen = rp->len; }
     return 0;
 }

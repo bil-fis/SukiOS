@@ -1092,6 +1092,10 @@ int main(int argc, char **argv)
             u_print("[shell] pchfnt selftest spawned\n");
     }
 
+    /* 注：nettest（网络子系统端到端验证）已由 kmain 作为内嵌 USER_PROG 在开机自检
+     * 阶段确定性 spawn（输出经串口落盘，详见 kmain.c）。此处不再重复拉起，避免双
+     * 实例造成 socket fd 清理与日志混乱。 */
+
     u_print("Type 'help' for commands.\n\n");
     g_len = 0; g_cur = 0; g_line[0] = 0; g_hist_idx = g_hist_count;
     prompt();

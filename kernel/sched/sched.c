@@ -1007,11 +1007,31 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
     port_release_owner(t);
     port_reap_ool(t);
     hda_release_owner(t);   /* P0-R1：owner 退出时停流，防悬空/音频锁死 */
+
+    /* 保存进入 task_exit_current 时的中断标志：末尾最终 spin_unlock 必须恢复它
+     * （而非重新加锁时的标志）。fd_exit_task 阻塞期间 port_block_and_yield 会 sti 开
+     * 中断，故重新加锁得到的 f 已是 IF=1；若用它做末尾恢复，会使随后的
+     * context_switch / suki_proc_notify_exit 在开中断下执行，定时器中断可能在切换
+     * 中途打穿寄存器/栈状态，造成非确定性损坏（FS/DHCP 间歇性失败）。原语义是关中断
+     * 下完成切换，故此处用 f_entry 还原。 */
+    uint64_t f_entry = f;
+
+    /* P0 网络回归修复（致命死锁）：fd_exit_task 会经 net_close_backend /
+     * fs_close_backend 发起阻塞式 IPC（net_rpc -> ipc_recv_kernel -> schedule
+     * 让出）。本函数自进入即持有 g_sched_lock，而 schedule() 又会重入取同一把锁，
+     * 若不先释放将触发自旋锁死锁（nettest 退出关闭 socket fd 时必现 PANIC）。
+     * 故在此先释放调度锁完成 fd 清理（与正常 close() 路径一致：解锁后才阻塞 IPC），
+     * 再重新持锁收尾（销毁地址空间 / 进 zombie 或 dead 链表）。释放期间 t 仍
+     * 为 current 且仍 RUNNING 在运行队列中，仅可能在阻塞点被切走、被唤醒后继续，
+     * 不会进入 reap（尚未标记 zombie/dead 且 alive 仍为 true）。 */
+    spin_unlock_irqrestore(&g_sched_lock, f);
     fd_exit_task(t);        /* POSIX：关闭本任务持有的全部 fd（引用归零者会
                              * 向 FS_SERVER 发 CLOSE，释放服务端句柄，避免
                              * 反复 spawn 造成服务端句柄表耗尽） */
+    f = spin_lock_irqsave(&g_sched_lock);
+
     /* 仅当没有其他存活任务共享本地址空间时才销毁 cr3/vma（线程共享 AS 时由最后
-     * 退出的线程负责释放，避免误伤仍在运行兄弟线程的映射；此时已持 g_sched_lock）。 */
+     * 退出的线程负责释放，避免误伤仍在运行兄弟线程的映射；此时已重新持 g_sched_lock）。 */
     if (!address_space_shared(t)) {
         vma_destroy_all(t);
         if (t->is_user && t->cr3 && t->cr3 != vmm_kernel_pml4()) {
@@ -1082,7 +1102,9 @@ __attribute__((noreturn)) void task_exit_current(uint64_t code)
 
     bool cr3_switch = (next->cr3 != t->cr3);
     uint64_t next_cr3 = next->cr3;
-    spin_unlock_irqrestore(&g_sched_lock, f);
+    /* 末尾恢复进入时的中断标志（f_entry，关中断），保证 context_switch 在关中断下
+     * 执行（见上方 f_entry 说明）；不可用重新加锁得到的 f（可能 IF=1）。 */
+    spin_unlock_irqrestore(&g_sched_lock, f_entry);
 
     /* SukiNative PROC 对象退出通知：释放调度锁后调用，内部可安全使用 sched_wake
      * 唤醒阻塞在 SYS_SUKI_WAIT 上、等待本进程退出的任务。 */

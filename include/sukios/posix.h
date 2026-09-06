@@ -529,6 +529,12 @@ typedef struct suki_fd_set {
 #define SYS_INPUT_READ      5
 #define SYS_REBOOT          6
 #define SYS_PORT_CLAIM      7
+/* 注意：17/18 已被核心 ABI 占用（SYS_FORK/SYS_GETPID），绝不可复用，否则
+ * syscall_dispatch 的 switch 会优先命中 SYS_PORT_ALLOC/FREE 而拦截 fork/getpid，
+ * 造成全局进程管理失效（getpid 恒返回 0、fork 返回端口号）。故动态端口分配/
+ * 释放使用 88..129 区段末端的空闲号位 97/98。 */
+#define SYS_PORT_ALLOC      97   /* 分配一个动态接收端口，返回端口号（0=失败） */
+#define SYS_PORT_FREE       98   /* 释放动态端口（a1=端口号） */
 #define SYS_EXECVE          8
 #define SYS_WAIT            9
 #define SYS_AUDIO_OPEN      10
@@ -726,6 +732,8 @@ typedef struct suki_objinfo {
 #define SYS_GETPEERNAME     162
 #define SYS_GETSOCKNAME     163
 #define SYS_SOCKETPAIR      164
+#define SYS_SEND            165   /* 已连接 socket 发送（等价于 sendto 无对端地址） */
+#define SYS_RECV            166   /* 已连接 socket 接收（等价于 recvfrom 无对端地址） */
 
 /* 内核扩展：Ring3 显示服务经此系统调用获得帧缓冲用户态映射与显示配置。
  * 放在原生区之外的独立扩展号，避免与 POSIX 区（20+）混淆。 */

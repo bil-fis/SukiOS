@@ -23,6 +23,7 @@
  * 调用关系：kernel/syscall/sys_posix.c 的 sys_open/read/write/... -> 本文件。
  */
 #include <kernel/fd.h>
+#include <kernel/net/socket.h>   /* FD_TYPE_SOCKET 路由：net_close_backend / net_read / net_write */
 #include <kernel/string.h>
 #include <kernel/console.h>
 #include <kernel/spinlock.h>
@@ -190,6 +191,8 @@ void fd_release_slot(int slot)
     }
     if (e->type == FD_TYPE_FILE || e->type == FD_TYPE_DIR) {
         fd_close_backend(e);
+    } else if (e->type == FD_TYPE_SOCKET) {
+        net_close_backend(e);   /* 向 NS_PORT 发 SOCK_MSG_CLOSE 关闭 net_server 侧句柄 */
     } else if (e->type == FD_TYPE_PIPE) {
         if (e->pipe) {
             /* 管道对象独立引用计数：两端都关闭后才释放 */
@@ -691,6 +694,22 @@ int fd_open(struct task *t, const char *path, int flags, uint32_t mode)
     return fdnum;
 }
 
+/*
+ * 分配一个 socket fd：类型为 FD_TYPE_SOCKET，backend 保存 net_server 分配的
+ * socket 句柄。供 sys_net_dispatch 的 socket()/accept() 创建 fd。
+ */
+int fd_socket(struct task *t, int handle)
+{
+    uint64_t f = spin_lock_irqsave(&g_fd_lock);
+    int fdnum = fd_bind_locked(t, FD_TYPE_SOCKET, SUKI_O_RDWR);
+    if (fdnum >= 0) {
+        fd_entry_t *e = &g_fd_slots[t->fds[fdnum]];
+        e->backend = (int)handle;
+    }
+    spin_unlock_irqrestore(&g_fd_lock, f);
+    return fdnum;
+}
+
 int fd_close(struct task *t, int fd)
 {
     int slot = -1;
@@ -725,6 +744,9 @@ suki_ssize_t fd_read(struct task *t, int fd, void *ubuf, size_t count)
     }
     if (e->type == FD_TYPE_PIPE) {
         return pipe_read(e, ubuf, count);
+    }
+    if (e->type == FD_TYPE_SOCKET) {
+        return net_read(t, fd, ubuf, count);
     }
     if (e->type == FD_TYPE_DIR) {
         return -SUKI_EISDIR;
@@ -939,6 +961,10 @@ suki_ssize_t fd_write(struct task *t, int fd, const void *ubuf, size_t count)
     }
     if ((e->flags & SUKI_O_ACCMODE) == SUKI_O_RDONLY) {
         return -SUKI_EBADF;
+    }
+
+    if (e->type == FD_TYPE_SOCKET) {
+        return net_write(t, fd, ubuf, count);
     }
 
     /* TTY：分批拷入内核再输出（红线：用户指针绝不直接交给输出路径） */

@@ -302,6 +302,22 @@ static uint64_t sys_port_claim(uint64_t port)
     return port_claim((uint32_t)port);
 }
 
+/* 17: sys_port_alloc —— 分配一个动态接收端口，供用户态 IPC 客户端作应答端口
+ * （SukiNative 网络/socket 原生 API 等需要临时 reply port 的场景）。
+ * 返回端口号（>0），失败返回 (uint64_t)-1。 */
+static uint64_t sys_port_alloc(void)
+{
+    uint32_t p = port_allocate(sched_current());
+    return p ? (uint64_t)p : (uint64_t)-1;
+}
+
+/* 18: sys_port_free —— 释放动态端口（a1=端口号）。 */
+static uint64_t sys_port_free(uint64_t port)
+{
+    port_free((uint32_t)port);
+    return 0;
+}
+
 /* 8: sys_execve / 1: sys_task_spawn —— ELF 加载（替换自身 或 新建子任务） */
 #define EXEC_PATH_MAX   256
 #define EXEC_ARG_MAX    ELF_ARG_MAX   /* 与 elf_build_stack 容量共享同一常量（H1） */
@@ -974,10 +990,13 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
      * 信号边界已统一在 posix_dispatch 返回路径经 sig_deliver_check 处理（含默认
      * 终止），不再需要中途的 pending_kill 检查。 */
 
-    /* SukiNative 原生对象 API：号位 130..199 一律经 sys_suki_dispatch 路由；
-     * 当前未实现的具体号返回 -ENOSYS（网络 socket 号已重定位到 150..，同样暂未实现）。 */
-    if (num >= 130 && num <= 199) {
+    /* SukiNative 原生对象 API：130..149 路由到 sys_suki_dispatch；
+     * 网络 socket 子系统：150..199 路由到 sys_net_dispatch（转发 NS_PORT）。 */
+    if (num >= 130 && num <= 149) {
         return sys_suki_dispatch(num, a1, a2, a3, a4, a5, a6);
+    }
+    if (num >= 150 && num <= 199) {
+        return sys_net_dispatch(num, a1, a2, a3, a4, a5, a6);
     }
 
     switch (num) {
@@ -1006,6 +1025,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_CONSOLE_READ:    return sys_console_read(a1, a2);
     case SYS_DISPLAY_BLIT:    return sys_display_blit(a1, a2, a3, a4, a5);
     case SYS_OOL_UNMAP:       return ipc_ool_unmap_user(a1);
+    case SYS_PORT_ALLOC:      return sys_port_alloc();
+    case SYS_PORT_FREE:       return sys_port_free(a1);
     /* 线程创建（pthread 基座）：在 shared 地址空间内造新 task，跳入 trampoline。 */
     case SYS_CLONE:           return sys_clone(a1, a2, a3, a4, a5, a6);
     default: {

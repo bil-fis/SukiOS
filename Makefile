@@ -130,7 +130,7 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -197,7 +197,7 @@ USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.ssvc.blob.o,$(USER_PROGS))
 #   * 可使用浮点 / SSE（minimp3 MP3 解码依赖），故启用 -msse2 且去掉
 #     -mgeneral-regs-only（内核 switch.S 已 fxsave/fxrstor 保存 Ring3 SSE 上下文）。
 #   * -Os 优先缩小体积，以适配内核 execve 单条 OOL(16 页=64KiB) 的加载上限。
-APP_PROGS    := hello playaudio audiotest bmploader
+APP_PROGS    := hello playaudio audiotest bmploader nettest
 APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -mno-red-zone -msse -msse2 \
                 -ffunction-sections -fdata-sections \
@@ -417,6 +417,12 @@ $(BUILD)/user/net_server.elf: $(BUILD)/user/net_server.c.o $(USER_LIB_OBJS) $(LW
 		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
 		-o $@ $(BUILD)/user/net_server.c.o $(USER_LIB_OBJS) $(LWIP_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
+
+# nettest（网络端到端验证）源码位于 user/apps/，单独给出 .c.o 规则；其 .elf 走
+# 通用 $(BUILD)/user/%.elf 规则（链接 USER_LIB_OBJS，含 suki_native 的 suki_socket_*）。
+$(BUILD)/user/nettest.c.o: user/apps/nettest.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 # 把 ELF 文件作为原始字节流嵌入内核镜像（objcopy -I binary 生成
 # _binary_build_user_<name>_elf_start/end 符号），并重命名为

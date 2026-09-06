@@ -649,7 +649,13 @@ static void test_system(void)
 
     /* ---- 语义性 ENOSYS：网络与 futex ---- */
     int64_t sk = suki_syscall3(SYS_SOCKET, SUKI_AF_INET, SUKI_SOCK_STREAM, 0);
-    ck("socket returns -ENOSYS (stack not yet)", sk == -SUKI_ENOSYS);
+    /* 网络栈现已实现：socket() 应返回合法 fd (>=0) 而非 -ENOSYS。真正的收发由
+     * nettest 端到端验证（kmain 开机自检 spawn，详见 results/step65.md）。 */
+    ck("socket implemented (returns fd >= 0)", sk >= 0);
+    if (sk >= 0) {
+        int64_t cl = suki_syscall1(SYS_CLOSE, (uint64_t)sk);
+        (void)cl;
+    }
     int64_t fx = suki_syscall3(SYS_FUTEX, 0, 0, 0);
     /* futex 现已实现：对 NULL uaddr 的等待应返回 -EFAULT（而非 -ENOSYS 未实现）。 */
     ck("futex implemented (rejects NULL uaddr)", fx == -SUKI_EFAULT);

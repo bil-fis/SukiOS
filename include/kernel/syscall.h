@@ -83,6 +83,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
 uint64_t sys_suki_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6);
 
+/* 网络 socket 子系统（150..199）：内核经 NS_PORT 转发到 net_server（lwIP）。
+ * 实现见 kernel/net/socket.c。 */
+uint64_t sys_net_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6);
+
 /* POSIX 子系统初始化（fd 表等）。kmain 在 syscall_init 之后调用。 */
 void posix_init(void);
 

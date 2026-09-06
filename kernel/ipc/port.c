@@ -780,6 +780,12 @@ uint64_t sys_mach_msg(uint64_t msg_uptr, uint64_t option,
                         (unsigned)port, (unsigned)m->size);
                 break;
             }
+            /* M8：非阻塞接收——队列空且无 waiter 时立即返回超时（不阻塞）。
+             * 供 net_server 在不阻塞帧接收的前提下轮询 NS_PORT。 */
+            if (option & MACH_RCV_NONBLOCK) {
+                spin_unlock_irqrestore(&g_port_lock, f);
+                return MACH_RCV_TIMED_OUT;
+            }
             port_wait_enqueue(p);
             /* double-check：注册 waiter 后再查队列，避免 SMP 下发送方在注册前
              * 入队导致的丢失唤醒（与 enqueue 同持 g_port_lock 构成原子协议） */

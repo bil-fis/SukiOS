@@ -23,6 +23,7 @@
 /* ---- mach_msg ABI（与 include/ipc/port.h 一致） ---- */
 #define MACH_SEND_MSG   0x1
 #define MACH_RECV_MSG   0x2
+#define MACH_RCV_NONBLOCK 0x4   /* 队列空时立即返回 MACH_RCV_TIMED_OUT（net_server 轮询 NS_PORT 用） */
 #define MACH_MSG_SUCCESS 0
 #define MACH_MSGH_BITS_OOL (1U << 31)
 
@@ -30,6 +31,7 @@
 #define FS_PORT         2
 /* 网络服务端口：11（注意不能占用 3 —— DISPLAY_PORT=3 已被显示服务使用） */
 #define NET_PORT        11
+#define NS_PORT         13              /* net_server 对外暴露的 socket 服务端口 */
 #define DISPLAY_PORT    3
 #define INPUT_PORT      4
 #define CONSOLE_PORT    5
@@ -280,6 +282,14 @@ static inline uint64_t mach_msg_recv(void *buf, uint32_t limit, uint32_t port)
 {
     return suki_syscall5(SYS_MACH_MSG, (uint64_t)buf, MACH_RECV_MSG,
                          0, limit, port);
+}
+
+/* 非阻塞接收：队列为空立即返回 MACH_RCV_TIMED_OUT（见 port.h MACH_RCV_NONBLOCK）。
+ * 供 net_server 主循环轮询 NS_PORT 而不阻塞帧接收。 */
+static inline uint64_t mach_msg_tryrecv(void *buf, uint32_t limit, uint32_t port)
+{
+    return suki_syscall5(SYS_MACH_MSG, (uint64_t)buf,
+                         MACH_RECV_MSG | MACH_RCV_NONBLOCK, 0, limit, port);
 }
 
 /* 释放经 mach_msg_recv 收到的 OOL 接收窗口（消费完 OOL 数据后必须调用，否则

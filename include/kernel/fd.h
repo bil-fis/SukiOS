@@ -46,6 +46,7 @@ struct task;
 #define FD_TYPE_DIR    2    /* 目录流（后端 = FS_SERVER 目录句柄） */
 #define FD_TYPE_TTY    3    /* 控制台（内核本地实现） */
 #define FD_TYPE_PIPE   4    /* 管道（内核本地环形缓冲） */
+#define FD_TYPE_SOCKET 5    /* 网络 socket（后端 = net_server 分配的 sock handle） */
 
 /* fd 后端（与 VFS 后端一一对应）。open 时由 VFS 路由确定；
  * read/write/lseek/fstat/close 据此分派到 FS_PORT 或内核内建后端。 */

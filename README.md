@@ -54,22 +54,21 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 | 启动协议 | Multiboot2（GRUB）/ PVH（qemu `-kernel`） |
 | 固件 | Legacy BIOS（SeaBIOS）与 UEFI（OVMF）双支持 |
 
-**系统调用表（已实现）：**
+**系统调用表（号位分区，详见 `include/sukios/posix.h` 与 `kernel/syscall/syscall.c`）：**
 
-| 号 | 名称 | 说明 |
+| 号段 | 类别 | 代表性调用（编号） |
 |---|---|---|
-| 0 | `sys_mach_msg` | Mach 风格 IPC 收发 |
-| 1 | `sys_task_create` / `sys_task_spawn` | 创建 / 派生用户态任务 |
-| 2 | `sys_task_exit` | 任务退出 |
-| 3 | `sys_yield` | 主动让出 CPU |
-| 4 | `SYS_DEBUG_WRITE` | 调试输出（经 `copy_from_user` 校验） |
-| 5 | `SYS_INPUT_READ` | 非阻塞取原始键盘扫描码 |
-| 6 | `SYS_REBOOT` | 重启 / ACPI S5 关机 |
-| 7 | `SYS_PORT_CLAIM` | 用户态认领端口接收权（IPC 能力） |
-| 8 | `SYS_EXECVE` | 加载并执行 ELF 映像 |
-| 9 | `SYS_CHDIR` | 改变进程工作目录 |
-| 100~203 | POSIX 层 | `open/read/write/close/lseek/stat/mkdir/rename/unlink` 等完整 POSIX ABI（见 `kernel/syscall/sys_posix.c`） |
-| 204 | `SYS_MOUSE_READ` | 非阻塞取内核 IRQ12 采集的鼠标事件（Ring3 鼠标驱动用） |
+| 0–19 | SukiOS / Mach 原生 | `sys_mach_msg`(0) `sys_task_spawn`(1) `sys_task_exit`(2) `sys_yield`(3) `SYS_DEBUG_WRITE`(4) `SYS_INPUT_READ`(5) `SYS_REBOOT`(6) `SYS_PORT_CLAIM`(7) `SYS_EXECVE`(8) `SYS_WAIT`(9) `SYS_AUDIO_*`(10–13) `SYS_MMAP_LEGACY`(14) `SYS_MUNMAP_LEGACY`(15) `SYS_SERIAL_READ`(16) `SYS_FORK`(17) `SYS_GETPID`(18) `SYS_GETPPID`(19) |
+| 20–39 | 进程 / 调度 / 资源（POSIX） | `waitpid`(20) `kill`(21) `getuid/getgid`(22–27) `brk/sbrk`(28–29) `times`(30) `umask`(31) `gettid`(32) `exit_group`(33) `arch_prctl`(35) `futex`(36) `getrlimit/setrlimit`(37–38) `getrusage`(39) |
+| 40–89 | 文件与目录 I/O（POSIX） | `open/close/read/write/lseek`(40–44) `stat/fstat/lstat`(45–47) `unlink/mkdir/rmdir`(48–50) `opendir/readdir/closedir`(51–53) `dup/dup2`(54–55) `fcntl`(56) `access`(57) `rename`(58) `truncate`(59–60) `chdir/getcwd`(61–62) `pipe`(63) `ioctl`(64) `link/symlink/readlink`(65–67) `chmod/fchmod`(68–69) `sync/fsync`(70–71) `utimes`(72) `getdents`(73) `statfs`(75–76) `pread/pwrite`(77–78) `readv/writev`(79–80) `select/poll`(81–82) `realpath`(83) `mknod`(84) `chown/fchown`(85–86) `telldir/seekdir`(87–88) `fpathconf`(89) |
+| 90–99 | 内存映射（POSIX） | `mmap`(90) `munmap`(91) `mprotect`(92) `msync`(93) `madvise`(94) `mincore`(95) `mremap`(96) `SYS_PORT_ALLOC`(97) `SYS_PORT_FREE`(98) |
+| 100–109 | 时间（POSIX） | `clock_gettime`(100) `clock_settime`(101) `clock_getres`(102) `gettimeofday`(103) `nanosleep`(104) `time`(105) `settimeofday`(106) `alarm`(107) `getitimer/setitimer`(108–109) |
+| 110–129 | 系统信息 / 动态链接 / IPC | `uname`(110) `sysinfo`(111) `getrandom`(112) `sysconf`(113) `prctl`(114) `gethostname/sethostname`(115–116) `getpgrp/setpgrp`(117–118) `getsid`(119) `nice`(120) `getpriority/setpriority`(121–122) `SYS_OOL_UNMAP`(125) `SYS_DL_OPEN`(126) `SYS_DL_SYM`(127) `SYS_DL_CLOSE`(128) `SYS_DL_ERROR`(129) |
+| 130–149 | **SukiNative 原生对象 API** | `OBJ_CREATE/DESTROY/DUPLICATE/QUERY`(130–133) `WAIT`(134) `EVENT_CREATE/SET/RESET`(135–137) `MUTEX_CREATE/LOCK/UNLOCK`(138–140) `SEM_CREATE/ACQUIRE/RELEASE`(141–143) **已实现**；`FILE_*`(144–147) `PROC_CREATE`(148) `MEM_ALLOC`(149) 预留（返回 `-ENOSYS`，Phase 2） |
+| 150–199 | **网络 socket 子系统** | `socket`(150) `bind`(151) `connect`(152) `listen`(153) `accept`(154) `sendto/recvfrom`(155–156) `sendmsg/recvmsg`(157–158) `shutdown`(159) `setsockopt/getsockopt`(160–161) `getpeername/getsockname`(162–163) `socketpair`(164) `send/recv`(165–166) …（其余预留）。内核仅把调用翻译成 NS_PORT 的 IPC 消息，由 `net_server`（lwIP）执行，**不解析任何网络协议** |
+| 200– | 内核扩展 | `SYS_FRAMEBUFFER_MAP`(200) `SYS_DISPLAY_READY`(201) `SYS_CONSOLE_READ`(202) `SYS_DISPLAY_BLIT`(203) `SYS_MOUSE_READ`(204) `SYS_CLONE`(205) `SYS_SIGACTION`(206) `SYS_SIGRETURN`(207) `SYS_SIGPROCMASK`(208) `SYS_TKILL`(209) `SYS_RAISE`(210) |
+
+> 调用约定统一为 System V AMD64：`%rax`=号，`%rdi/%rsi/%rdx/%r10/%r8/%r9`=参数，返回值 `%rax`（失败为 `-errno`）。所有来自用户态的指针必须经 `copy_from_user` / `copy_to_user` 访问（项目强制规则）。POSIX 层（20–129）对外行为兼容 Linux/Unix，老程序（Servo 等只调 20–129）不受影响；SukiNative（130–149）是新服务可直接使用的原生接口。
 
 ---
 
@@ -95,6 +94,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **任务模型**：`task_t` 支持内核 / 用户任务、idle、zombie 回收。
 - **调度器**：单一全局运行队列 + 每任务 `cpu` 占用标志（原子 CAS），杜绝双核同跑一任务竞态；RR 时间片抢占；`context_switch` 正确保存/恢复 callee-saved、切换 RSP/CR3、恢复 per-CPU GS。
 - **syscall / 中断上下文**：`syscall_entry.S` 与 `isr.S` 均按 OSDev SWAPGS 标准配对，消除 GS 翻转态跨任务丢失。
+- **线程与信号**：支持线程（`SYS_CLONE` 在共享地址空间造新任务跳入 trampoline，pthread 基座）+ 同步原语（`SYS_FUTEX` WAIT/WAKE，pthread 基础集）；基础信号框架（`SIGACTION` / `SIGRETURN` / `SIGPROCMASK` / `TKILL` / `RAISE`）已实现，`posixtest` 多线程用例验证通过。
 
 ### 2.4 IPC（Mach 风格）
 - 全局端口表 `kernel_port_t`；`mach_msg_send` / `mach_msg_recv`；发送/接收权能力检查（`port_claim`）。
@@ -105,6 +105,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **Intel HDA** 音频控制器（ICH6 兼容）输出编解码器。
 - **键盘**：PS/2 键盘经 I/O APIC 投递（`input_server` 经 `SYS_INPUT_READ` 取扫描码）。
 - **鼠标**：PS/2 鼠标经 IRQ12（IOAPIC GSI12）采集 3/4 字节包，内核侧解析后经 `SYS_MOUSE_READ` 派发；Ring3 `mouse_server` 拉包并经 `DISPLAY_PORT` 发光标事件。
+- **网络（Intel 82540EM / e1000）**：Ring0 裸驱动（`kernel/drivers/e1000.c`），经 PCI class `0x02/subclass 0x00` 探测，DMA + 中断收发以太网帧，**只做帧搬运、不解析 IP/TCP/UDP**；原始帧经 `NET_PORT` IPC 交给用户态 `net_server`（lwIP 2.2.1）处理。启动自检会发 ARP 请求并收到 QEMU user 后端（网关 `10.0.2.2` / DNS `10.0.2.3`）应答，端到端验证 TX/RX 通路；`nettest` 开机自检进一步验证 socket 通路。
 - **PCI**：ECAM（MCFG）探测，缺失时 PIO 回退；`_PRT` 路由、MSI 编程。
 - **ACPI**：RSDP/XSDT/MADT/HPET/MCFG 解析；LAPIC / IOAPIC 取代 8259 PIC + PIT；TSC 校准。
 - **RTC**：`kernel/time/rtc.c` 读取 CMOS 实时时钟。
@@ -113,12 +114,20 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **disk-srv**（内核线程）：响应 `DISK_PORT`，真实扇区读写。
 - **fs-server**：用 **FatFs（ChaN R0.16）** 做 FAT32 解析；支持 create/write/append/read_at/read_file（OOL）/mkdir/rename/truncate/unlink/list，LFN 正确，整条路径经真实磁盘 IO 自检（self-test ALL PASS）。
 - **input-server**：转发键盘输入。
-- **display-server**：**已实现**。独占帧缓冲、栅格化终端文本（内嵌 8x8 字体）、绘制鼠标光标（像素快照法）；内核经 `SYS_DISPLAY_READY`/IPC 转发控制台输出避免覆盖桌面。后续界面字体将采用 `ResourceHanRoundedCN-Medium.ttf`。
+- **display-server**：独占帧缓冲、栅格化终端文本（内嵌 8x8 字体）、绘制鼠标光标（像素快照法）；内核经 `SYS_DISPLAY_READY`/IPC 转发控制台输出避免覆盖桌面。界面字体经 `fontsrv`（FreeType）渲染。
 - **mouse-server**：Ring3 鼠标驱动（`.kdr` 形态，临时内嵌 spawn），经 `SYS_MOUSE_READ` 拉包、累计坐标、发光标事件到 display-server。
+- **net-server**：网络服务（`user/net_server.c`）。作为 `NET_PORT` 客户端收发原始帧（交给 Ring0 e1000 驱动），并作为 `NS_PORT` 服务端用 **lwIP 2.2.1**（raw API，`NO_SYS=1`）实现 TCP/IP 协议栈与 DHCP；内核 150–166 socket syscall 经 IPC 转发到此。启动即自动获取 IP（QEMU user-net 网关 `10.0.2.2`），证明「e1000 → NET_PORT → lwIP」全链路打通。
+- **fontsrv**：字体服务（`user/fontsrv.c`）。加载 `ResourceHanRoundedCN-Medium.ttf`，经 FreeType 光栅化字形位图，经 `FONT_PORT` IPC 提供给 display-server / `pchfnt` 等程序绘制到帧缓冲。
 - **shell**：bash 风格交互式命令行。已实现：历史记录（**内存环形缓冲，最多 100 条，超出丢弃最旧，不落盘**；↑/↓ 滚动）、**Tab 文件名补全**（唯一匹配直接补全、目录补 `/`、多匹配补公共前缀并列出候选）、**行内光标编辑**（←/→ 移动光标、Home/End 跳行首行尾、Backspace 删前、Delete 删后、Enter 提交）、管道 `|` 与重定向 `>`、`$VAR`/`$?` 变量展开、内建命令（`help`/`echo`/`cat`/`ls`/`cd`/`pwd`/`mkdir`/`touch`/`rm`/`write`/`date`/`whoami`/`ps`/`ports`/`portclaim`/`exec`/`spawn`/`clear`/`reboot`）。方向键由 input_server 把 PS/2 扫描码（e0 前缀）编码为 ANSI 转义序列送达。
 - **BMP 加载器**（`user/apps/bmploader.c`）：流式读取 BMP 并经内核 `SYS_DISPLAY_BLIT` 通道 blit 到帧缓冲。
-- **独立用户程序**（FAT32 磁盘 `::BIN/`）：`hello`、`playaudio`（minimp3 MP3 解码）、`audiotest`。
-- **posixtest**：POSIX 系统调用层自检程序。
+
+**开机自检程序**（随内核启动自动运行，输出经串口落盘，验证各子系统；其中 `RUSTHELLO` 经 `weak` 符号引用，对应 blob 缺失则跳过，其余恒随构建运行）：
+- **posixtest**：POSIX 系统调用层一致性测试，含 `pthread`/`clone`/`futex` 多线程用例。
+- **nettest**：socket 冒烟测试，验证 `net_server` 通路（ARP/DHCP/TCP 端到端）。
+- **dltest**：动态链接端到端验证（DT_NEEDED 自动加载 + 运行期 `dlopen`/`dlsym`/`dlclose` + COPY 重定位 + 槽位回收）。
+- **RUSTHELLO**：Rust 程序（详见 §2.10），打印 `hello from rust on SukiOS` 后退出。
+
+**独立用户程序**（FAT32 磁盘 `::BIN/`）：`hello`、`playaudio`（minimp3 MP3 解码）、`audiotest`、`pchfnt`（TTF 字形渲染，经 `fontsrv`）。
 
 ### 2.7 VFS 路由层
 - 内核 `vfs.c` 做最长前缀挂载解析：`/`→DISK（FAT32）、`/tmp`+`/run`→TMPFS、`/dev`→DEVFS。
@@ -142,20 +151,26 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **磁盘路径**：`make disk` 会（在 rust 二进制存在时）把它拷入 FAT32 磁盘 `::BIN/RUSTHELLO.SKA`，可在 shell 里 `exec BIN/rusthello` 经真实「从磁盘 exec」路径运行。
 - 当前 Rust 支持为 **`#![no_std]` + 自定义 bare-metal 目标 + 经 FFI 复用 `libsuki.a`**；Rust `std` 库（Servo 前置）尚未移植（见 §3）。
 
+### 2.11 动态链接与共享库（`.sl`）
+- **内核加载器 `ld.suki`**：ELF 加载（execve / spawn）时解析 `DT_NEEDED`，自动映射并基址重定位依赖的共享库；运行期 `dlopen` / `dlsym` / `dlclose` / `dlerror` 经系统调用 **126–129** 完全由内核完成符号解析与页表映射（用户指针一律 `copy_from_user` / `copy_to_user`）。
+- **共享库形态**：`.sl`（ELF 共享对象），例：`libtest.sl`（`user/libs/libtest.c`），置于 `/LIB/`，由内核在加载期或运行期映射到进程地址空间。
+- **libdl 封装**：用户态 `user/lib/dlfcn.c` 提供标准 `dlopen` / `dlsym` / `dlclose` / `dlerror` 接口（忽略 flags，当前仅立即绑定语义）。
+- **验证**：`dltest`（`user/apps/dltest.c`）开机自检覆盖 ① 加载期 `DT_NEEDED` 依赖自动加载与 `R_X86_64_COPY` 拷贝重定位；② 同名库 `dlopen` 去重；③ 纯运行期 `dlopen` + `dlclose` 真正回收物理页；④ 槽位复用。
+
 ---
 
 ## 3. 尚未实现 / 早期
 
 > 以下为当前明确**未实现 / 早期**的部分，列出以避免误用。
 
-- **网络栈**：完全未实现。无 virtio-net / Intel 网卡驱动，无 TCP/IP、UDP、socket。
+- **网络子系统（早期但已打通）**：Ring0 **e1000 驱动 + 用户态 `net_server`（lwIP 2.2.1，raw API）** 已打通「e1000 → `NET_PORT` → lwIP」全链路，DHCP 自动获取 IP，内核 **150–166** socket syscall 经 `NS_PORT` 转发；`nettest` 开机自检验证通路。仍属早期：非阻塞 / 异步语义、连接状态精细管理、DNS 客户端应用、多网卡 / 多协议栈、virtio-net 等仍在完善；当前仅验证 QEMU `user` 后端（`10.0.2.2` 网关 / `10.0.2.3` DNS）。
 - **真正的 GUI 应用框架**：已有 display-server 基础（终端栅格化 + 光标），但**无窗口系统 / 合成器 / 应用离屏 Buffer 合成管线**；TTF 字形渲染已接入：由 `fontsrv` 字体服务加载 FreeType 渲染字形位图，经 IPC 供 `pchfnt` 等程序绘制到帧缓冲（详见 `results/step53.md`）。
 - **存储**：仅 FAT32 经 FatFs；无 ext2/3/4、exFAT、NTFS、ISO9660（除引导 ISO 外）。
 - **多文件系统 / 多磁盘 / GPT**：仅识别首个磁盘首分区 FAT32。
-- **完整 POSIX 语义**：无 fork（仅有 spawn/execve 模型）、无信号、无 pthread、无 swap、无 huge page、无 NUMA。
+- **完整 POSIX 语义（部分已实现）**：传统 `fork` / `clone` / 线程（`pthread` 基座）/ `futex` / **信号框架**（`SIGACTION` / `SIGRETURN` / `SIGPROCMASK` / `TKILL` / `RAISE`）已落地，并由 `posixtest` 多线程用例验证；仍缺：swap / huge page / NUMA，以及作业控制、会话 / 进程组精细语义、完整信号投递集等高级 POSIX 语义。
 - **电源管理**：仅重启与 ACPI S5 关机；无睡眠 / 休眠 / 调频。
 - **用户态隔离强化**：进程间靠端口能力粗粒度隔离，无完整能力 / 沙箱模型（无 seccomp 类机制）。
-- **kdr 动态加载器**：`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现；当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
+- **`.kdr` 内核模块加载器（未实现）**：**用户态共享库动态链接已实现**（`.sl` + 内核 `ld.suki` + syscall 126–129 + `dltest` 自检，见 §2.11）；但 **`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现**，当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
 - **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
@@ -195,13 +210,20 @@ make disk
 常用变体：
 
 ```bash
-make all              # 仅编译内核 ELF
-make run              # 图形窗口运行（推荐人工交互测试 shell / 鼠标 / 音频）
-make run-headless    # 无头运行，仅串口（自动化验证用）
-make run-ahci        # 磁盘挂 AHCI（DMA+中断）验证
-make run-uefi        # OVMF UEFI 启动验证
-make run-q           # PVH 直启（qemu -kernel，不经 GRUB）
-make info            # 打印当前工具链/对象信息
+make all                  # 仅编译内核 ELF
+make run                  # 图形窗口运行（推荐人工交互测试 shell / 鼠标 / 音频）
+make run-headless         # 无头运行，仅串口（自动化验证用）
+make run-dbg              # 带内核串口详细诊断（DBG=1，verbose 日志）
+make run-ahci             # 磁盘挂 AHCI（DMA+中断）验证
+make run-ahci-headless    # AHCI + 无头
+make run-uefi             # OVMF UEFI 启动验证
+make run-uefi-headless    # UEFI + 无头
+make run-q                # PVH 直启（qemu -kernel，不经 GRUB）
+make run-q-debug          # PVH 直启 + 详细诊断
+make debug                # 等价于 run-dbg（别名）
+make info                 # 打印当前工具链/对象信息
+make gcc                  # 从源码构建 x86_64-sukios 交叉工具链（Binutils+GCC，见 cross/）
+make rust-libs            # 仅重建 libsuki.a 运行时归档
 ```
 
 #### Rust 程序开发（可选，步骤见 `results/step69.md`）
@@ -263,31 +285,41 @@ SukiOS/
 │   ├── mm/                # PMM / VMM / kmalloc / vma
 │   ├── sched/             # 调度器（sched.c）、上下文切换（switch.S）
 │   ├── ipc/               # Mach 端口与 mach_msg
-│   ├── syscall/           # 系统调用分发（syscall.c）+ POSIX 层（sys_posix.c）
+│   ├── syscall/           # 系统调用分发（syscall.c）+ POSIX 层（sys_posix.c）+ SukiNative（sys_suki.c）+ 信号（signal.c）
 │   ├── acpi/              # ACPI 解析、LAPIC/IOAPIC、HPET、PCI
 │   ├── fs/                # vfs.c / tmpfs.c / devfs.c / fd.c 路由层
-│   ├── drivers/           # Ring0 裸驱动：ata.c、ahci.c、hda.c、keyboard.c
+│   ├── drivers/           # Ring0 裸驱动：ata.c、ahci.c、e1000.c、hda.c、pci.c（键盘/鼠标在 arch/x86_64/）
 │   ├── time/              # rtc.c（CMOS 实时时钟）
-│   ├── elf/               # ELF64 加载（execve 用）
+│   ├── elf/               # ELF64 加载 + 动态链接（execve / DT_NEEDED / dlopen，ld.suki）
 │   ├── abilities/         # 用户态能力库（miniz 压缩，依赖 libc，不入内核）
-│   ├── kmain.c            # 内核 C 主入口
-│   └── gdbstub.c          # 串口 GDB 远程调试 stub
+│   ├── kmain.c            # 内核 C 主入口（拉起 disk-srv 与全部 Ring3 服务 / 自检）
+│   └── gdbstub.c          # 串口 GDB 远程调试 stub（注：项目调试以 QEMU 自带机制为主，GDB 交互非推荐路径）
 ├── user/                  # Ring3 服务与程序（C，freestanding）
 │   ├── fs_server.c        # FAT32 服务（FatFs + DISK_PORT）
 │   ├── input_server.c     # 键盘输入服务
 │   ├── display_server.c   # 显示合成服务（帧缓冲独占 + 终端栅格化 + 光标）
 │   ├── mouse_server.c     # 鼠标驱动（Ring3 .kdr 形态）
+│   ├── net_server.c       # 网络服务（lwIP 2.2.1，NET_PORT/NS_PORT）
+│   ├── fontsrv.c          # 字体服务（FreeType，FONT_PORT）
 │   ├── shell.c            # 交互 shell
-│   ├── apps/              # 独立程序：hello / playaudio / audiotest / bmploader
-│   └── lib/               # 用户态 freestanding 桩：crt0 / suki.c / libc / suki.h
+│   ├── apps/              # 独立程序：hello / playaudio / audiotest / bmploader / pchfnt / nettest / dltest
+│   ├── libs/              # 共享库示例（libtest.sl 等，动态链接验证）
+│   └── lib/               # 用户态 freestanding 桩：crt0 / suki.c / libc / pthread / dlfcn / suki.h
 ├── drivers/FatFs/         # ChaN FatFs R0.16
 ├── minimp3/               # minimp3 解码库（CC0，playaudio 用）
 ├── resources/             # ResourceHanRoundedCN-Medium.ttf（界面字体，OFL-1.1）
+├── lib/                   # 第三方库（vendor，随仓库分发）
+│   ├── freetype-2.14.3/   # FreeType 字体光栅化引擎（FTL，fontsrv 用）
+│   └── lwip-2.2.1/        # lwIP TCP/IP 协议栈（BSD-2-Clause，net_server 用）
 ├── include/               # 内核 / 用户态公共头
 ├── grub/                  # grub.cfg（ISO 引导配置）
 ├── tools/                 # gen_relk.py（KASLR 重定位）等
 ├── results/               # 阶段性实现文档（stepNN.md）
 ├── osdev_wiki/            # OSDev 维基离线副本（实现参考）
+├── rust/                  # Rust 工具链示例工程（make make-rust-env 生成规格/归档，源码入库）
+├── SukiNative API 完整系统接口规范.md   # SukiNative 130–149 对象 API 规范
+├── SukiOS 全栈技术参考手册.md           # 全栈技术参考
+├── SukiOS 混合风格权限提升设计文档.md   # 权限/能力设计
 ├── build/                 # 构建产物（被 .gitignore 忽略）
 ├── Makefile
 ├── NOTICE                 # 第三方库版权与许可证
@@ -370,6 +402,7 @@ tail -8 /tmp/sukios.log
 - **Rich Geldreich / RAD Game Tools / Valve** —— miniz（zlib 风格许可）。
 - **Cyano Hao** —— Resource Han Rounded（资源圆体，OFL-1.1），界面字体。
 - **FreeType Project** —— FreeType 字体光栅化引擎（FTL 许可），`lib/freetype-2.14.3/`，驱动 TTF 字形渲染。
+- **lwIP（Adam Dunkels / Simon Goldschmidt 等）** —— lwIP 轻量级 TCP/IP 协议栈（BSD-2-Clause），`lib/lwip-2.2.1/`，驱动 `net_server` 网络能力。
 - **newlib 贡献者**（Red Hat、UC Berkeley 等）—— freestanding 用户态实现参考。
 - **GRUB / SeaBIOS / OVMF / QEMU** —— 可引导固件与验证环境。
 - **CodeBuddy** —— 代码生成与调试支持。
@@ -393,6 +426,7 @@ tail -8 /tmp/sukios.log
 | newlib（参考，不入库） | `lib/newlib-4.6.0.20260123/` | BSD 风格（Red Hat / UC Berkeley 等） |
 | FatFs | `drivers/FatFs/` | 1-clause BSD 风格（ChaN） |
 | Resource Han Rounded | `resources/ResourceHanRoundedCN-Medium.ttf` | SIL OFL-1.1（Cyano Hao） |
+| lwIP | `lib/lwip-2.2.1/` | BSD-2-Clause（Adam Dunkels 等） |
 | Rust 工具链（rustup / rustc / cargo） | 本地安装（不随仓库分发） | MIT OR Apache-2.0（Rust Project Developers） |
 
 ---

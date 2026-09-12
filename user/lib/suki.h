@@ -127,13 +127,13 @@ static inline uint64_t suki_syscall6(uint64_t n, uint64_t a1, uint64_t a2,
 }
 
 /* P0-R8：ACPI S5 软关机（SYS_REBOOT mode=1）。 */
-static inline void suki_poweroff(void)
+static inline void SukiPoweroff(void)
 {
     suki_syscall5(SYS_REBOOT, 1, 0, 0, 0, 0);
 }
 
 /* 重启（SYS_REBOOT mode=0）。 */
-static inline void suki_reboot(void)
+static inline void SukiReboot(void)
 {
     suki_syscall5(SYS_REBOOT, 0, 0, 0, 0, 0);
 }
@@ -359,47 +359,47 @@ char  *u_utoa(uint64_t v, char *buf);           /* 兼容包装(=u_utoa_s(v,buf,
 typedef int64_t suki_status_t;
 
 /* 事件：init_signaled=初始是否已触发，manual_reset=手动复位(否则 wait 命中后自动消费) */
-suki_status_t suki_event_create(bool init_signaled, bool manual_reset, suki_handle_t *out);
-suki_status_t suki_event_set(suki_handle_t h);
-suki_status_t suki_event_reset(suki_handle_t h);
+suki_status_t SukiEventCreate(bool init_signaled, bool manual_reset, suki_handle_t *out);
+suki_status_t SukiEventSet(suki_handle_t h);
+suki_status_t SukiEventReset(suki_handle_t h);
 
-suki_status_t suki_mutex_create(suki_handle_t *out);
-suki_status_t suki_mutex_lock(suki_handle_t h);
-suki_status_t suki_mutex_unlock(suki_handle_t h);
+suki_status_t SukiMutexCreate(suki_handle_t *out);
+suki_status_t SukiMutexLock(suki_handle_t h);
+suki_status_t SukiMutexUnlock(suki_handle_t h);
 
 /* 信号量：initial/max 为初值与上限 */
-suki_status_t suki_sem_create(uint32_t initial, uint32_t max, suki_handle_t *out);
-suki_status_t suki_sem_acquire(suki_handle_t h);
-suki_status_t suki_sem_release(suki_handle_t h);
+suki_status_t SukiSemCreate(uint32_t initial, uint32_t max, suki_handle_t *out);
+suki_status_t SukiSemAcquire(suki_handle_t h);
+suki_status_t SukiSemRelease(suki_handle_t h);
 
 /* 多对象等待：handles[count] 句柄数组；flags=SUKI_WAIT_ANY/ALL/NO_BLOCK；
  * timeout_ms 暂未实现（0=无限等待）；命中写 *out_index。返回 0 命中，<0 错误。 */
-suki_status_t suki_wait(const suki_handle_t *handles, size_t count, uint32_t flags,
+suki_status_t SukiWait(const suki_handle_t *handles, size_t count, uint32_t flags,
                         uint64_t timeout_ms, size_t *out_index);
 
-suki_status_t suki_obj_destroy(suki_handle_t h);
-suki_status_t suki_obj_duplicate(suki_handle_t h, uint32_t rights, suki_handle_t *out);
-suki_status_t suki_obj_query(suki_handle_t h, suki_objinfo_t *info);
+suki_status_t SukiObjDestroy(suki_handle_t h);
+suki_status_t SukiObjDuplicate(suki_handle_t h, uint32_t rights, suki_handle_t *out);
+suki_status_t SukiObjQuery(suki_handle_t h, suki_objinfo_t *info);
 
 /* 通用工厂：type 为 suki_obj_type_t，a2/a3 类型相关（事件:init,manual；信号量:initial,max） */
-suki_status_t suki_obj_create(uint32_t type, uint64_t a2, uint64_t a3, suki_handle_t *out);
+suki_status_t SukiObjCreate(uint32_t type, uint64_t a2, uint64_t a3, suki_handle_t *out);
 
 /* ---- SukiNative 文件对象（144..147）---- */
 /* path 为用户态字符串；access 为 SUKI_O_* 标志（见 posix.h），写文件用
  * SUKI_O_CREAT|SUKI_O_RDWR|SUKI_O_TRUNC 等组合。out 返回文件句柄。 */
-suki_status_t suki_file_open(const char *path, uint32_t access, suki_handle_t *out);
-suki_status_t suki_file_read(suki_handle_t h, void *buf, size_t count, size_t *out_nread);
-suki_status_t suki_file_write(suki_handle_t h, const void *buf, size_t count, size_t *out_nwritten);
-suki_status_t suki_file_close(suki_handle_t h);
+suki_status_t SukiFileOpen(const char *path, uint32_t access, suki_handle_t *out);
+suki_status_t SukiFileRead(suki_handle_t h, void *buf, size_t count, size_t *out_nread);
+suki_status_t SukiFileWrite(suki_handle_t h, const void *buf, size_t count, size_t *out_nwritten);
+suki_status_t SukiFileClose(suki_handle_t h);
 
 /* ---- SukiNative 进程对象（148）---- */
 /* path 为程序路径；argv 为 const char*[] 用户数组（可为 NULL，argc=0）；
- * out 返回监控句柄，子进程退出后可由 suki_wait 命中（经内核退出通知）。 */
-suki_status_t suki_proc_create(const char *path, int argc, const char **argv, suki_handle_t *out);
+ * out 返回监控句柄，子进程退出后可由 SukiWait 命中（经内核退出通知）。 */
+suki_status_t SukiProcCreate(const char *path, int argc, const char **argv, suki_handle_t *out);
 
 /* ---- SukiNative 内存对象（149）---- */
 /* size 为请求字节数（内部页对齐）；out 返回句柄；映射用户地址经
- * suki_obj_query().base 取得，可直接读写（按需零填充，与 mmap 同机制）。 */
-suki_status_t suki_mem_alloc(uint64_t size, suki_handle_t *out);
+ * SukiObjQuery().base 取得，可直接读写（按需零填充，与 mmap 同机制）。 */
+suki_status_t SukiMemAlloc(uint64_t size, suki_handle_t *out);
 
 #endif /* _SUKI_USER_SUKI_H */

@@ -53,6 +53,7 @@ TYPE_NAME = {
     TYPE_BOOL: "bool", TYPE_STRING: "string", TYPE_BINARY: "binary",
     TYPE_LINK: "link",
 }
+TYPE_NAME_LIST = [TYPE_NAME[t] for t in sorted(TYPE_NAME.keys())]
 
 
 # ---------------------------------------------------------------------------
@@ -245,46 +246,38 @@ def GenDefaults(dest_dir: str):
 # ---------------------------------------------------------------------------
 def RunGui(path: str):
     import tkinter as tk
-    from tkinter import ttk, messagebox, simpledialog
+    from tkinter import ttk, messagebox, filedialog
 
-    hive = RegistryHive()
-    if os.path.exists(path):
+    root = tk.Tk()
+    root.geometry("820x520")
+
+    # 当前编辑会话状态：hive 为可变引用，path 记录当前文件（None 表示尚未关联文件）。
+    state = {"hive": RegistryHive(), "path": path or None}
+
+    # 尝试加载初始文件（若存在）
+    if path and os.path.exists(path):
         try:
-            hive.Load(path)
+            state["hive"].Load(path)
         except Exception as ex:  # noqa
             messagebox.showerror("加载失败", str(ex))
 
-    root = tk.Tk()
-    root.title("SukiOS Registry Editor — %s" % os.path.basename(path))
-    root.geometry("820x520")
-
-    pane = ttk.PanedWindow(root, orient="horizontal")
-    pane.pack(fill="both", expand=True)
-
-    tree = ttk.Treeview(pane)
-    pane.add(tree, weight=1)
-
-    right = ttk.Frame(pane)
-    pane.add(right, weight=2)
-
+    # ---- StringVar（必须在创建 Tk 根之后） ----
     type_var = tk.StringVar()
     val_var = tk.StringVar()
-    ttk.Label(right, text="键路径:").grid(row=0, column=0, sticky="w")
     path_var = tk.StringVar()
-    path_entry = ttk.Entry(right, textvariable=path_var, width=48)
-    path_entry.grid(row=0, column=1, sticky="we")
-    ttk.Label(right, text="类型:").grid(row=1, column=0, sticky="w")
-    type_combo = ttk.Combobox(right, textvariable=type_var,
-                               values=[TYPE_NAME[t] for t in TYPE_NAME], state="readonly", width=12)
-    type_combo.grid(row=1, column=1, sticky="w")
-    ttk.Label(right, text="值:").grid(row=2, column=0, sticky="w")
-    val_entry = ttk.Entry(right, textvariable=val_var, width=48)
-    val_entry.grid(row=2, column=1, sticky="we")
 
+    def UpdateTitle():
+        p = state["path"]
+        if p:
+            root.title("SukiOS Registry Editor — %s" % os.path.basename(p))
+        else:
+            root.title("SukiOS Registry Editor — (未命名)")
+
+    # ---- 回调：树/表单 ----
     def RefreshTree():
         tree.delete(*tree.get_children())
         root_node = tree.insert("", "end", text="<root>", open=True)
-        for k in hive.Keys():
+        for k in state["hive"].Keys():
             parts = k.strip("/").split("/")
             parent = root_node
             for i in range(len(parts)):
@@ -307,7 +300,7 @@ def RunGui(path: str):
         if not cur:
             return
         p = "/" + cur[0]
-        r = hive.GetValue(p)
+        r = state["hive"].GetValue(p)
         if r is None:
             return
         vtype, val, _ = r
@@ -315,39 +308,190 @@ def RunGui(path: str):
         type_var.set(TYPE_NAME[vtype])
         val_var.set(str(val))
 
-    tree.bind("<<TreeviewSelect>>", OnSelect)
+    def ClearForm():
+        path_var.set("")
+        type_var.set("")
+        val_var.set("")
 
-    def DoSave():
+    # ---- 回调：文件操作 ----
+    def LoadIntoState(p: str) -> bool:
+        h = RegistryHive()
+        try:
+            h.Load(p)
+        except Exception as ex:  # noqa
+            messagebox.showerror("加载失败", str(ex))
+            return False
+        state["hive"] = h
+        state["path"] = p
+        return True
+
+    def DoOpen():
+        p = filedialog.askopenfilename(
+            title="打开 SukiRegistry Hive",
+            filetypes=[("SukiRegistry Hive", "*.reg"),
+                       ("所有文件", "*.*")],
+        )
+        if not p:
+            return
+        if LoadIntoState(p):
+            RefreshTree()
+            ClearForm()
+            UpdateTitle()
+
+    def DoSaveFile():
+        p = state["path"]
+        if not p:
+            DoSaveAs()
+            return
+        try:
+            state["hive"].Save(p)
+        except Exception as ex:  # noqa
+            messagebox.showerror("保存失败", str(ex))
+            return
+        messagebox.showinfo("已保存", "写入 %s (generation=%d)" %
+                            (p, state["hive"].generation))
+
+    def DoSaveAs():
+        initial = os.path.basename(state["path"]) if state["path"] else "system.reg"
+        p = filedialog.asksaveasfilename(
+            title="另存为 SukiRegistry Hive",
+            defaultextension=".reg",
+            initialfile=initial,
+            filetypes=[("SukiRegistry Hive", "*.reg"),
+                       ("所有文件", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            state["hive"].Save(p)
+        except Exception as ex:  # noqa
+            messagebox.showerror("保存失败", str(ex))
+            return
+        state["path"] = p
+        UpdateTitle()
+        messagebox.showinfo("已保存", "写入 %s (generation=%d)" %
+                            (p, state["hive"].generation))
+
+    def DoExit():
+        root.destroy()
+
+    def DoAbout():
+        messagebox.showinfo(
+            "关于",
+            "SukiOS Registry Editor\n\n"
+            "SukiRegistry Hive 二进制格式外部编辑器（无签名版）\n"
+            "路径分隔符统一使用 Unix 风格 '/'",
+        )
+
+    # ---- 回调：键编辑 ----
+    def DoSaveEntry():
         p = path_var.get().strip()
+        if not p:
+            return
         if not p.startswith("/"):
             p = "/" + p
-        vt = [k for k, v in TYPE_NAME.items() if v == type_var.get()][0]
+        try:
+            vt = [k for k, v in TYPE_NAME.items() if v == type_var.get()][0]
+        except IndexError:
+            messagebox.showerror("错误", "请选择合法的类型")
+            return
         raw = val_var.get()
-        if vt == TYPE_INT64 or vt == TYPE_UINT64:
-            hive.SetValue(p, vt, int(raw))
-        elif vt == TYPE_BOOL:
-            hive.SetValue(p, vt, raw.strip().lower() in ("1", "true", "yes"))
-        else:
-            hive.SetValue(p, vt, raw)
-        hive.Save(path)
+        try:
+            if vt in (TYPE_INT64, TYPE_UINT64):
+                state["hive"].SetValue(p, vt, int(raw))
+            elif vt == TYPE_BOOL:
+                state["hive"].SetValue(
+                    p, vt, raw.strip().lower() in ("1", "true", "yes"))
+            else:
+                state["hive"].SetValue(p, vt, raw)
+        except PermissionError as ex:
+            messagebox.showerror("拒绝", str(ex))
+            return
+        except ValueError as ex:
+            messagebox.showerror("错误", "值无法解析: %s" % ex)
+            return
+        if state["path"]:
+            try:
+                state["hive"].Save(state["path"])
+            except Exception as ex:  # noqa
+                messagebox.showerror("保存失败", str(ex))
         RefreshTree()
-        messagebox.showinfo("已保存", "写入 %s (generation=%d)" % (path, hive.generation))
+        messagebox.showinfo("已保存", "写入 %s (generation=%d)" %
+                            (p, state["hive"].generation))
 
-    def DoDelete():
+    def DoDeleteEntry():
         p = path_var.get().strip()
+        if not p:
+            return
         if not p.startswith("/"):
             p = "/" + p
-        hive.DeleteValue(p)
-        hive.Save(path)
+        state["hive"].DeleteValue(p)
+        if state["path"]:
+            try:
+                state["hive"].Save(state["path"])
+            except Exception as ex:  # noqa
+                messagebox.showerror("保存失败", str(ex))
         RefreshTree()
+        ClearForm()
+
+    # ---- 布局 ----
+    pane = ttk.PanedWindow(root, orient="horizontal")
+    pane.pack(fill="both", expand=True)
+
+    tree = ttk.Treeview(pane)
+    pane.add(tree, weight=1)
+
+    right = ttk.Frame(pane)
+    pane.add(right, weight=2)
+
+    ttk.Label(right, text="键路径:").grid(row=0, column=0, sticky="w")
+    path_entry = ttk.Entry(right, textvariable=path_var, width=48)
+    path_entry.grid(row=0, column=1, sticky="we")
+    ttk.Label(right, text="类型:").grid(row=1, column=0, sticky="w")
+    type_combo = ttk.Combobox(right, textvariable=type_var,
+                              values=TYPE_NAME_LIST,
+                              state="readonly", width=12)
+    type_combo.grid(row=1, column=1, sticky="w")
+    ttk.Label(right, text="值:").grid(row=2, column=0, sticky="w")
+    val_entry = ttk.Entry(right, textvariable=val_var, width=48)
+    val_entry.grid(row=2, column=1, sticky="we")
+
+    right.columnconfigure(1, weight=1)
 
     btn = ttk.Frame(right)
     btn.grid(row=3, column=0, columnspan=2, pady=8)
-    ttk.Button(btn, text="保存", command=DoSave).pack(side="left", padx=4)
-    ttk.Button(btn, text="删除", command=DoDelete).pack(side="left", padx=4)
-    ttk.Button(btn, text="另存为默认", command=lambda: (hive.Save(path),
-                 messagebox.showinfo("ok", "已写回 %s" % path))).pack(side="left", padx=4)
+    ttk.Button(btn, text="保存键", command=DoSaveEntry).pack(side="left", padx=4)
+    ttk.Button(btn, text="删除键", command=DoDeleteEntry).pack(side="left", padx=4)
 
+    tree.bind("<<TreeviewSelect>>", OnSelect)
+
+    # ---- 菜单栏 ----
+    menubar = tk.Menu(root)
+
+    file_menu = tk.Menu(menubar, tearoff=0)
+    file_menu.add_command(label="打开...", accelerator="Ctrl+O", command=DoOpen)
+    file_menu.add_separator()
+    file_menu.add_command(label="保存", accelerator="Ctrl+S", command=DoSaveFile)
+    file_menu.add_command(label="另存为...", accelerator="Ctrl+Shift+S",
+                          command=DoSaveAs)
+    file_menu.add_separator()
+    file_menu.add_command(label="退出", accelerator="Ctrl+Q", command=DoExit)
+    menubar.add_cascade(label="文件", menu=file_menu)
+
+    help_menu = tk.Menu(menubar, tearoff=0)
+    help_menu.add_command(label="关于", command=DoAbout)
+    menubar.add_cascade(label="帮助", menu=help_menu)
+
+    root.config(menu=menubar)
+
+    # ---- 快捷键 ----
+    root.bind_all("<Control-o>", lambda e: DoOpen())
+    root.bind_all("<Control-s>", lambda e: DoSaveFile())
+    root.bind_all("<Control-Shift-s>", lambda e: DoSaveAs())
+    root.bind_all("<Control-Shift-S>", lambda e: DoSaveAs())
+    root.bind_all("<Control-q>", lambda e: DoExit())
+
+    UpdateTitle()
     RefreshTree()
     root.mainloop()
 

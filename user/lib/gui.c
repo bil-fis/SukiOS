@@ -52,7 +52,7 @@ static int gui_ipc_call(uint32_t remote, uint32_t id,
     return (r == 0) ? 0 : -1;
 }
 
-suki_window_t *suki_create_window(const char *title, int x, int y,
+suki_window_t *SukiCreateWindow(const char *title, int x, int y,
                                   uint32_t w, uint32_t h, uint32_t style)
 {
     uint64_t need = (uint64_t)w * h * 4;
@@ -84,7 +84,7 @@ suki_window_t *suki_create_window(const char *title, int x, int y,
     return win;
 }
 
-void suki_destroy_window(suki_window_t *w)
+void SukiDestroyWindow(suki_window_t *w)
 {
     if (!w || w->id == SUKI_WINDOW_ID_INVALID) return;
     wm_destroy_req_t m; memset(&m, 0, sizeof(m));
@@ -100,15 +100,15 @@ void suki_destroy_window(suki_window_t *w)
     w->buffer = NULL;
 }
 
-void *suki_get_buffer(suki_window_t *w) { return w ? w->buffer : NULL; }
+void *SukiGetBuffer(suki_window_t *w) { return w ? w->buffer : NULL; }
 
-void suki_set_pixel(suki_window_t *w, int x, int y, uint32_t rgb)
+void SukiSetPixel(suki_window_t *w, int x, int y, uint32_t rgb)
 {
     if (!w || x < 0 || y < 0 || (uint32_t)x >= w->w || (uint32_t)y >= w->h) return;
     ((uint32_t *)w->buffer)[y * w->w + x] = rgb;
 }
 
-void suki_fill_rect(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh, uint32_t rgb)
+void SukiFillRect(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh, uint32_t rgb)
 {
     if (!w) return;
     int x0 = x < 0 ? 0 : x;
@@ -120,21 +120,21 @@ void suki_fill_rect(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh, ui
             ((uint32_t *)w->buffer)[j * w->w + i] = rgb;
 }
 
-void suki_draw_line(suki_window_t *w, int x0, int y0, int x1, int y1, uint32_t rgb)
+void SukiDrawLine(suki_window_t *w, int x0, int y0, int x1, int y1, uint32_t rgb)
 {
     if (!w) return;
     int dx = x1 - x0, dy = y1 - y0;
     int steps = (dx < 0 ? -dx : dx) > (dy < 0 ? -dy : dy) ? (dx < 0 ? -dx : dx)
                                                             : (dy < 0 ? -dy : dy);
-    if (steps == 0) { suki_set_pixel(w, x0, y0, rgb); return; }
+    if (steps == 0) { SukiSetPixel(w, x0, y0, rgb); return; }
     for (int s = 0; s <= steps; s++) {
         int x = x0 + (int)((int64_t)dx * s / steps);
         int y = y0 + (int)((int64_t)dy * s / steps);
-        suki_set_pixel(w, x, y, rgb);
+        SukiSetPixel(w, x, y, rgb);
     }
 }
 
-void suki_draw_text(suki_window_t *w, int x, int y, const char *text, uint32_t rgb)
+void SukiDrawText(suki_window_t *w, int x, int y, const char *text, uint32_t rgb)
 {
     if (!w || !text) return;
     int cx = x;
@@ -145,12 +145,12 @@ void suki_draw_text(suki_window_t *w, int x, int y, const char *text, uint32_t r
         for (int row = 0; row < 8; row++)
             for (int col = 0; col < 8; col++)
                 if (g[row] & (1u << col))
-                    suki_set_pixel(w, cx + col, y + row, rgb);
+                    SukiSetPixel(w, cx + col, y + row, rgb);
         cx += 8;
     }
 }
 
-void suki_flush(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh)
+void SukiFlush(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh)
 {
     if (!w || w->id == SUKI_WINDOW_ID_INVALID) return;
     wm_flush_req_t m; memset(&m, 0, sizeof(m));
@@ -165,7 +165,7 @@ void suki_flush(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh)
     mach_msg_send(&m, sizeof(m));
 }
 
-void suki_set_event_port(suki_window_t *w, uint32_t port)
+void SukiSetEventPort(suki_window_t *w, uint32_t port)
 {
     if (!w || w->id == SUKI_WINDOW_ID_INVALID) return;
     wm_set_event_req_t m; memset(&m, 0, sizeof(m));
@@ -179,7 +179,7 @@ void suki_set_event_port(suki_window_t *w, uint32_t port)
     w->event_port = port;
 }
 
-bool suki_poll_event(suki_window_t *w, suki_event_t *out)
+bool SukiPollEvent(suki_window_t *w, suki_event_t *out)
 {
     if (!w || w->event_port == 0 || !out) return false;
     static uint8_t buf[256];
@@ -192,7 +192,7 @@ bool suki_poll_event(suki_window_t *w, suki_event_t *out)
     return true;
 }
 
-int suki_set_focus(suki_window_t *w)
+int SukiSetFocus(suki_window_t *w)
 {
     if (!w || w->id == SUKI_WINDOW_ID_INVALID) return -1;
     wm_set_focus_req_t req; memset(&req, 0, sizeof(req));
@@ -203,7 +203,7 @@ int suki_set_focus(suki_window_t *w)
     return 0;
 }
 
-void suki_set_window_pos(suki_window_t *w, int x, int y)
+void SukiSetWindowPos(suki_window_t *w, int x, int y)
 {
     if (!w || w->id == SUKI_WINDOW_ID_INVALID) return;
     wm_set_pos_req_t m; memset(&m, 0, sizeof(m));
@@ -217,7 +217,7 @@ void suki_set_window_pos(suki_window_t *w, int x, int y)
     w->x = (int32_t)x; w->y = (int32_t)y;
 }
 
-int suki_get_window_rect(suki_window_t *w, int32_t *x, int32_t *y,
+int SukiGetWindowRect(suki_window_t *w, int32_t *x, int32_t *y,
                          uint32_t *w_out, uint32_t *h_out)
 {
     if (!w) return -1;

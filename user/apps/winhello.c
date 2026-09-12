@@ -16,10 +16,10 @@ int main(int argc, char **argv)
     (void)argv;
     u_print("[winhello] starting GUI self-test\n");
 
-    suki_window_t *w =     suki_create_window("WinHello", 120, 80, 360, 240,
+    suki_window_t *w =     SukiCreateWindow("WinHello", 120, 80, 360, 240,
                                           SUKI_WS_DEFAULT);
     if (!w) {
-        u_print("[winhello] FAIL: suki_create_window returned NULL\n");
+        u_print("[winhello] FAIL: SukiCreateWindow returned NULL\n");
         sys_exit(1);
     }
     u_print("[winhello] window created id=");
@@ -30,18 +30,18 @@ int main(int argc, char **argv)
     for (uint32_t y = 0; y < w->h; y++) {
         uint32_t t = (y * 255) / w->h;
         uint32_t col = SUKI_RGB(t, 40, 255 - t);
-        suki_fill_rect(w, 0, y, w->w, 1, col);
+        SukiFillRect(w, 0, y, w->w, 1, col);
     }
     /* 标题栏 */
-    suki_fill_rect(w, 0, 0, w->w, 20, SUKI_ACCENT);
-    suki_draw_text(w, 8, 6, w->title, 0x00FFFFFF);
+    SukiFillRect(w, 0, 0, w->w, 20, SUKI_ACCENT);
+    SukiDrawText(w, 8, 6, w->title, 0x00FFFFFF);
     /* 客户区文本与矩形 */
-    suki_draw_text(w, 12, 40, "SukiOS GUI", SUKI_FG_WINDOW);
-    suki_draw_text(w, 12, 56, "libsuki_gui + OOL", SUKI_FG_WINDOW);
-    suki_draw_line(w, 12, 90, 200, 160, 0x00FFD070);
-    suki_fill_rect(w, 150, 110, 80, 50, 0x0044AA66);
+    SukiDrawText(w, 12, 40, "SukiOS GUI", SUKI_FG_WINDOW);
+    SukiDrawText(w, 12, 56, "libsuki_gui + OOL", SUKI_FG_WINDOW);
+    SukiDrawLine(w, 12, 90, 200, 160, 0x00FFD070);
+    SukiFillRect(w, 150, 110, 80, 50, 0x0044AA66);
 
-    suki_flush(w, 0, 0, w->w, w->h);
+    SukiFlush(w, 0, 0, w->w, w->h);
     u_print("[winhello] flushed frame to WM (OOL)\n");
 
     /* 事件端口：验证 WM -> 应用事件分发。
@@ -52,14 +52,14 @@ int main(int argc, char **argv)
     uint32_t ep = sys_port_alloc();
     if (ep) {
         sys_port_claim(ep);
-        suki_set_event_port(w, ep);
+        SukiSetEventPort(w, ep);
         u_print("[winhello] event port registered, polling...\n");
         bool manual = (argc > 0);
         if (manual) u_print("[winhello] MANUAL mode: window stays until closed\n");
         suki_event_t ev;
         int limit = manual ? 30000 : 200;
         for (int i = 0; i < limit; i++) {
-            if (suki_poll_event(w, &ev)) {
+            if (SukiPollEvent(w, &ev)) {
                 u_print("[winhello] event type=");
                 char b2[16]; u_print(u_utoa_s(ev.type, b2, sizeof(b2)));
                 u_print("\n");
@@ -73,7 +73,7 @@ int main(int argc, char **argv)
         u_print("[winhello] poll loop done (non-blocking)\n");
     }
 
-    suki_destroy_window(w);
+    SukiDestroyWindow(w);
     u_print("[winhello] PASS: window lifecycle complete\n");
     sys_exit(0);
     return 0;

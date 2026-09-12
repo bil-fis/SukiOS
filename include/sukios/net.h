@@ -114,34 +114,34 @@ typedef uint32_t suki_socket_t;      /* socket 句柄（net_server 分配） */
 extern "C" {
 #endif
 
-suki_status_t suki_socket_create(int domain, int type, int proto,
+suki_status_t SukiSocketCreate(int domain, int type, int proto,
                                  suki_socket_t *out);
-suki_status_t suki_socket_bind(suki_socket_t s, const void *addr,
+suki_status_t SukiSocketBind(suki_socket_t s, const void *addr,
                                 uint32_t addrlen);
-suki_status_t suki_socket_connect(suki_socket_t s, const void *addr,
+suki_status_t SukiSocketConnect(suki_socket_t s, const void *addr,
                                    uint32_t addrlen);
-suki_status_t suki_socket_listen(suki_socket_t s, int backlog);
-suki_status_t suki_socket_accept(suki_socket_t s, void *addr,
+suki_status_t SukiSocketListen(suki_socket_t s, int backlog);
+suki_status_t SukiSocketAccept(suki_socket_t s, void *addr,
                                   uint32_t *addrlen, suki_socket_t *out);
-suki_status_t suki_socket_send(suki_socket_t s, const void *buf, uint32_t len,
+suki_status_t SukiSocketSend(suki_socket_t s, const void *buf, uint32_t len,
                                 uint32_t flags, uint32_t *out_nwritten);
-suki_status_t suki_socket_recv(suki_socket_t s, void *buf, uint32_t len,
+suki_status_t SukiSocketRecv(suki_socket_t s, void *buf, uint32_t len,
                                 uint32_t flags, uint32_t *out_nread);
-suki_status_t suki_socket_sendto(suki_socket_t s, const void *buf, uint32_t len,
+suki_status_t SukiSocketSendTo(suki_socket_t s, const void *buf, uint32_t len,
                                   uint32_t flags, const void *addr,
                                   uint32_t addrlen, uint32_t *out_nwritten);
-suki_status_t suki_socket_recvfrom(suki_socket_t s, void *buf, uint32_t len,
+suki_status_t SukiSocketRecvFrom(suki_socket_t s, void *buf, uint32_t len,
                                     uint32_t flags, void *addr,
                                     uint32_t *addrlen, uint32_t *out_nread);
-suki_status_t suki_socket_close(suki_socket_t s);
-suki_status_t suki_socket_getsockname(suki_socket_t s, void *addr,
+suki_status_t SukiSocketClose(suki_socket_t s);
+suki_status_t SukiSocketGetSockName(suki_socket_t s, void *addr,
                                        uint32_t *addrlen);
-suki_status_t suki_socket_getpeername(suki_socket_t s, void *addr,
+suki_status_t SukiSocketGetPeerName(suki_socket_t s, void *addr,
                                        uint32_t *addrlen);
-suki_status_t suki_socket_shutdown(suki_socket_t s, int how);
-suki_status_t suki_socket_setsockopt(suki_socket_t s, int level, int optname,
+suki_status_t SukiSocketShutdown(suki_socket_t s, int how);
+suki_status_t SukiSocketSetSockOpt(suki_socket_t s, int level, int optname,
                                       const void *optval, uint32_t optlen);
-suki_status_t suki_socket_getsockopt(suki_socket_t s, int level, int optname,
+suki_status_t SukiSocketGetSockOpt(suki_socket_t s, int level, int optname,
                                       void *optval, uint32_t *optlen);
 
 #ifdef __cplusplus

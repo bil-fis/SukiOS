@@ -200,7 +200,7 @@ suki_status_t suki_yield(void);
 // include/sukios/memory.h
 
 /* 分配虚拟内存（保留+提交） */
-suki_status_t suki_mem_alloc(
+suki_status_t SukiMemAlloc(
     void         *hint,          /* 期望地址（可为 NULL） */
     size_t        size,
     uint32_t      protection,    /* SUKI_MAP_* */
@@ -251,7 +251,7 @@ suki_status_t suki_mem_brk(
 // include/sukios/file.h
 
 /* 打开文件/设备 */
-suki_status_t suki_file_open(
+suki_status_t SukiFileOpen(
     const char    *path,
     uint32_t       access,       /* SUKI_ACCESS_* */
     uint32_t       mode,         /* 权限位（octal） */
@@ -259,10 +259,10 @@ suki_status_t suki_file_open(
 );
 
 /* 关闭文件 */
-suki_status_t suki_file_close(suki_handle_t file);
+suki_status_t SukiFileClose(suki_handle_t file);
 
 /* 读取文件 */
-suki_status_t suki_file_read(
+suki_status_t SukiFileRead(
     suki_handle_t  file,
     void          *buffer,
     size_t         count,
@@ -270,7 +270,7 @@ suki_status_t suki_file_read(
 );
 
 /* 写入文件 */
-suki_status_t suki_file_write(
+suki_status_t SukiFileWrite(
     suki_handle_t  file,
     const void    *buffer,
     size_t         count,
@@ -353,36 +353,36 @@ suki_status_t suki_fs_getcwd(
 // include/sukios/sync.h
 
 /* ---- 事件（Event，手动/自动复位）---- */
-suki_status_t suki_event_create(
+suki_status_t SukiEventCreate(
     bool           manual_reset,
     bool           initial_state,
     suki_handle_t *out_event
 );
 
-suki_status_t suki_event_set(suki_handle_t event);
-suki_status_t suki_event_reset(suki_handle_t event);
+suki_status_t SukiEventSet(suki_handle_t event);
+suki_status_t SukiEventReset(suki_handle_t event);
 suki_status_t suki_event_pulse(suki_handle_t event);  /* set + 唤醒 + reset */
 
 /* ---- 互斥锁（Mutex，支持递归）---- */
-suki_status_t suki_mutex_create(
+suki_status_t SukiMutexCreate(
     bool           recursive,
     suki_handle_t *out_mutex
 );
 
-suki_status_t suki_mutex_lock(suki_handle_t mutex);
+suki_status_t SukiMutexLock(suki_handle_t mutex);
 suki_status_t suki_mutex_trylock(suki_handle_t mutex);
-suki_status_t suki_mutex_unlock(suki_handle_t mutex);
+suki_status_t SukiMutexUnlock(suki_handle_t mutex);
 
 /* ---- 信号量（Semaphore，计数）---- */
-suki_status_t suki_sem_create(
+suki_status_t SukiSemCreate(
     uint32_t       initial_count,
     uint32_t       max_count,
     suki_handle_t *out_sem
 );
 
-suki_status_t suki_sem_acquire(suki_handle_t sem, uint32_t count);
+suki_status_t SukiSemAcquire(suki_handle_t sem, uint32_t count);
 suki_status_t suki_sem_tryacquire(suki_handle_t sem);
-suki_status_t suki_sem_release(suki_handle_t sem, uint32_t count);
+suki_status_t SukiSemRelease(suki_handle_t sem, uint32_t count);
 
 /* ---- 条件变量（Condition Variable，需配合 Mutex）---- */
 suki_status_t suki_cond_create(suki_handle_t *out_cond);
@@ -401,7 +401,7 @@ suki_status_t suki_cond_broadcast(suki_handle_t cond);
 // include/sukios/wait.h
 
 /* 等待一个或多个对象变为"有信号"状态 */
-suki_status_t suki_wait(
+suki_status_t SukiWait(
     const suki_handle_t *handles,
     size_t               count,
     uint32_t             flags,        /* SUKI_WAIT_ANY / SUKI_WAIT_ALL */
@@ -414,7 +414,7 @@ static inline suki_status_t suki_wait_one(
     suki_handle_t handle,
     uint64_t      timeout_ms
 ) {
-    return suki_wait(&handle, 1, SUKI_WAIT_ANY, timeout_ms, NULL);
+    return SukiWait(&handle, 1, SUKI_WAIT_ANY, timeout_ms, NULL);
 }
 ```
 
@@ -488,7 +488,7 @@ typedef struct suki_sockaddr {
 } suki_sockaddr_t;
 
 /* 创建套接字 */
-suki_status_t suki_socket_create(
+suki_status_t SukiSocketCreate(
     suki_addr_family_t family,
     suki_sock_type_t   type,
     suki_ip_proto_t    protocol,
@@ -496,33 +496,33 @@ suki_status_t suki_socket_create(
 );
 
 /* 绑定地址 */
-suki_status_t suki_socket_bind(
+suki_status_t SukiSocketBind(
     suki_handle_t        sock,
     const suki_sockaddr_t *addr
 );
 
 /* 监听 */
-suki_status_t suki_socket_listen(
+suki_status_t SukiSocketListen(
     suki_handle_t sock,
     uint32_t      backlog
 );
 
 /* 接受连接 */
-suki_status_t suki_socket_accept(
+suki_status_t SukiSocketAccept(
     suki_handle_t   sock,
     suki_sockaddr_t *out_addr,
     suki_handle_t  *out_client
 );
 
 /* 连接 */
-suki_status_t suki_socket_connect(
+suki_status_t SukiSocketConnect(
     suki_handle_t        sock,
     const suki_sockaddr_t *addr,
     uint64_t              timeout_ms
 );
 
 /* 发送数据 */
-suki_status_t suki_socket_send(
+suki_status_t SukiSocketSend(
     suki_handle_t  sock,
     const void    *data,
     size_t         len,
@@ -531,7 +531,7 @@ suki_status_t suki_socket_send(
 );
 
 /* 接收数据 */
-suki_status_t suki_socket_recv(
+suki_status_t SukiSocketRecv(
     suki_handle_t  sock,
     void          *buffer,
     size_t         max_len,
@@ -540,7 +540,7 @@ suki_status_t suki_socket_recv(
 );
 
 /* 发送到（UDP） */
-suki_status_t suki_socket_sendto(
+suki_status_t SukiSocketSendTo(
     suki_handle_t        sock,
     const void          *data,
     size_t               len,
@@ -549,7 +549,7 @@ suki_status_t suki_socket_sendto(
 );
 
 /* 从（UDP）接收 */
-suki_status_t suki_socket_recvfrom(
+suki_status_t SukiSocketRecvFrom(
     suki_handle_t   sock,
     void           *buffer,
     size_t          max_len,
@@ -558,7 +558,7 @@ suki_status_t suki_socket_recvfrom(
 );
 
 /* 关闭套接字 */
-suki_status_t suki_socket_close(suki_handle_t sock);
+suki_status_t SukiSocketClose(suki_handle_t sock);
 ```
 
 
@@ -786,10 +786,10 @@ suki_status_t suki_auth_revoke_all(void);
 | `exit()` | `suki_process_terminate(SUKI_HANDLE_NULL, code)` |
 | `waitpid()` | `suki_process_wait()` |
 | `getpid()` | `suki_process_id(suki_process_self())` |
-| `open()` | `suki_file_open()` |
-| `close()` | `suki_file_close()` |
-| `read()` | `suki_file_read()` |
-| `write()` | `suki_file_write()` |
+| `open()` | `SukiFileOpen()` |
+| `close()` | `SukiFileClose()` |
+| `read()` | `SukiFileRead()` |
+| `write()` | `SukiFileWrite()` |
 | `lseek()` | `suki_file_seek()` |
 | `stat()` | `suki_file_stat()` |
 | `mkdir()` | `suki_dir_create()` |
@@ -800,12 +800,12 @@ suki_status_t suki_auth_revoke_all(void);
 | `munmap()` | `suki_mem_unmap()` |
 | `sbrk()` | `suki_mem_brk()` |
 | `pipe()` | `suki_pipe_create()` |
-| `socket()` | `suki_socket_create()` |
-| `bind()` | `suki_socket_bind()` |
-| `connect()` | `suki_socket_connect()` |
-| `accept()` | `suki_socket_accept()` |
-| `send()`/`recv()` | `suki_socket_send()`/`suki_socket_recv()` |
-| `poll()`/`select()` | `suki_wait()` |
+| `socket()` | `SukiSocketCreate()` |
+| `bind()` | `SukiSocketBind()` |
+| `connect()` | `SukiSocketConnect()` |
+| `accept()` | `SukiSocketAccept()` |
+| `send()`/`recv()` | `SukiSocketSend()`/`SukiSocketRecv()` |
+| `poll()`/`select()` | `SukiWait()` |
 | `pthread_create()` | `suki_thread_create()` |
 | `pthread_join()` | `suki_thread_join()` |
 | `pthread_mutex_*` | `suki_mutex_*` |
@@ -825,9 +825,9 @@ suki_status_t suki_auth_revoke_all(void);
 | **错误处理** | 全局 `errno` | 直接返回状态码 |
 | **资源标识** | `int fd`, `pid_t` | 统一 `suki_handle_t` |
 | **对象模型** | 无统一模型 | 全部对象化 |
-| **等待机制** | `poll`/`select` | 统一的 `suki_wait()`，支持任意对象 |
+| **等待机制** | `poll`/`select` | 统一的 `SukiWait()`，支持任意对象 |
 | **IPC** | `pipe`/`socket` | Mach 端口（原生） |
 | **权限** | `uid/gid` | `suki_auth_request()` |
 | **跨进程资源传递** | `SCM_RIGHTS` | `suki_duplicate()` |
-| **内存管理** | `mmap`/`brk` 分离 | `suki_mem_alloc`/`suki_mem_map` 统一 |
+| **内存管理** | `mmap`/`brk` 分离 | `SukiMemAlloc`/`suki_mem_map` 统一 |
 | **学习曲线** | 40 年历史包袱 | 设计干净，仅 15 类 API |

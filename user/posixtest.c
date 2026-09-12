@@ -937,115 +937,115 @@ static void test_sukinative(void)
 
     /* auto-reset 事件：初始未触发 */
     suki_handle_t ev;
-    ck("suki_event_create(auto)", suki_event_create(false, false, &ev) == 0 && ev != 0);
+    ck("SukiEventCreate(auto)", SukiEventCreate(false, false, &ev) == 0 && ev != 0);
 
     size_t idx;
-    suki_status_t r = suki_wait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
+    suki_status_t r = SukiWait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
     ck("wait no-block on unsignaled event => EAGAIN", r == -SUKI_EAGAIN);
 
-    ck("suki_event_set", suki_event_set(ev) == 0);
-    r = suki_wait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
+    ck("SukiEventSet", SukiEventSet(ev) == 0);
+    r = SukiWait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
     ck("wait on signaled event => 0 (index 0)", r == 0 && idx == 0);
-    r = suki_wait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
+    r = SukiWait(&ev, 1, SUKI_WAIT_NO_BLOCK, 0, &idx);
     ck("auto-reset consumed (=> EAGAIN again)", r == -SUKI_EAGAIN);
 
     /* manual-reset 事件：触发后多次等待命中，reset 后停止 */
     suki_handle_t evm;
-    ck("suki_event_create(manual)", suki_event_create(true, true, &evm) == 0);
-    ck("wait manual signaled => 0", suki_wait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == 0 && idx == 0);
-    ck("wait manual again => 0",   suki_wait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == 0 && idx == 0);
-    ck("suki_event_reset", suki_event_reset(evm) == 0);
-    ck("wait after reset => EAGAIN", suki_wait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == -SUKI_EAGAIN);
+    ck("SukiEventCreate(manual)", SukiEventCreate(true, true, &evm) == 0);
+    ck("wait manual signaled => 0", SukiWait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == 0 && idx == 0);
+    ck("wait manual again => 0",   SukiWait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == 0 && idx == 0);
+    ck("SukiEventReset", SukiEventReset(evm) == 0);
+    ck("wait after reset => EAGAIN", SukiWait(&evm, 1, SUKI_WAIT_NO_BLOCK, 0, &idx) == -SUKI_EAGAIN);
 
     /* 多对象 ANY 等待：仅触发第二个 */
     suki_handle_t evs[2];
-    ck("ev0 create", suki_event_create(false, false, &evs[0]) == 0);
-    ck("ev1 create", suki_event_create(false, false, &evs[1]) == 0);
-    ck("suki_event_set(evs[1])", suki_event_set(evs[1]) == 0);
-    r = suki_wait(evs, 2, SUKI_WAIT_ANY, 0, &idx);
+    ck("ev0 create", SukiEventCreate(false, false, &evs[0]) == 0);
+    ck("ev1 create", SukiEventCreate(false, false, &evs[1]) == 0);
+    ck("SukiEventSet(evs[1])", SukiEventSet(evs[1]) == 0);
+    r = SukiWait(evs, 2, SUKI_WAIT_ANY, 0, &idx);
     ck("wait ANY returns index 1", r == 0 && idx == 1);
 
     /* 互斥锁：空闲可立即获取/释放 */
     suki_handle_t mtx;
-    ck("suki_mutex_create", suki_mutex_create(&mtx) == 0);
-    ck("mutex lock(free)=>0", suki_mutex_lock(mtx) == 0);
-    ck("mutex unlock=>0",     suki_mutex_unlock(mtx) == 0);
+    ck("SukiMutexCreate", SukiMutexCreate(&mtx) == 0);
+    ck("mutex lock(free)=>0", SukiMutexLock(mtx) == 0);
+    ck("mutex unlock=>0",     SukiMutexUnlock(mtx) == 0);
 
     /* 信号量：初值 2，取一次释放一次，回到 2 */
     suki_handle_t sem;
-    ck("suki_sem_create(2,5)", suki_sem_create(2, 5, &sem) == 0);
-    ck("sem acquire=>0", suki_sem_acquire(sem) == 0);
-    ck("sem release=>0", suki_sem_release(sem) == 0);
+    ck("SukiSemCreate(2,5)", SukiSemCreate(2, 5, &sem) == 0);
+    ck("sem acquire=>0", SukiSemAcquire(sem) == 0);
+    ck("sem release=>0", SukiSemRelease(sem) == 0);
 
     /* 对象查询 */
     suki_objinfo_t info;
-    ck("suki_obj_query(sem)", suki_obj_query(sem, &info) == 0 &&
+    ck("SukiObjQuery(sem)", SukiObjQuery(sem, &info) == 0 &&
         info.type == SUKI_OT_SEM && info.count == 2);
 
     /* 句柄复制 + 销毁（引用计数） */
     suki_handle_t dup;
-    ck("suki_obj_duplicate", suki_obj_duplicate(sem, 0, &dup) == 0);
-    ck("suki_obj_destroy(sem)", suki_obj_destroy(sem) == 0);
-    ck("suki_obj_destroy(dup)", suki_obj_destroy(dup) == 0);
-    ck("suki_obj_destroy(ev)",   suki_obj_destroy(ev) == 0);
-    ck("suki_obj_destroy(evm)",  suki_obj_destroy(evm) == 0);
-    ck("suki_obj_destroy(evs0)", suki_obj_destroy(evs[0]) == 0);
-    ck("suki_obj_destroy(evs1)", suki_obj_destroy(evs[1]) == 0);
-    ck("suki_obj_destroy(mtx)",  suki_obj_destroy(mtx) == 0);
+    ck("SukiObjDuplicate", SukiObjDuplicate(sem, 0, &dup) == 0);
+    ck("SukiObjDestroy(sem)", SukiObjDestroy(sem) == 0);
+    ck("SukiObjDestroy(dup)", SukiObjDestroy(dup) == 0);
+    ck("SukiObjDestroy(ev)",   SukiObjDestroy(ev) == 0);
+    ck("SukiObjDestroy(evm)",  SukiObjDestroy(evm) == 0);
+    ck("SukiObjDestroy(evs0)", SukiObjDestroy(evs[0]) == 0);
+    ck("SukiObjDestroy(evs1)", SukiObjDestroy(evs[1]) == 0);
+    ck("SukiObjDestroy(mtx)",  SukiObjDestroy(mtx) == 0);
 
     /* ===== Phase 2：文件对象（FILE_OPEN/READ/WRITE/CLOSE） ===== */
     print_str("--- sukinative file object ---\n");
     suki_handle_t rf;
-    ck("suki_file_open(/README.TXT, RDONLY)",
-       suki_file_open("/README.TXT", SUKI_O_RDONLY, &rf) == 0 && rf != 0);
+    ck("SukiFileOpen(/README.TXT, RDONLY)",
+       SukiFileOpen("/README.TXT", SUKI_O_RDONLY, &rf) == 0 && rf != 0);
     char rdbuf[16]; size_t nrd;
-    ck("suki_file_read", suki_file_read(rf, rdbuf, 16, &nrd) == 0 && nrd > 0);
+    ck("SukiFileRead", SukiFileRead(rf, rdbuf, 16, &nrd) == 0 && nrd > 0);
     suki_objinfo_t fi;
-    ck("suki_obj_query(file)", suki_obj_query(rf, &fi) == 0 && fi.type == SUKI_OT_FILE);
-    ck("suki_file_close(rf)", suki_file_close(rf) == 0);
+    ck("SukiObjQuery(file)", SukiObjQuery(rf, &fi) == 0 && fi.type == SUKI_OT_FILE);
+    ck("SukiFileClose(rf)", SukiFileClose(rf) == 0);
 
     /* 创建 + 写 + 重开读回校验 */
     suki_handle_t wf;
-    ck("suki_file_open(creat)",
-       suki_file_open("/SUKITST.TXT", SUKI_O_CREAT | SUKI_O_RDWR | SUKI_O_TRUNC, &wf) == 0 && wf != 0);
+    ck("SukiFileOpen(creat)",
+       SukiFileOpen("/SUKITST.TXT", SUKI_O_CREAT | SUKI_O_RDWR | SUKI_O_TRUNC, &wf) == 0 && wf != 0);
     const char *msg = "SukiNative IO";
     size_t nw;
-    ck("suki_file_write", suki_file_write(wf, (const void *)msg, 13, &nw) == 0 && nw == 13);
+    ck("SukiFileWrite", SukiFileWrite(wf, (const void *)msg, 13, &nw) == 0 && nw == 13);
     suki_handle_t rf2;
-    ck("suki_file_open(reopen)", suki_file_open("/SUKITST.TXT", SUKI_O_RDONLY, &rf2) == 0);
+    ck("SukiFileOpen(reopen)", SukiFileOpen("/SUKITST.TXT", SUKI_O_RDONLY, &rf2) == 0);
     char back[16]; size_t nr2;
-    ck("suki_file_read(back)", suki_file_read(rf2, back, 13, &nr2) == 0 && nr2 == 13);
+    ck("SukiFileRead(back)", SukiFileRead(rf2, back, 13, &nr2) == 0 && nr2 == 13);
     int fmatch = 1; for (size_t i = 0; i < 13; i++) if (back[i] != msg[i]) fmatch = 0;
     ck("file content match", fmatch == 1);
-    ck("suki_file_close(wf)", suki_file_close(wf) == 0);
-    ck("suki_file_close(rf2)", suki_file_close(rf2) == 0);
+    ck("SukiFileClose(wf)", SukiFileClose(wf) == 0);
+    ck("SukiFileClose(rf2)", SukiFileClose(rf2) == 0);
 
     /* ===== Phase 2：内存对象（MEM_ALLOC） ===== */
     print_str("--- sukinative mem object ---\n");
     suki_handle_t mh;
-    ck("suki_mem_alloc(4096)", suki_mem_alloc(4096, &mh) == 0 && mh != 0);
+    ck("SukiMemAlloc(4096)", SukiMemAlloc(4096, &mh) == 0 && mh != 0);
     suki_objinfo_t mi;
-    ck("suki_obj_query(mem)",
-       suki_obj_query(mh, &mi) == 0 && mi.type == SUKI_OT_MEM &&
+    ck("SukiObjQuery(mem)",
+       SukiObjQuery(mh, &mi) == 0 && mi.type == SUKI_OT_MEM &&
        mi.size == 4096 && mi.base != 0);
     volatile uint8_t *mp = (volatile uint8_t *)(unsigned long)mi.base;
     mp[0] = 0xAB; mp[4095] = 0xCD;
     ck("mem write/read", mp[0] == 0xAB && mp[4095] == 0xCD);
-    ck("suki_obj_destroy(mh)", suki_obj_destroy(mh) == 0);
+    ck("SukiObjDestroy(mh)", SukiObjDestroy(mh) == 0);
 
     /* ===== Phase 2：进程对象（PROC_CREATE + 等待退出通知） ===== */
     print_str("--- sukinative proc object ---\n");
     suki_handle_t ph;
-    ck("suki_proc_create(/BIN/HELLO.SKA)",
-       suki_proc_create("/BIN/HELLO.SKA", 0, NULL, &ph) == 0 && ph != 0);
+    ck("SukiProcCreate(/BIN/HELLO.SKA)",
+       SukiProcCreate("/BIN/HELLO.SKA", 0, NULL, &ph) == 0 && ph != 0);
     suki_objinfo_t pi;
-    ck("suki_obj_query(proc)",
-       suki_obj_query(ph, &pi) == 0 && pi.type == SUKI_OT_PROC && pi.base > 0);
+    ck("SukiObjQuery(proc)",
+       SukiObjQuery(ph, &pi) == 0 && pi.type == SUKI_OT_PROC && pi.base > 0);
     /* 阻塞等待子进程（hello 会 sys_exit）退出，由 suki_proc_notify_exit 唤醒 */
     size_t pidx;
-    r = suki_wait(&ph, 1, SUKI_WAIT_ANY, 0, &pidx);
+    r = SukiWait(&ph, 1, SUKI_WAIT_ANY, 0, &pidx);
     ck("wait proc exit => 0", r == 0 && pidx == 0);
-    ck("suki_obj_destroy(ph)", suki_obj_destroy(ph) == 0);
+    ck("SukiObjDestroy(ph)", SukiObjDestroy(ph) == 0);
 
     print_str("[sukinative] done\n");
 }

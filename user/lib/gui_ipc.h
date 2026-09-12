@@ -94,7 +94,7 @@ typedef struct wm_set_event_req {
     uint32_t          event_port;
 } wm_set_event_req_t;
 
-/* 设置焦点窗口（应用侧 suki_set_focus 用） */
+/* 设置焦点窗口（应用侧 SukiSetFocus 用） */
 typedef struct wm_set_focus_req {
     mach_msg_header_t h;
     suki_window_id_t  id;

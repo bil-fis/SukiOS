@@ -1115,7 +1115,7 @@ static void shell_outn(const char *s, size_t n)
 static void term_render(void)
 {
     if (!g_win) return;
-    uint32_t *fb = (uint32_t *)suki_get_buffer(g_win);
+    uint32_t *fb = (uint32_t *)SukiGetBuffer(g_win);
     if (!fb) return;
     int W = g_win->w, H = g_win->h;
     for (int y = 0; y < H; y++)
@@ -1134,7 +1134,7 @@ static void term_render(void)
                         fb[(py+ry)*W + (px+cx)] = 0x00e0e0e0;  /* 浅灰前景 */
         }
     }
-    suki_flush(g_win, 0, 0, W, H);
+    SukiFlush(g_win, 0, 0, W, H);
 }
 
 /* 键盘字符处理（从 WM 焦点窗口事件端口收到 KEY_DOWN 后调用）。
@@ -1190,14 +1190,14 @@ int main(int argc, char **argv)
 
     /* shell 作为 WM 管理的窗口程序：创建窗口 + 事件端口，并主动请求焦点。
      * 之后键盘由 WM 转发到本窗口（焦点模型）；close 按钮触发 SUKI_EVENT_WINDOW_CLOSE。 */
-    g_win = suki_create_window("Shell", 40, 60, 660, 380, SUKI_WS_DEFAULT);
+    g_win = SukiCreateWindow("Shell", 40, 60, 660, 380, SUKI_WS_DEFAULT);
     if (g_win) {
         g_ep = sys_port_alloc();
         if (g_ep) {
             sys_port_claim(g_ep);
-            suki_set_event_port(g_win, g_ep);
+            SukiSetEventPort(g_win, g_ep);
         }
-        suki_set_focus(g_win);
+        SukiSetFocus(g_win);
         shell_out("[shell] windowed mode: window id=");
         char b[16]; shell_out(u_utoa_s(g_win->id, b, sizeof(b)));
         shell_out("\n");
@@ -1246,12 +1246,12 @@ int main(int argc, char **argv)
     for (;;) {
         if (g_win && g_ep) {
             suki_event_t ev;
-            while (suki_poll_event(g_win, &ev)) {
+            while (SukiPollEvent(g_win, &ev)) {
                 if (ev.type == SUKI_EVENT_KEY_DOWN)
                     handle_key((char)(unsigned char)ev.u.key.keycode);
                 else if (ev.type == SUKI_EVENT_WINDOW_CLOSE) {
                     shell_out("[shell] window close requested, exiting shell\n");
-                    if (g_win) { suki_destroy_window(g_win); g_win = NULL; }
+                    if (g_win) { SukiDestroyWindow(g_win); g_win = NULL; }
                     sys_exit(0);
                 }
             }

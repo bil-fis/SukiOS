@@ -6,7 +6,7 @@
  * 架构（与 FS_SERVER/disk-srv 同构，符合混合内核红线）：
  *   - lwIP 跑在用户态（NO_SYS=1：raw API，定时器由本服务轮询 sys_check_timeouts
  *     驱动；阻塞语义放在 IPC 层——客户端等 net_server 应答，绝不在 lwIP 内部阻塞
- *     内核）。这是微内核网络服务的典型结构，且不依赖 suki_wait 的 timeout（尚未实现）。
+ *     内核）。这是微内核网络服务的典型结构，且不依赖 SukiWait 的 timeout（尚未实现）。
  *   - 原始以太网帧经 NET_PORT 收发：net_server 是 NET_PORT 的【客户端】，发
  *     GET_MAC/SEND/RECV 请求，并以 NET_REPLY_PORT 收应答；
  *     Ring0 的 e1000 驱动（kernel/drivers/e1000.c::net_srv_task）才是 NET_PORT 的

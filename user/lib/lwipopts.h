@@ -5,7 +5,7 @@
  *
  * SukiOS 适配要点：
  *   - NO_SYS=1：不使用 lwIP 的 OS 模拟层（无需线程/邮箱）。原因是 SukiNative
- *     的 suki_wait() 的 timeout_ms 尚未实现，而 lwIP 的顺序/socket API 依赖
+ *     的 SukiWait() 的 timeout_ms 尚未实现，而 lwIP 的顺序/socket API 依赖
  *     带超时的 mbox 等待来实现 TCP 定时器；改用 raw API 后，定时器由网络服务
  *     周期性调用 sys_check_timeouts() 驱动，阻塞语义放到 IPC 层（客户端等待
  *     服务应答），这正是微内核网络服务的典型结构，也更稳健。

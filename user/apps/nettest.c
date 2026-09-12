@@ -9,7 +9,7 @@
  *        服务必然回送一个 UDP 包（DATA 或 ERROR），从而确定性地验证
  *        「内核转发 NS_PORT -> net_server(lwIP) -> 真实 UDP 收发（接收路径）」。
  *      - 若 TFTP 根目录未配置，会回 ERROR 包，仍证明 recv 路径打通。
- *   2) SukiNative 原生 socket 对象：suki_socket_create/close 冒烟测试。
+ *   2) SukiNative 原生 socket 对象：SukiSocketCreate/close 冒烟测试。
  *
  * 输出经 u_print 落到 serial，供 QEMU 启动日志核验。
  */
@@ -110,15 +110,15 @@ int main(int argc, char **argv)
     u_print("[nettest] POSIX UDP round-trip (with reply): PASS\n");
 
     /* ---- SukiNative 原生 socket 冒烟 ---- */
-    u_print("[nettest] === SukiNative suki_socket_create(DGRAM) ===\n");
+    u_print("[nettest] === SukiNative SukiSocketCreate(DGRAM) ===\n");
     suki_socket_t sk;
-    suki_status_t st = suki_socket_create(SUKI_AF_INET, SUKI_SOCK_DGRAM, 0, &sk);
+    suki_status_t st = SukiSocketCreate(SUKI_AF_INET, SUKI_SOCK_DGRAM, 0, &sk);
     if (st != 0) {
-        u_print("[nettest] suki_socket_create FAIL st="); pd((uint64_t)st); u_print("\n");
+        u_print("[nettest] SukiSocketCreate FAIL st="); pd((uint64_t)st); u_print("\n");
     } else {
-        u_print("[nettest] suki_socket_create ok handle="); pd((uint64_t)sk); u_print("\n");
-        suki_status_t cs = suki_socket_close(sk);
-        u_print("[nettest] suki_socket_close st="); pd((uint64_t)cs); u_print("\n");
+        u_print("[nettest] SukiSocketCreate ok handle="); pd((uint64_t)sk); u_print("\n");
+        suki_status_t cs = SukiSocketClose(sk);
+        u_print("[nettest] SukiSocketClose st="); pd((uint64_t)cs); u_print("\n");
     }
 
     u_print("[nettest] all done.\n");

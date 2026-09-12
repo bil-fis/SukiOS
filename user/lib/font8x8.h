@@ -2,7 +2,7 @@
  * user/lib/font8x8.h
  * -----------------------------------------------------------------------------
  * 8x8 点阵字体（公有领域 font8x8，ASCII 0x20-0x7E），用于用户态图形绘制
- * （display_server 的终端栅格化与 libsuki_gui 的 suki_draw_text 共用，单一数据源）。
+ * （display_server 的终端栅格化与 libsuki_gui 的 SukiDrawText 共用，单一数据源）。
  * 以 `static const` 形式提供，多个 TU 包含时各得一份副本（freestanding 无链接冲突）。
  */
 #ifndef _SUKI_FONT8X8_H

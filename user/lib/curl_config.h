@@ -143,8 +143,8 @@
 #define HAVE_LIBZ 1
 
 /* =============================================================================
- * 5) TLS 后端（当前未接入；后续经 mbedTLS 提供时改定义 USE_MBEDTLS）
+ * 5) TLS 后端：mbedTLS（lib/mbedtls @ 3.6.7 LTS）
  * ============================================================================= */
-/* #define USE_MBEDTLS 1 */
+#define USE_MBEDTLS 1
 
 #endif /* SUKIOS_CURL_CONFIG_H */

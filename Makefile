@@ -138,7 +138,7 @@ USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
-                -I user/lib/shims -include $(CONFIG_H)
+                -I lib/zlib -I user/lib/shims -include $(CONFIG_H)
 
 # ---- lwIP 2.2.1（vendor 在 lib/） ----
 # NO_SYS=1 下编译的核心/接口源文件（关闭 altcp/ipv6/igmp/autoip/socket）。
@@ -183,6 +183,7 @@ USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                  $(BUILD)/user/lib/suki_native.c.o \
                  $(BUILD)/user/lib/dlfcn.c.o \
                  $(BUILD)/user/lib/fileio.c.o \
+                 $(BUILD)/user/lib/mbedtls_glue.c.o \
                  $(BUILD)/user/lib/net.c.o
 
 # FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接
@@ -315,26 +316,53 @@ $(FT_LIB): $(FT_OBJS) $(FT_SHIM_OBJ)
 		$(FT_OBJS) $(FT_SHIM_OBJ)
 	@echo "==> FreeType static lib $(FT_LIB) ($(words $(FT_OBJS)) objects)"
 
-# ---- miniz 压缩库（zlib 兼容，用户态能力库）----
-# 源码复用内核能力目录 kernel/abilities/miniz/miniz.c（freestanding 友好），
-# 以 -DMINIZ_USE_ZLIB_COMPAT 提供标准 zlib 符号（inflate/deflate/compress/...），
-# 供 libcurl 以 HAVE_ZLIB 接入。经 -I include 解析其头 kernel/abilities/miniz/miniz.h。
-MINIZ_DIR   := kernel/abilities/miniz
-MINIZ_SRCS  := $(MINIZ_DIR)/miniz.c
-MINIZ_OBJS  := $(patsubst $(MINIZ_DIR)/%,$(BUILD)/miniz/%,$(MINIZ_SRCS:.c=.c.o))
-MINIZ_LIB   := $(BUILD)/libminiz.a
-MINIZ_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fno-asynchronous-unwind-tables -fcommon \
-                -DMINIZ_USE_ZLIB_COMPAT -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME \
-                -DNDEBUG -I include -I user/lib/shims \
-                -include user/lib/shims/string.h -include user/lib/shims/stdlib.h \
-                -include user/lib/shims/assert.h
-$(BUILD)/miniz/%.c.o: $(MINIZ_DIR)/%.c
+# ---- zlib（用户态压缩库，git submodule: lib/zlib @ v1.3.1）----
+# 供 libcurl 以 HAVE_LIBZ 接入（gzip/deflate Content-Encoding）。
+# 仅编译核心编解码源（排除 gz* 文件流实现）——它们依赖宿主文件流语义，本仓不需要。
+ZLIB_DIR    := lib/zlib
+ZLIB_SRCS   := $(ZLIB_DIR)/adler32.c $(ZLIB_DIR)/compress.c $(ZLIB_DIR)/crc32.c \
+               $(ZLIB_DIR)/deflate.c $(ZLIB_DIR)/infback.c $(ZLIB_DIR)/inffast.c \
+               $(ZLIB_DIR)/inflate.c $(ZLIB_DIR)/inftrees.c $(ZLIB_DIR)/trees.c \
+               $(ZLIB_DIR)/uncompr.c $(ZLIB_DIR)/zutil.c
+ZLIB_OBJS   := $(patsubst $(ZLIB_DIR)/%.c,$(BUILD)/zlib/%.c.o,$(ZLIB_SRCS))
+ZLIB_LIB    := $(BUILD)/libz.a
+ZLIB_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fcommon \
+               -fno-asynchronous-unwind-tables -fno-pic -fno-pie -mcmodel=small \
+               -DHAVE_HIDDEN=0 -DNO_GZCOMPRESS -DNO_GZIP \
+               -I $(ZLIB_DIR) -I include -I user/lib/shims
+$(BUILD)/zlib/%.c.o: $(ZLIB_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(USER_CC) $(MINIZ_CFLAGS) -c $< -o $@
-$(MINIZ_LIB): $(MINIZ_OBJS)
+	$(USER_CC) $(ZLIB_CFLAGS) -c $< -o $@
+$(ZLIB_LIB): $(ZLIB_OBJS)
 	@mkdir -p $(dir $@)
-	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ $(MINIZ_OBJS)
-	@echo "==> miniz static lib $(MINIZ_LIB)"
+	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ $(ZLIB_OBJS)
+	@echo "==> zlib static lib $(ZLIB_LIB) ($(words $(ZLIB_OBJS)) objects)"
+
+# ---- mbedTLS（TLS 后端，git submodule: lib/mbedtls @ 3.6.7 LTS）----
+# 经 -DMBEDTLS_CONFIG_FILE 指向 user/lib/suki_mbedtls_config.h（含官方默认配置 + SukiOS 裁剪）。
+# 熵源经 MBEDTLS_ENTROPY_HARDWARE_ALT + mbedtls_glue.c 的 mbedtls_hardware_poll 提供。
+MBEDTLS_DIR    := lib/mbedtls
+MBEDTLS_SRCS   := $(wildcard $(MBEDTLS_DIR)/library/*.c)
+MBEDTLS_OBJS   := $(patsubst $(MBEDTLS_DIR)/%.c,$(BUILD)/mbedtls/%.c.o,$(MBEDTLS_SRCS))
+MBEDTLS_LIB    := $(BUILD)/libmbedtls.a
+MBEDTLS_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fcommon \
+                  -fno-asynchronous-unwind-tables -fno-pic -fno-pie -mcmodel=small \
+                  -DMBEDTLS_CONFIG_FILE='"suki_mbedtls_config.h"' \
+                  -I $(MBEDTLS_DIR)/include -I $(MBEDTLS_DIR)/library \
+                  -I user/lib -I user/lib/shims -I include
+$(BUILD)/mbedtls/%.c.o: $(MBEDTLS_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(MBEDTLS_CFLAGS) -c $< -o $@
+$(MBEDTLS_LIB): $(MBEDTLS_OBJS)
+	@mkdir -p $(dir $@)
+	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ $(MBEDTLS_OBJS)
+	@echo "==> mbedTLS static lib $(MBEDTLS_LIB) ($(words $(MBEDTLS_OBJS)) objects)"
+
+# mbedTLS 用户态垫片（熵源/毫秒时间）需要 mbedTLS 头，且必须与库使用同一配置头。
+$(BUILD)/user/lib/mbedtls_glue.c.o: user/lib/mbedtls_glue.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -DMBEDTLS_CONFIG_FILE='"suki_mbedtls_config.h"' \
+		-I user/lib -I $(MBEDTLS_DIR)/include -c $< -o $@
 
 # ---- libcurl（HTTP/HTTPS 客户端静态库）----
 # 配置为手写 user/lib/curl_config.h（无法在宿主运行 configure）；经 -DHAVE_CONFIG_H
@@ -352,8 +380,10 @@ CURL_LIB    := $(BUILD)/libcurl.a
 CURL_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fcommon \
                -fno-asynchronous-unwind-tables -fno-pic -fno-pie -mcmodel=small \
                -DBUILDING_LIBCURL -DHAVE_CONFIG_H -DCURL_STATICLIB \
+               -DMBEDTLS_CONFIG_FILE='"suki_mbedtls_config.h"' \
                -I $(CURL_DIR)/include -I $(CURL_DIR)/lib \
-               -I user/lib -I user/lib/shims -I include -include $(CONFIG_H)
+               -I $(MBEDTLS_DIR)/include \
+               -I lib/zlib -I user/lib -I user/lib/shims -I include -include $(CONFIG_H)
 $(BUILD)/curl/%.c.o: $(CURL_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(USER_CC) $(CURL_CFLAGS) -c $< -o $@
@@ -389,7 +419,21 @@ else
 RUST_BLOB := $(BUILD)/user/rusthello.blob.o
 endif
 
-OBJS := $(patsubst %,$(BUILD)/%.o,$(C_SRCS) $(S_SRCS)) $(USER_BLOBS) $(RUST_BLOB)
+# ---- miniz 内核能力（Ring0 压缩）----
+# kernel/abilities/ 默认被 C_SRCS 的 find 排除（用户态能力库不入内核）；此处**显式**
+# 把 miniz 源编入内核：以 shim 头（assert/stdlib/string）适配 freestanding 环境，
+# 分配经 kminiz.c 映射到内核堆。为后续 minOSEnv/rootfs（initramfs、.spkg 解压）预留。
+KMINIZ_DIR  := kernel/abilities/miniz
+KMINIZ_SRCS := $(KMINIZ_DIR)/miniz.c $(KMINIZ_DIR)/kminiz.c
+KMINIZ_OBJS := $(patsubst %.c,$(BUILD)/%.c.o,$(KMINIZ_SRCS))
+KMINIZ_CFLAGS := $(CFLAGS) \
+                 -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_APIS \
+                 -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES -I $(KMINIZ_DIR)/shim
+$(BUILD)/kernel/abilities/miniz/%.c.o: $(KMINIZ_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(KMINIZ_CFLAGS) -c $< -o $@
+
+OBJS := $(patsubst %,$(BUILD)/%.o,$(C_SRCS) $(S_SRCS)) $(USER_BLOBS) $(RUST_BLOB) $(KMINIZ_OBJS)
 
 # ---- 磁盘镜像 (FAT32) ----
 DISK := $(BUILD)/disk.img
@@ -586,12 +630,12 @@ $(BUILD)/user/%.elf: $(BUILD)/user/%.c.o $(USER_LIB_OBJS) user/user.ld
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
-# shell 专用：链接 gui.c.o（窗口程序，调用 suki_create_window 等）+ miniz 静态库
-# （shell 的 libc_selftest 内做 miniz 压缩/解压往返自检，验证用户态能力库可用）。
-$(BUILD)/user/shell.elf: $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(MINIZ_LIB) user/user.ld
+# shell 专用：链接 gui.c.o（窗口程序，调用 suki_create_window 等）+ zlib 静态库
+# （shell 的 libc_selftest 内做 zlib 压缩/解压往返自检）。
+$(BUILD)/user/shell.elf: $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(ZLIB_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--no-warn-rwx-segments -T user/user.ld \
-		-o $@ $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(MINIZ_LIB) -lgcc
+		-o $@ $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(ZLIB_LIB) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # fs_server 专用：追加 FatFs 核心对象
@@ -631,10 +675,10 @@ $(BUILD)/user/nettest.c.o: user/apps/nettest.c
 $(BUILD)/user/curl_test.c.o: user/apps/curl_test.c
 	@mkdir -p $(dir $@)
 	$(USER_CC) $(USER_CFLAGS) -I $(CURL_DIR)/include -c $< -o $@
-$(BUILD)/user/curl_test.elf: $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(MINIZ_LIB) user/user.ld
+$(BUILD)/user/curl_test.elf: $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
-		-o $@ $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(MINIZ_LIB) -lgcc
+		-o $@ $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # 把 ELF 文件作为原始字节流嵌入内核镜像（objcopy -I binary 生成

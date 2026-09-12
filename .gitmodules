@@ -10,3 +10,6 @@
 [submodule "lib/freetype-2.14.3"]
 	path = lib/freetype-2.14.3
 	url = https://github.com/freetype/freetype.git
+[submodule "lib/zlib"]
+	path = lib/zlib
+	url = https://github.com/madler/zlib.git

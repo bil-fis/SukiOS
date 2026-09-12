@@ -37,6 +37,7 @@
 #include <kernel/string.h>
 #include <kernel/task.h>
 #include <mm/vma.h> /* P0-5：vma_selftest */
+#include <kernel/abilities/kminiz.h> /* 内核内嵌压缩能力（miniz）自检 */
 #include <kernel/syscall.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -306,6 +307,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     vmm_init();
     kheap_init();
     mm_selftest();
+
+    /* ---- 内核内嵌压缩能力（miniz）自检：为 minOSEnv/rootfs 预留 ----
+     * 依赖内核堆（kheap_init）已就绪。 */
+    kminiz_selftest();
 
     /* ---- P0-8：安全地基总装（vmm/kheap 就绪后、SMP 启动前）----
      * UMIP 使能 + NXE/SMEP/SMAP 复核 + BSP 守卫页 IST 栈 + Meltdown 检测 */

@@ -489,3 +489,17 @@ void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
     }
     return NULL;
 }
+
+/* ---- 伪随机数（C 标准 LCG；供 mbedTLS rsa.c 等第三方库使用）---- */
+static unsigned long g_rand_state = 1;
+
+void srand(unsigned int seed)
+{
+    g_rand_state = seed ? (unsigned long)seed : 1UL;
+}
+
+int rand(void)
+{
+    g_rand_state = g_rand_state * 1103515245UL + 12345UL;
+    return (int)((g_rand_state >> 16) & 0x7FFFFFFFUL);
+}

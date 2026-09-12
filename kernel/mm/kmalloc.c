@@ -229,3 +229,35 @@ void kfree(void *ptr)
     }
     spin_unlock_irqrestore(&g_kheap_lock, irqf);
 }
+
+/*
+ * krealloc：重新分配内核堆块（供内核能力 miniz 等使用）。
+ * - ptr==NULL 等价 kmalloc(size)；size==0 等价 kfree(ptr) 并返回 NULL。
+ * - 缩小时原地返回；扩大时新分配 + 拷贝旧负载 + 释放旧块。
+ * 不持 g_kheap_lock 调用 kmalloc/kfree（二者内部各自加锁），避免嵌套死锁。
+ */
+void *krealloc(void *ptr, size_t size)
+{
+    if (!ptr) {
+        return kmalloc(size);
+    }
+    if (size == 0) {
+        kfree(ptr);
+        return NULL;
+    }
+    block_t *b = (block_t *)((uint64_t)ptr - HDR_SIZE);
+    uint64_t old = b->size;              /* 旧负载字节数（块头记录，读取合法） */
+    if (size <= old) {
+        return ptr;                      /* 原地复用，无需搬移 */
+    }
+    void *np = kmalloc(size);
+    if (!np) {
+        return NULL;
+    }
+    uint8_t *s = (uint8_t *)ptr, *d = (uint8_t *)np;
+    for (uint64_t i = 0; i < old; i++) {
+        d[i] = s[i];
+    }
+    kfree(ptr);
+    return np;
+}

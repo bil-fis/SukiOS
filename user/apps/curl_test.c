@@ -3,11 +3,11 @@
  * -----------------------------------------------------------------------------
  * libcurl 移植端到端验证程序（开机自检由 kmain 内嵌 spawn）。
  *
- * 用 libcurl 的 easy 接口对 QEMU user-net 网关（10.0.2.2 = 宿主机）发起真实
- * HTTP GET，验证「libcurl → socket(150-166) → 内核 sys_net_dispatch → net_server
- * (lwIP) → 真实 TCP」整条链路。默认 URL 指向宿主机 8000 端口的 HTTP 服务。
- *
- * 输出经 u_print 落到 serial，供无头回归判读。
+ * 用 libcurl easy 接口对 QEMU user-net 网关（10.0.2.2 = 宿主机）发起真实请求：
+ *   1) HTTP  : http://10.0.2.2:8000/hello.txt   （TCP + HTTP）
+ *   2) HTTPS : https://10.0.2.2:8443/hello.txt  （TLS，mbedTLS 后端；自签证书，关闭校验）
+ * 覆盖「libcurl → socket(150-166) → 内核 sys_net_dispatch → net_server(lwIP) → 真实 TCP」
+ * 与「libcurl → mbedTLS(TLS) → 同上」两条链路。输出经 u_print 落到 serial。
  */
 #include "lib/suki.h"
 #include <string.h>
@@ -39,29 +39,18 @@ static void pd(uint64_t v)
     u_print(u_utoa_s(v, b, sizeof(b)));
 }
 
-int main(int argc, char **argv)
+/*
+ * 执行一次 GET（带 DHCP 等待重试）。insecure!=0 时关闭证书校验（自签场景）。
+ * 成功返回 0（*out_code 为 HTTP 状态码），否则返回 libcurl 错误码。
+ */
+static int run_get(const char *tag, const char *url, int insecure, long *out_code)
 {
-    const char *url = (argc > 1 && argv[1] && argv[1][0])
-                        ? argv[1] : "http://10.0.2.2:8000/hello.txt";
-
-    u_print("[curl] === libcurl easy GET ===\n");
-    u_print("[curl] URL: "); u_print(url); u_print("\n");
-    u_print("[curl] libcurl version: "); u_print(curl_version()); u_print("\n");
-
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
-        u_print("[curl] curl_global_init FAIL\n");
-        sys_exit(1);
-    }
-
     CURLcode rc = CURLE_OK;
     long code = 0;
 
-    /* 网络（DHCP）尚未就绪时 connect 会失败。最多重试 400 次、每次小睡 20ms
-     * （共约 8s 预算），既等待 DHCP 绑定、又避免与 net_server 抢 CPU（互相饿死）；
-     * 仅在每 20 次打印一次，避免刷屏。 */
     for (int attempt = 0; attempt < 400; attempt++) {
         CURL *h = curl_easy_init();
-        if (!h) { u_print("[curl] curl_easy_init FAIL\n"); curl_global_cleanup(); sys_exit(1); }
+        if (!h) { u_print("[curl] curl_easy_init FAIL\n"); return -1; }
 
         g_len = 0;
         g_body[0] = '\0';
@@ -72,33 +61,86 @@ int main(int argc, char **argv)
         curl_easy_setopt(h, CURLOPT_TIMEOUT, 10L);
         curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 5L);
         curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+        if (insecure) {
+            curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+            curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+        }
 
+        u_print("[curl] "); u_print(tag); u_print(" try "); pd((uint64_t)attempt);
+        u_print(": perform...\n");
         rc = curl_easy_perform(h);
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
         curl_easy_cleanup(h);
+        u_print("[curl] "); u_print(tag); u_print(" try "); pd((uint64_t)attempt);
+        u_print(" done rc="); pd((uint64_t)rc); u_print("\n");
 
         if (rc == CURLE_OK)
             break;
         if ((attempt % 20) == 0) {
-            u_print("[curl] attempt "); pd((uint64_t)attempt);
-            u_print(" rc="); pd((uint64_t)rc);
+            u_print("[curl] "); u_print(tag); u_print(" attempt ");
+            pd((uint64_t)attempt); u_print(" rc="); pd((uint64_t)rc);
             u_print(" ("); u_print(curl_easy_strerror(rc)); u_print("), retry\n");
         }
         struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 20 * 1000 * 1000;
         nanosleep(&ts, (struct timespec *)0);
     }
 
-    if (rc == CURLE_OK) {
-        u_print("[curl] HTTP status="); pd((uint64_t)code);
-        u_print(" body="); pd((uint64_t)g_len); u_print(" bytes\n");
-        u_print("[curl] body: "); u_print(g_body); u_print("\n");
-        u_print("[curl] libcurl HTTP GET: PASS\n");
-    } else {
-        u_print("[curl] libcurl HTTP GET: FAIL rc="); pd((uint64_t)rc);
-        u_print(" ("); u_print(curl_easy_strerror(rc)); u_print(")\n");
+    if (out_code) *out_code = code;
+    return (int)rc;
+}
+
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    const char *http_url  = "http://10.0.2.2:8000/hello.txt";
+    const char *https_url = "https://10.0.2.2:8443/hello.txt";
+
+    u_print("[curl] === libcurl easy GET ===\n");
+    u_print("[curl] libcurl version: "); u_print(curl_version()); u_print("\n");
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+        u_print("[curl] curl_global_init FAIL\n");
+        sys_exit(1);
+    }
+
+    int fails = 0;
+
+    /* ---- 1) HTTP ---- */
+    {
+        long code = 0;
+        int rc = run_get("http", http_url, 0, &code);
+        u_print("[curl] HTTP  URL: "); u_print(http_url); u_print("\n");
+        if (rc == 0) {
+            u_print("[curl] HTTP  status="); pd((uint64_t)code);
+            u_print(" body="); pd((uint64_t)g_len); u_print(" bytes: ");
+            u_print(g_body); u_print("\n");
+            u_print("[curl] libcurl HTTP  GET: PASS\n");
+        } else {
+            fails++;
+            u_print("[curl] libcurl HTTP  GET: FAIL rc="); pd((uint64_t)rc);
+            u_print(" ("); u_print(curl_easy_strerror((CURLcode)rc)); u_print(")\n");
+        }
+    }
+
+    /* ---- 2) HTTPS（TLS via mbedTLS；自签证书，关闭校验） ---- */
+    {
+        long code = 0;
+        int rc = run_get("https", https_url, 1, &code);
+        u_print("[curl] HTTPS URL: "); u_print(https_url); u_print("\n");
+        if (rc == 0) {
+            u_print("[curl] HTTPS status="); pd((uint64_t)code);
+            u_print(" body="); pd((uint64_t)g_len); u_print(" bytes: ");
+            u_print(g_body); u_print("\n");
+            u_print("[curl] libcurl HTTPS GET: PASS\n");
+        } else {
+            fails++;
+            u_print("[curl] libcurl HTTPS GET: FAIL rc="); pd((uint64_t)rc);
+            u_print(" ("); u_print(curl_easy_strerror((CURLcode)rc)); u_print(")\n");
+        }
     }
 
     curl_global_cleanup();
-    sys_exit(rc == CURLE_OK ? 0 : 1);
+    sys_exit(fails == 0 ? 0 : 1);
     return 0;
 }

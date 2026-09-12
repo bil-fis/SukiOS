@@ -39,6 +39,10 @@ int    unsetenv(const char *name);
 int    putenv(char *string);
 extern char **environ;
 
+/* ---- 伪随机数 ---- */
+int    rand(void);
+void   srand(unsigned int seed);
+
 /* ---- 字符串转数值 ---- */
 long   strtol(const char *nptr, char **endptr, int base);
 long long strtoll(const char *nptr, char **endptr, int base);

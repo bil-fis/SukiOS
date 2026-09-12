@@ -162,8 +162,14 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **来源/配置**：`lib/curl`（git submodule，`8.22.0`，见 §5.1）。不运行 autotools/CMake，改为**手写 `user/lib/curl_config.h`**（经 `-DHAVE_CONFIG_H` 被 `curl_setup.h` 引入），按 SukiOS 用户态实有能力声明 `HAVE_*`。
 - **libc 补齐**（libcurl 需要而原 libc 缺失的）：新增 `<sys/types.h>`/`<sys/stat.h>`/`<signal.h>` 标准头；新增 `FILE` 流层（`user/lib/fileio.c`：`fopen/fdopen/fread/fwrite/fgets/fprintf/...` 与 `stdin/stdout/stderr`）；新增 `strspn/strcspn/strpbrk`、`bsearch`、`fstat/stat/lstat`、`gethostname`；补网络 errno（`EWOULDBLOCK/EADDRINUSE/EISCONN/...`）与 `PF_*`。并按 POSIX/glibc 语义让 `<sys/socket.h>` 暴露 `fd_set`、`struct sigaction` 暴露 `sa_handler` 宏。
 - **构建**：`build/libcurl.a`（`lib/*.c` + `curlx/*` + `vauth/*` + `vdns/*` + `vtls/*` + `vquic/vquic.c`），链接进 `curl_test`。
-- **能力**：**HTTP**、FTP、TFTP；gzip/deflate 经 **miniz**（zlib 兼容层，`HAVE_LIBZ`）；仅 IPv4、同步 `getaddrinfo` 解析、无线程、无 c-ares；LDAP/SMTP/IMAP/POP3/... 经官方 `CURL_DISABLE_*` 关闭。**HTTPS/TLS 后端待 mbedTLS 接入**（见 §3）。
-- **验证**：开机自检 `curl_test`（`user/apps/curl_test.c`）用 easy 接口对宿主机 HTTP 服务发起真实 GET，得 **HTTP 200 + 正确响应体**，零 panic（详见 `results/step84.md`）。
+- **能力**：**HTTP / HTTPS（TLS）/ FTP / TFTP**；gzip/deflate 经 **zlib**（`lib/zlib` @ v1.3.1，`HAVE_LIBZ`）；TLS 后端为 **mbedTLS**（`lib/mbedtls` @ 3.6.7 LTS，`USE_MBEDTLS`）；仅 IPv4、同步 `getaddrinfo` 解析、无线程、无 c-ares；LDAP/SMTP/IMAP/POP3/... 经官方 `CURL_DISABLE_*` 关闭。
+- **验证**：开机自检 `curl_test`（`user/apps/curl_test.c`）用 easy 接口对宿主机服务发起真实请求——**HTTP**（200 + 响应体）与 **HTTPS**（TLS 握手 + 200 + 响应体，自签证书）均通过，零 panic（详见 `results/step84.md`、`results/step85.md`）。
+
+### 2.13 内核内嵌压缩能力（miniz）
+- **形态**：`kernel/abilities/miniz/`（miniz，zlib 风格）**编入 Ring0 内核**，对外提供内核 API（`include/kernel/abilities/kminiz.h`：`kminiz_compress/uncompress/compress_bound/adler32/crc32`），实现在 `kernel/abilities/miniz/kminiz.c`。
+- **适配**：自定义 `assert/stdlib/string` 垫片适配 freestanding 环境；分配经垫片映射到内核堆（`kmalloc/kzalloc/krealloc/kfree`）。为此给内核堆新增了 `krealloc()`。
+- **用途**：为后续**最小系统环境（minOSEnv / rootfs）**预留内核态解压能力（如 initramfs、`.spkg` 软件包）。开机自检 `kminiz_selftest()` 做压缩→解压往返校验（kernel.ski 启动即打印 `[kminiz] selftest OK`）。
+- **说明**：用户态不再使用 miniz（改用真实 zlib，见 §2.12）。
 
 ---
 
@@ -181,7 +187,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **`.kdr` 内核模块加载器（未实现）**：**用户态共享库动态链接已实现**（`.sl` + 内核 `ld.suki` + syscall 126–129 + `dltest` 自检，见 §2.11）；但 **`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现**，当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
-- **HTTPS / TLS 后端（mbedTLS，未接入）**：libcurl 已集成并可用（HTTP/FTP/TFTP + zlib via miniz，见 §2.12 与 `results/step84.md`），但**尚未接入 TLS 后端**，故暂不支持 `https://`。mbedTLS `3.6.7`（LTS）已作为 submodule 位于 `lib/mbedtls`（见 §5.1）；后续将其编译为静态库 + 提供用户态平台适配（熵源 RDRAND/软 PRNG、timing 经 `gettimeofday`），再以 `USE_MBEDTLS` 接入 libcurl。
+- **curl 命令行应用（进行中）**：libcurl **库**已完整可用（HTTP/HTTPS/FTP/TFTP + zlib + mbedTLS，见 §2.12 与 `results/step85.md`）；把上游 `lib/curl/src`（curl 命令行工具）编为**可从 shell 运行的应用程序**（`::BIN/CURL.SKA`）仍在推进——主要受内核 `execve`/spawn 单次加载字节数上限（当前 OOL 16 页=64 KiB）制约，需配套放宽内核加载上限；另需为工具补齐若干 libc（`isatty`/`getpwuid`/`setlocale` 等）。
 - **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
 
 ---
@@ -327,8 +333,9 @@ SukiOS/
 ├── lib/                   # 第三方【库】——全部以 git submodule 引入（库文件放 lib/）
 │   ├── lwip-2.2.1/        # lwIP TCP/IP 协议栈（BSD-3-Clause）@ tag STABLE-2_2_1_RELEASE，net_server 用
 │   ├── freetype-2.14.3/   # FreeType 字体光栅化引擎（FTL）@ tag VER-2-14-3，fontsrv 用
-│   ├── mbedtls/           # mbedTLS 3.6.7（LTS，Apache-2.0）@ tag mbedtls-3.6.7，TLS 后端（待接入）
-│   └── curl/              # libcurl 8.22.0（curl 许可）@ tag curl-8_22_0，HTTP/FTP/TFTP 客户端（已集成，见 §2.12）
+│   ├── mbedtls/           # mbedTLS 3.6.7（LTS，Apache-2.0）@ tag mbedtls-3.6.7，TLS 后端（已接入）
+│   ├── curl/              # libcurl 8.22.0（curl 许可）@ tag curl-8_22_0，HTTP/HTTPS/FTP/TFTP（已集成，见 §2.12）
+│   └── zlib/              # zlib 1.3.1（zlib 许可）@ tag v1.3.1，用户态压缩（libcurl 用）
 ├── compapps/              # 第三方【程序/工具】——以 git submodule 引入（程序文件放 compapps/）
 ├── include/               # 内核 / 用户态公共头
 ├── grub/                  # grub.cfg（ISO 引导配置）
@@ -361,8 +368,9 @@ SukiOS 引入外部第三方项目**一律使用 `git submodule`**（不再把�
 |---|---|---|---|
 | `lib/lwip-2.2.1` | `lwip-tcpip/lwip` | `STABLE-2_2_1_RELEASE` | 用户态 `net_server` 的 TCP/IP 协议栈 |
 | `lib/freetype-2.14.3` | `freetype/freetype` | `VER-2-14-3` | `fontsrv` 字形光栅化 |
-| `lib/mbedtls` | `Mbed-TLS/mbedtls` | `mbedtls-3.6.7`（3.6 LTS） | HTTPS/TLS 后端（供 libcurl，待接入） |
-| `lib/curl` | `curl/curl` | `curl-8_22_0` | HTTP/HTTPS 客户端（待集成） |
+| `lib/mbedtls` | `Mbed-TLS/mbedtls` | `mbedtls-3.6.7`（3.6 LTS） | HTTPS/TLS 后端（**已接入** libcurl，见 §2.12） |
+| `lib/curl` | `curl/curl` | `curl-8_22_0` | HTTP/HTTPS 客户端库 libcurl（**已集成**，见 §2.12） |
+| `lib/zlib` | `madler/zlib` | `v1.3.1` | 用户态压缩库（libcurl 的 gzip/deflate Content-Encoding） |
 
 使用方式：
 

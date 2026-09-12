@@ -1057,33 +1057,33 @@ static void libc_selftest(void)
         else { fail++; shell_out("[libc-test] FAIL gettimeofday/clock_gettime\n"); }
     }
 
-    /* 8) miniz（user/lib/shims/zlib.h + build/libminiz.a）：压缩/解压往返一致性 */
+    /* 8) zlib（lib/zlib @ v1.3.1，submodule）：压缩/解压往返一致性 */
     {
         static const char mmsg[] =
-            "SukiOS miniz zlib-compat round trip: The quick brown fox jumps "
+            "SukiOS zlib round trip: The quick brown fox jumps "
             "over the lazy dog. 0123456789 0123456789 0123456789";
         static uint8_t comp[512];
         static uint8_t decomp[512];
-        mz_ulong clen = (mz_ulong)sizeof(comp);
-        mz_ulong dlen = (mz_ulong)sizeof(decomp);
-        mz_ulong src_len = (mz_ulong)(u_strlen(mmsg) + 1);
-        int rc = mz_compress2(comp, &clen, (const unsigned char *)mmsg,
-                              src_len, MZ_DEFAULT_LEVEL);
-        if (rc == MZ_OK && clen > 0 && clen < src_len) {
-            rc = mz_uncompress(decomp, &dlen, comp, clen);
-            if (rc == MZ_OK && dlen == src_len &&
+        uLongf clen = (uLongf)sizeof(comp);
+        uLongf dlen = (uLongf)sizeof(decomp);
+        uLong src_len = (uLong)(u_strlen(mmsg) + 1);
+        int rc = compress2(comp, &clen, (const Bytef *)mmsg,
+                           src_len, Z_DEFAULT_COMPRESSION);
+        if (rc == Z_OK && clen > 0 && clen < src_len) {
+            rc = uncompress(decomp, &dlen, comp, clen);
+            if (rc == Z_OK && dlen == src_len &&
                 u_strcmp((char *)decomp, mmsg) == 0) {
                 pass++;
-                shell_out("[libc-test] miniz roundtrip OK ("); 
+                shell_out("[libc-test] zlib roundtrip OK (");
                 shell_out(u_utoa_s((uint64_t)src_len, nbuf, sizeof(nbuf)));
                 shell_out(" -> ");
                 shell_out(u_utoa_s((uint64_t)clen, nbuf, sizeof(nbuf)));
                 shell_out(" bytes)\n");
             } else {
-                fail++; shell_out("[libc-test] FAIL mz_uncompress\n");
+                fail++; shell_out("[libc-test] FAIL uncompress\n");
             }
         } else {
-            fail++; shell_out("[libc-test] FAIL mz_compress2\n");
+            fail++; shell_out("[libc-test] FAIL compress2\n");
         }
     }
 

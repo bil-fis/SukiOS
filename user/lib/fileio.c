@@ -34,18 +34,26 @@ FILE *stderr = &g_stderr;
 
 int fileno(FILE *fp) { return fp ? fp->fd : -1; }
 
-FILE *fopen(const char *path, const char *mode)
+/* 标准 fopen/freopen 模式串 → 内核 open() 标志 */
+static int mode_to_flags(const char *mode)
 {
-    if (!path || !mode) { errno = EINVAL; return NULL; }
-
     int flags = 0;
     int plus = (strchr(mode, '+') != NULL);
     switch (mode[0]) {
     case 'r': flags = plus ? O_RDWR : O_RDONLY; break;
     case 'w': flags = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC; break;
     case 'a': flags = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND; break;
-    default:  errno = EINVAL; return NULL;
+    default:  return -1;
     }
+    return flags;
+}
+
+FILE *fopen(const char *path, const char *mode)
+{
+    if (!path || !mode) { errno = EINVAL; return NULL; }
+
+    int flags = mode_to_flags(mode);
+    if (flags < 0) { errno = EINVAL; return NULL; }
 
     int fd = open(path, flags, 0644);
     if (fd < 0) return NULL;
@@ -148,6 +156,26 @@ char *fgets(char *s, int size, FILE *fp)
     }
     s[i] = '\0';
     return s;
+}
+
+/* freopen：把已有流重新关联到 path（先关闭该流原有 fd，再按 mode 打开），
+ * 成功返回原 stream，失败返回 NULL。供 curl 工具等做 stderr 重定向。 */
+FILE *freopen(const char *path, const char *mode, FILE *stream)
+{
+    if (!stream || !path || !mode) { errno = EINVAL; return NULL; }
+    int flags = mode_to_flags(mode);
+    if (flags < 0) { errno = EINVAL; return NULL; }
+
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return NULL;
+
+    if (stream->close_on_close && stream->fd >= 3)
+        close(stream->fd);
+    stream->fd  = fd;
+    stream->eof = 0;
+    stream->err = 0;
+    stream->close_on_close = 1;
+    return stream;
 }
 
 int fflush(FILE *fp) { (void)fp; return 0; }

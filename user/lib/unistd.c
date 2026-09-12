@@ -167,3 +167,18 @@ int gethostname(char *name, size_t len)
     }
     return 0;
 }
+
+/* 截断/扩展文件到指定长度（供 curl 工具等使用）。 */
+int ftruncate(int fd, off_t length)
+{
+    long r = suki_syscall2(SYS_FTRUNCATE, (uint64_t)fd, (uint64_t)length);
+    return (int)libc_ret(r);
+}
+
+/* 是否为终端设备。SukiOS 用户态标准流走 CGA/串口，不是 POSIX tty；
+ * 返回 0 使第三方程序（如 curl）走非终端分支（不绘制进度条、不报终端告警）。 */
+int isatty(int fd)
+{
+    (void)fd;
+    return 0;
+}

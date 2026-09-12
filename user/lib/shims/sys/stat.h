@@ -37,6 +37,18 @@
 #define S_IXOTH  00001
 
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
+
+/* 传统秒级时间戳成员名：本 libc 的 struct stat 以纳秒拆分字段存储，
+ * 这里按传统名做成员别名（与 glibc 语义一致：tv_sec 部分）。 */
+#ifndef st_atime
+#define st_atime  st_atim_sec
+#endif
+#ifndef st_mtime
+#define st_mtime  st_mtim_sec
+#endif
+#ifndef st_ctime
+#define st_ctime  st_ctim_sec
+#endif
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
 #define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)

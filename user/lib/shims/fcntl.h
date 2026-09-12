@@ -47,6 +47,6 @@
 #endif
 
 /* fcntl 包装（实现见 user/lib/net.c） */
-int fcntl(int fd, int cmd, int arg);
+int fcntl(int fd, int cmd, ...);   /* 标准可变参数：F_GETFL 等无第三参，F_SETFL 带 flags */
 
 #endif /* _SUKI_SHIM_FCNTL_H */

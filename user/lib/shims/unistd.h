@@ -92,6 +92,8 @@ int   kill(int pid, int sig);
 int   getpid(void);
 int   getppid(void);
 int   gethostname(char *name, size_t len);
+int   isatty(int fd);
+int   ftruncate(int fd, off_t length);
 void  _exit(int code);
 unsigned int sleep(unsigned int seconds);
 int   usleep(unsigned int usec);

@@ -323,10 +323,11 @@ static uint64_t sys_port_free(uint64_t port)
 #define EXEC_PATH_MAX   256
 #define EXEC_ARG_MAX    ELF_ARG_MAX   /* 与 elf_build_stack 容量共享同一常量（H1） */
 #define EXEC_STR_MAX    512
-/* 可装载 ELF 映像上限：由原 64KiB(OOL 单条) 提升为 1MiB。
- * 原因：fontsrv 集成 FreeType 后映像约 950KiB；exec_read_file 现改为
- * FS_MSG_READ_AT 分块读（不再受 OOL 16 页限制），故内核侧上限可独立放大。 */
-#define EXEC_ELF_MAX    (1024 * 1024)
+/* 可装载 ELF 映像上限：由原 64KiB(OOL 单条) → 1MiB → 4MiB。
+ * 原因：fontsrv 集成 FreeType 后映像约 950KiB；curl CLI（集成 libcurl + mbedTLS +
+ * zlib 后约 1.6MiB）超过 1MiB。exec_read_file 已改为 FS_MSG_READ_AT 分块读
+ * （不再受 OOL 16 页限制），故内核侧上限可独立放大为 4MiB。 */
+#define EXEC_ELF_MAX    (4 * 1024 * 1024)
 
 /* 这两个 scratch 由 syscall_entry.S 存入“当前任务”的 scr_rip/scr_rsp
  * （task_t 字段，经 g_scratch 指针访问）；execve 改写它们使 syscall 返回

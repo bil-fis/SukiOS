@@ -133,7 +133,7 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test dltest winhello
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -204,7 +204,7 @@ USER_BLOBS    := $(patsubst %,$(BUILD)/user/%.ssvc.blob.o,$(USER_PROGS))
 #   * 可使用浮点 / SSE（minimp3 MP3 解码依赖），故启用 -msse2 且去掉
 #     -mgeneral-regs-only（内核 switch.S 已 fxsave/fxrstor 保存 Ring3 SSE 上下文）。
 #   * -Os 优先缩小体积，以适配内核 execve 单条 OOL(16 页=64KiB) 的加载上限。
-APP_PROGS    := hello playaudio audiotest bmploader nettest dltest winhello
+APP_PROGS    := hello playaudio audiotest bmploader nettest dltest winhello curl
 APP_CFLAGS   := -ffreestanding -nostdlib -std=gnu11 -Os \
                 -mno-red-zone -msse -msse2 \
                 -ffunction-sections -fdata-sections \
@@ -391,6 +391,32 @@ $(CURL_LIB): $(CURL_OBJS)
 	@mkdir -p $(dir $@)
 	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ $(CURL_OBJS)
 	@echo "==> libcurl static lib $(CURL_LIB) ($(words $(CURL_OBJS)) objects)"
+
+# ---- curl 命令行工具（lib/curl/src，与 Linux curl 同源的 CLI）----
+CURLTOOL_DIR    := lib/curl/src
+CURLTOOL_SRCS   := $(wildcard $(CURLTOOL_DIR)/*.c) $(wildcard $(CURLTOOL_DIR)/toolx/*.c)
+CURLTOOL_OBJS   := $(patsubst $(CURLTOOL_DIR)/%.c,$(BUILD)/curltool/%.c.o,$(CURLTOOL_SRCS))
+CURLTOOL_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fcommon \
+                   -fno-asynchronous-unwind-tables -fno-pic -fno-pie -mcmodel=small \
+                   -DHAVE_CONFIG_H -DCURL_STATICLIB \
+                   -DMBEDTLS_CONFIG_FILE='"suki_mbedtls_config.h"' \
+                   -I $(CURLTOOL_DIR) -I $(CURL_DIR)/include -I $(CURL_DIR)/lib \
+                   -I $(MBEDTLS_DIR)/include -I lib/zlib \
+                   -I user/lib -I user/lib/shims -I include
+$(BUILD)/curltool/%.c.o: $(CURLTOOL_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(CURLTOOL_CFLAGS) -c $< -o $@
+
+# 仅编译不链接（便于移植期用 make -k curltool-objs 一次性收集全部编译错误）
+.PHONY: curltool-objs
+curltool-objs: $(CURLTOOL_OBJS)
+
+# 链接 curl 命令行工具（CLI）：curl 工具目标 + 用户库 + libcurl + zlib + mbedTLS
+$(BUILD)/apps/curl.elf: $(CURLTOOL_OBJS) $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $(CURLTOOL_OBJS) $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) -lgcc
+	@echo "==> curl CLI app $@ ($$(stat -c%s $@) bytes)"
 
 # 字体相关独立程序：fontsrv（常驻字体服务）与 pchfnt（渲染命令行工具）
 FONT_PROGS  := fontsrv pchfnt
@@ -671,7 +697,11 @@ $(BUILD)/user/nettest.c.o: user/apps/nettest.c
 	@mkdir -p $(dir $@)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
-# curl_test（libcurl 移植端到端验证）：源码在 user/apps/，额外链接 libcurl + miniz。
+# curl_app_test：从磁盘装载并执行 ::BIN/CURL.SKA 的验证程序（源码在 user/apps/）。
+$(BUILD)/user/curl_app_test.c.o: user/apps/curl_app_test.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+# curl_test（libcurl 移植端到端验证）：源码在 user/apps/，额外链接 libcurl + zlib + mbedTLS。
 $(BUILD)/user/curl_test.c.o: user/apps/curl_test.c
 	@mkdir -p $(dir $@)
 	$(USER_CC) $(USER_CFLAGS) -I $(CURL_DIR)/include -c $< -o $@

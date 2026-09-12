@@ -18,6 +18,7 @@
 #include "lib/suki.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -176,7 +177,13 @@ int poll(struct pollfd *fds, unsigned int nfds, int timeout) {
                                        (uint64_t)timeout, 0, 0));
 }
 
-int fcntl(int fd, int cmd, int arg) {
+int fcntl(int fd, int cmd, ...) {
+    /* 标准 fcntl 为可变参数：F_GETFL/F_GETFD 等无第三参，F_SETFL/F_SETFD 带 flags。
+     * 统一读取一个 int 实参（无第三参时该值被内核在该 cmd 下忽略）。 */
+    va_list ap;
+    va_start(ap, cmd);
+    int arg = va_arg(ap, int);
+    va_end(ap);
     return net_ret((long)suki_syscall5(SYS_FCNTL, (uint64_t)fd, (uint64_t)cmd,
                                        (uint64_t)arg, 0, 0));
 }

@@ -165,7 +165,14 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **能力**：**HTTP / HTTPS（TLS）/ FTP / TFTP**；gzip/deflate 经 **zlib**（`lib/zlib` @ v1.3.1，`HAVE_LIBZ`）；TLS 后端为 **mbedTLS**（`lib/mbedtls` @ 3.6.7 LTS，`USE_MBEDTLS`）；仅 IPv4、同步 `getaddrinfo` 解析、无线程、无 c-ares；LDAP/SMTP/IMAP/POP3/... 经官方 `CURL_DISABLE_*` 关闭。
 - **验证**：开机自检 `curl_test`（`user/apps/curl_test.c`）用 easy 接口对宿主机服务发起真实请求——**HTTP**（200 + 响应体）与 **HTTPS**（TLS 握手 + 200 + 响应体，自签证书）均通过，零 panic（详见 `results/step84.md`、`results/step85.md`）。
 
-### 2.13 内核内嵌压缩能力（miniz）
+### 2.13 curl 命令行应用（`::BIN/CURL.SKA`）
+- **同源**：直接编译上游 `lib/curl/src`（curl 命令行工具，42 个源文件），与 Linux 上的 `curl` 是同一份代码、同一套参数语义（`curl_getparam`/`tool_operate` 等），不是自研简化版。
+- **构建**：`build/apps/curl.elf`（约 1.63 MiB），链接 `USER_LIB_OBJS + libcurl.a + libz.a + libmbedtls.a`；安装到 FAT32 磁盘 `::BIN/CURL.SKA`（与其他独立程序一致，`exec BIN/curl` 装载）。
+- **内核配套**：原 `EXEC_ELF_MAX` 为 1 MiB，放不下 1.6 MiB 的 curl CLI，已上调至 **4 MiB**（exec 读盘本就是 `FS_MSG_READ_AT` 分块读，不受 OOL 16 页限制）。
+- **libc 补齐**：为工具新增 `isatty`（返回 0，走非终端分支）、`ftruncate`、`freopen`、`rand/srand`；`fcntl` 改为标准可变参数；`<sys/stat.h>` 补 `st_atime/st_mtime/st_ctime` 成员别名。
+- **验证**：开机自检 `curl_app_test`（`user/apps/curl_app_test.c`）以真实命令行参数 **execve 磁盘上的 `::BIN/CURL.SKA`**（与 shell 同路径），日志显示任务名变为 `CURL.SKA` 且 **exit code 0**（请求成功完成）。其 stdout 走控制台设备，无头串口日志不捕获文本（见 §3 说明）。
+
+### 2.14 内核内嵌压缩能力（miniz）
 - **形态**：`kernel/abilities/miniz/`（miniz，zlib 风格）**编入 Ring0 内核**，对外提供内核 API（`include/kernel/abilities/kminiz.h`：`kminiz_compress/uncompress/compress_bound/adler32/crc32`），实现在 `kernel/abilities/miniz/kminiz.c`。
 - **适配**：自定义 `assert/stdlib/string` 垫片适配 freestanding 环境；分配经垫片映射到内核堆（`kmalloc/kzalloc/krealloc/kfree`）。为此给内核堆新增了 `krealloc()`。
 - **用途**：为后续**最小系统环境（minOSEnv / rootfs）**预留内核态解压能力（如 initramfs、`.spkg` 软件包）。开机自检 `kminiz_selftest()` 做压缩→解压往返校验（kernel.ski 启动即打印 `[kminiz] selftest OK`）。
@@ -187,7 +194,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **`.kdr` 内核模块加载器（未实现）**：**用户态共享库动态链接已实现**（`.sl` + 内核 `ld.suki` + syscall 126–129 + `dltest` 自检，见 §2.11）；但 **`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现**，当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
-- **curl 命令行应用（进行中）**：libcurl **库**已完整可用（HTTP/HTTPS/FTP/TFTP + zlib + mbedTLS，见 §2.12 与 `results/step85.md`）；把上游 `lib/curl/src`（curl 命令行工具）编为**可从 shell 运行的应用程序**（`::BIN/CURL.SKA`）仍在推进——主要受内核 `execve`/spawn 单次加载字节数上限（当前 OOL 16 页=64 KiB）制约，需配套放宽内核加载上限；另需为工具补齐若干 libc（`isatty`/`getpwuid`/`setlocale` 等）。
+- **curl CLI 输出在无头串口日志中不可见**：`::BIN/CURL.SKA` 经开机包装器 execve 后**执行成功（exit code 0，即请求完成）**，但其 stdout 指向控制台设备（CGA/图形会话），无头模式下不进串口，故回归日志里看不到响应体文本。在图形 shell 中 `exec BIN/curl` 可正常看到输出。这是「输出通道」而非 curl 本身的问题。
 - **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
 
 ---

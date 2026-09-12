@@ -181,7 +181,8 @@ USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/stack_canary.c.o \
                   $(BUILD)/user/lib/setjmp.S.o \
                  $(BUILD)/user/lib/suki_native.c.o \
-                 $(BUILD)/user/lib/dlfcn.c.o
+                 $(BUILD)/user/lib/dlfcn.c.o \
+                 $(BUILD)/user/lib/net.c.o
 
 # FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接
 # DISK_PORT IPC 做磁盘 IO。ff.c + ffunicode.c 编入 fs_server 的 blob/elf。
@@ -312,6 +313,27 @@ $(FT_LIB): $(FT_OBJS) $(FT_SHIM_OBJ)
 	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ \
 		$(FT_OBJS) $(FT_SHIM_OBJ)
 	@echo "==> FreeType static lib $(FT_LIB) ($(words $(FT_OBJS)) objects)"
+
+# ---- miniz 压缩库（zlib 兼容，用户态能力库）----
+# 源码复用内核能力目录 kernel/abilities/miniz/miniz.c（freestanding 友好），
+# 以 -DMINIZ_USE_ZLIB_COMPAT 提供标准 zlib 符号（inflate/deflate/compress/...），
+# 供 libcurl 以 HAVE_ZLIB 接入。经 -I include 解析其头 kernel/abilities/miniz/miniz.h。
+MINIZ_DIR   := kernel/abilities/miniz
+MINIZ_SRCS  := $(MINIZ_DIR)/miniz.c
+MINIZ_OBJS  := $(patsubst $(MINIZ_DIR)/%,$(BUILD)/miniz/%,$(MINIZ_SRCS:.c=.c.o))
+MINIZ_LIB   := $(BUILD)/libminiz.a
+MINIZ_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fno-asynchronous-unwind-tables -fcommon \
+                -DMINIZ_USE_ZLIB_COMPAT -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME \
+                -DNDEBUG -I include -I user/lib/shims \
+                -include user/lib/shims/string.h -include user/lib/shims/stdlib.h \
+                -include user/lib/shims/assert.h
+$(BUILD)/miniz/%.c.o: $(MINIZ_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(MINIZ_CFLAGS) -c $< -o $@
+$(MINIZ_LIB): $(MINIZ_OBJS)
+	@mkdir -p $(dir $@)
+	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ $(MINIZ_OBJS)
+	@echo "==> miniz static lib $(MINIZ_LIB)"
 
 # 字体相关独立程序：fontsrv（常驻字体服务）与 pchfnt（渲染命令行工具）
 FONT_PROGS  := fontsrv pchfnt
@@ -537,11 +559,12 @@ $(BUILD)/user/%.elf: $(BUILD)/user/%.c.o $(USER_LIB_OBJS) user/user.ld
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
-# shell 专用：链接 gui.c.o（窗口程序，调用 suki_create_window 等）
-$(BUILD)/user/shell.elf: $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
+# shell 专用：链接 gui.c.o（窗口程序，调用 suki_create_window 等）+ miniz 静态库
+# （shell 的 libc_selftest 内做 miniz 压缩/解压往返自检，验证用户态能力库可用）。
+$(BUILD)/user/shell.elf: $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(MINIZ_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
 		-Wl,--no-warn-rwx-segments -T user/user.ld \
-		-o $@ $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
+		-o $@ $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(MINIZ_LIB) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # fs_server 专用：追加 FatFs 核心对象
@@ -724,7 +747,7 @@ $(KERNEL): $(OBJS) $(RELK) boot/linker.ld
 
 # ---- 生成可引导 ISO (BIOS + UEFI 双启动) ----
 iso: $(ISO)
-$(ISO): $(KERNEL) grub/grub.cfg $(KDR_OBJS)
+$(ISO): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB)
 	@mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.ski
 	cp grub/grub.cfg $(ISODIR)/boot/grub/grub.cfg

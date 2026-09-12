@@ -23,18 +23,43 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
 {
     char *p = buf;
     char *end = buf + (size ? size - 1 : 0);
-    int width;
     char c;
+
+    /* 输出一个字符：仅在缓冲未满时写入并推进；满后停止（保持有界） */
+#define VSN_PUT(ch) do { if (size && p < end) *p++ = (char)(ch); } while (0)
 
     while ((c = *fmt++)) {
         if (c != '%') {
-            if (size && p < end) *p = c;
-            if (p >= end) p = end; else p++;
+            VSN_PUT(c);
             continue;
         }
-        /* 解析宽度 */
-        width = 0;
-        while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+        /* 解析标志位：'-' 左对齐；'0' 零填充（数值域） */
+        int left = 0;
+        char pad = ' ';
+        for (;;) {
+            if (*fmt == '-') { left = 1; fmt++; }
+            else if (*fmt == '0') { pad = '0'; fmt++; }
+            else break;
+        }
+        /* 解析宽度（数字或 '*'） */
+        int width = 0;
+        if (*fmt == '*') {
+            width = va_arg(ap, int); fmt++;
+            if (width < 0) { left = 1; width = -width; }
+        } else {
+            while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+        }
+        /* 解析精度（'.' 后数字或 '*'；-1 表示未指定） */
+        int prec = -1;
+        if (*fmt == '.') {
+            fmt++; prec = 0;
+            if (*fmt == '*') {
+                prec = va_arg(ap, int); fmt++;
+                if (prec < 0) prec = -1;
+            } else {
+                while (*fmt >= '0' && *fmt <= '9') prec = prec * 10 + (*fmt++ - '0');
+            }
+        }
         /* 长度修饰 */
         int longness = 0; /* 0=int, 1=long, 2=long long */
         while (*fmt == 'l') { longness++; fmt++; }
@@ -45,51 +70,69 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
             const char *s = va_arg(ap, const char *);
             if (!s) s = "(null)";
             size_t sl = strlen(s);
-            if (width > (int)sl) { width -= (int)sl; while (width-- > 0) { if (size && p < end) *p++ = ' '; } }
-            while (*s) { if (size && p < end) *p++ = *s; s++; }
+            if (prec >= 0 && (size_t)prec < sl) sl = (size_t)prec;   /* %.Ns 截断 */
+            int n = (width > (int)sl) ? width - (int)sl : 0;
+            if (!left) while (n-- > 0) VSN_PUT(' ');
+            for (size_t i = 0; i < sl; i++) VSN_PUT(s[i]);
+            if (left) while (n-- > 0) VSN_PUT(' ');
         } else if (c == 'c') {
             char cc = (char)va_arg(ap, int);
-            if (size && p < end) *p = cc; p++;
+            int n = (width > 1) ? width - 1 : 0;
+            if (!left) while (n-- > 0) VSN_PUT(' ');
+            VSN_PUT(cc);
+            if (left) while (n-- > 0) VSN_PUT(' ');
         } else if (c == 'd' || c == 'i') {
             int64_t v;
             if (longness >= 2) v = va_arg(ap, long long);
             else if (longness == 1) v = va_arg(ap, long);
             else v = va_arg(ap, int);
             char tmp[24]; int ti = 0; int neg = (v < 0);
-            uint64_t uv = neg ? (uint64_t)(-v) : (uint64_t)v;
-            if (uv == 0) tmp[ti++] = '0';
-            while (uv) { tmp[ti++] = '0' + (uv % 10); uv /= 10; }
-            int len = ti + (neg ? 1 : 0);
-            if (width > len) { width -= len; while (width-- > 0) { if (size && p < end) *p++ = ' '; } }
-            if (neg) { if (size && p < end) *p++ = '-'; }
-            while (ti) { if (size && p < end) *p++ = tmp[--ti]; }
-        } else if (c == 'u') {
+            /* 取绝对值：先 +1 再取负，避免 INT64_MIN 取负溢出（UB） */
+            uint64_t uv = neg ? ((uint64_t)(-(v + 1)) + 1u) : (uint64_t)v;
+            if (uv == 0) { if (prec != 0) tmp[ti++] = '0'; }
+            while (uv) { tmp[ti++] = (char)('0' + (int)(uv % 10)); uv /= 10; }
+            int mindig = (prec > ti) ? prec : ti;          /* 精度：最少位数（补前导 0） */
+            int len = (neg ? 1 : 0) + mindig;
+            int n = (width > len) ? width - len : 0;
+            int zpad = (pad == '0' && prec < 0 && !left);
+            if (!left && !zpad) while (n-- > 0) VSN_PUT(' ');
+            if (neg) VSN_PUT('-');
+            if (zpad) while (n-- > 0) VSN_PUT('0');
+            for (int z = ti; z < mindig; z++) VSN_PUT('0');
+            while (ti) VSN_PUT(tmp[--ti]);
+            if (left) while (n-- > 0) VSN_PUT(' ');
+        } else if (c == 'u' || c == 'x' || c == 'X') {
             uint64_t v;
             if (longness >= 2) v = va_arg(ap, unsigned long long);
             else if (longness == 1) v = va_arg(ap, unsigned long);
             else v = va_arg(ap, unsigned int);
-            char tmp[24]; int n = fmt_utoa(tmp, v, 10, 0);
-            if (width > n) { width -= n; while (width-- > 0) { if (size && p < end) *p++ = ' '; } }
-            for (int i = 0; i < n; i++) { if (size && p < end) *p++ = tmp[i]; }
-        } else if (c == 'x' || c == 'X') {
-            uint64_t v;
-            if (longness >= 2) v = va_arg(ap, unsigned long long);
-            else if (longness == 1) v = va_arg(ap, unsigned long);
-            else v = va_arg(ap, unsigned int);
-            char tmp[24]; int n = fmt_utoa(tmp, v, 16, c == 'X');
-            if (width > n) { width -= n; while (width-- > 0) { if (size && p < end) *p++ = ' '; } }
-            for (int i = 0; i < n; i++) { if (size && p < end) *p++ = tmp[i]; }
+            int base = (c == 'u') ? 10 : 16;
+            char tmp[24]; int n2 = fmt_utoa(tmp, v, base, c == 'X');
+            if (prec == 0 && v == 0) n2 = 0;               /* %.0x 的 0 -> 空 */
+            int mindig = (prec > n2) ? prec : n2;
+            int n = (width > mindig) ? width - mindig : 0;
+            int zpad = (pad == '0' && prec < 0 && !left);
+            if (!left && !zpad) while (n-- > 0) VSN_PUT(' ');
+            if (zpad) while (n-- > 0) VSN_PUT('0');
+            for (int z = n2; z < mindig; z++) VSN_PUT('0');
+            for (int i = 0; i < n2; i++) VSN_PUT(tmp[i]);
+            if (left) while (n-- > 0) VSN_PUT(' ');
         } else if (c == 'p') {
             uint64_t v = (uint64_t)va_arg(ap, void *);
-            char tmp[20]; int n = fmt_utoa(tmp, v, 16, 0);
-            if (size && p < end) *p++ = '0'; if (size && p < end) *p++ = 'x';
-            for (int i = 0; i < n; i++) { if (size && p < end) *p++ = tmp[i]; }
+            char tmp[20]; int n2 = fmt_utoa(tmp, v, 16, 0);
+            int len = n2 + 2;
+            int n = (width > len) ? width - len : 0;
+            if (!left) while (n-- > 0) VSN_PUT(' ');
+            VSN_PUT('0'); VSN_PUT('x');
+            for (int i = 0; i < n2; i++) VSN_PUT(tmp[i]);
+            if (left) while (n-- > 0) VSN_PUT(' ');
         } else if (c == '%') {
-            if (size && p < end) *p++ = '%';
+            VSN_PUT('%');
         } else {
-            if (size && p < end) *p++ = c;
+            VSN_PUT(c);
         }
     }
+#undef VSN_PUT
     if (size) { if (p < end) *p = '\0'; else buf[size - 1] = '\0'; }
     return (int)(p - buf);
 }

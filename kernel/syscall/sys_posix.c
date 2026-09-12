@@ -1385,6 +1385,9 @@ static int64_t sys_writev(int32_t fd, const suki_iovec_t *uiov, int32_t cnt)
  * timeout：无就绪事件时以 task_yield() 让出 CPU 重试，直到超时（节拍精度）。
  * 返回就绪的 fd 数（0 = 超时），负 errno 为失败。
  */
+/* 前向声明：内核网络子系统提供的 socket 就绪查询（见 kernel/net/socket.c） */
+uint32_t net_poll(int fd, uint32_t want);
+
 static int64_t sys_poll(suki_pollfd_t *ufds, uint32_t nfds, int32_t timeout_ms)
 {
     if (!ufds || nfds == 0 || nfds > 256) {
@@ -1428,6 +1431,11 @@ static int64_t sys_poll(suki_pollfd_t *ufds, uint32_t nfds, int32_t timeout_ms)
                 } else if (fds[i].events & SUKI_POLLOUT) {
                     fds[i].revents |= SUKI_POLLOUT;
                 }
+            } else if (e->type == FD_TYPE_SOCKET) {
+                /* socket：问 net_server（lwIP 状态），避免假就绪 */
+                uint32_t m = net_poll(fds[i].fd, fds[i].events);
+                fds[i].revents |= (m & (fds[i].events
+                                        | SUKI_POLLERR | SUKI_POLLHUP | SUKI_POLLNVAL));
             } else {
                 /* 普通文件：POSIX 认为普通文件总是就绪 */
                 fds[i].revents |= (fds[i].events & (SUKI_POLLIN | SUKI_POLLOUT));
@@ -1564,6 +1572,11 @@ static int64_t sys_select(int32_t nfds, suki_fd_set_t *ur,
                     if (fds[i].events & SUKI_POLLOUT) {
                         fds[i].revents |= SUKI_POLLOUT;
                     }
+                } else if (e->type == FD_TYPE_SOCKET) {
+                    uint32_t m = net_poll(fds[i].fd, fds[i].events);
+                    if (m & SUKI_POLLIN)  fds[i].revents |= SUKI_POLLIN;
+                    if (m & SUKI_POLLOUT) fds[i].revents |= SUKI_POLLOUT;
+                    if (m & SUKI_POLLERR) fds[i].revents |= SUKI_POLLERR;
                 } else {
                     fds[i].revents |=
                         (fds[i].events & (SUKI_POLLIN | SUKI_POLLOUT));

@@ -51,6 +51,7 @@
 #define SOCK_MSG_SETSOCKOPT   11
 #define SOCK_MSG_GETSOCKOPT   12
 #define SOCK_MSG_SHUTDOWN     13
+#define SOCK_MSG_POLL         16   /* 查询就绪掩码：req.flags=关注事件, resp.result=就绪掩码 */
 #define SOCK_MSG_SENDTO       14
 #define SOCK_MSG_RECVFROM     15
 

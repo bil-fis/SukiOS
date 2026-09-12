@@ -121,6 +121,31 @@ static fd_entry_t *net_fd_entry(struct task *t, int fd)
     return e;
 }
 
+/*
+ * net_poll：查询 socket fd 的就绪掩码（POSIX POLL* 位）。
+ * 经 SOCK_MSG_POLL 问 net_server（lwIP 状态），net_server 在 resp.result 回传掩码。
+ * fd 非 socket / 查询失败时返回 0。
+ */
+uint32_t net_poll(int fd, uint32_t want)
+{
+    task_t *t = sched_current();
+    fd_entry_t *e = net_fd_entry(t, fd);
+    if (!e) {
+        return 0;
+    }
+    sock_req_t *r = net_req_prep(SOCK_MSG_POLL, (uint32_t)e->backend);
+    r->flags = want;
+    if (net_rpc(SOCK_MSG_POLL, NULL,
+                (uint32_t)(sizeof(mach_msg_header_t) + sizeof(sock_req_t))) != 0) {
+        return 0;
+    }
+    sock_resp_t *rp = net_resp();
+    if ((int32_t)rp->status < 0) {
+        return 0;
+    }
+    return rp->result;
+}
+
 /* ===================== 各操作实现 ===================== */
 
 static int do_socket(int domain, int type, int proto, int *out_fd)

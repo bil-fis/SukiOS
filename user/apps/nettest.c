@@ -17,6 +17,16 @@
 #include <string.h>
 #include <sukios/posix.h>
 #include <sukios/net.h>
+/* libc 层标准网络/时间头（实现对应用 user/lib/net.c、user/lib/time.c）。
+ * 这些正是 libcurl 依赖的标准 <sys/socket.h>/<netinet/in.h>/<arpa/inet.h>/
+ * <netdb.h>/<poll.h>，此处一并验证其「声明 + 实现 + 内核 ABI」三者一致。 */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <poll.h>
+#include <unistd.h>
+#include <errno.h>
 
 static void pd(uint64_t v)
 {
@@ -27,10 +37,6 @@ static void pd(uint64_t v)
 static int sys_socket(int d, int t, int p)
 {
     return (int)suki_syscall5(SYS_SOCKET, (uint64_t)d, (uint64_t)t, (uint64_t)p, 0, 0);
-}
-static int sys_bind(int fd, void *a, int al)
-{
-    return (int)suki_syscall5(SYS_BIND, (uint64_t)fd, (uint64_t)a, (uint64_t)al, 0, 0);
 }
 static int sys_sendto(int fd, const void *b, size_t l, int f, void *a, int al)
 {
@@ -108,6 +114,110 @@ int main(int argc, char **argv)
         u_print("[nettest] TFTP reply opcode="); pd((uint64_t)rbuf[1]); u_print("\n");
     }
     u_print("[nettest] POSIX UDP round-trip (with reply): PASS\n");
+
+    /* =====================================================================
+     * libc 层网络 API 验证（<sys/socket.h>/<netinet/in.h>/<arpa/inet.h>/
+     * <netdb.h>/<poll.h>，实现见 user/lib/net.c）
+     * 覆盖 libcurl 依赖的全部标准接口：地址转换、名称解析、socket 包装器、
+     * poll 就绪查询。全部走真实内核 syscall 与真实 lwIP 往返，非桩。
+     * ===================================================================== */
+    u_print("[nettest] === libc net API (sys/socket.h + netinet/in.h + netdb.h) ===\n");
+    int lpass = 0, lfail = 0;
+
+    /* (1) inet_pton / inet_ntop / inet_addr 地址转换闭环 */
+    {
+        struct in_addr ia;
+        char txt[INET_ADDRSTRLEN];
+        in_addr_t n = inet_addr("10.0.2.2");
+        if (inet_pton(AF_INET, "10.0.2.2", &ia) == 1 &&
+            ia.s_addr[0] == 10 && ia.s_addr[1] == 0 &&
+            ia.s_addr[2] == 2  && ia.s_addr[3] == 2 &&
+            inet_ntop(AF_INET, &ia, txt, sizeof(txt)) != NULL &&
+            strcmp(txt, "10.0.2.2") == 0 &&
+            n == (in_addr_t)(10u | (0u << 8) | (2u << 16) | (2u << 24))) {
+            lpass++;
+        } else {
+            lfail++; u_print("[nettest] FAIL inet_pton/ntop/addr\n");
+        }
+    }
+
+    /* (2) getaddrinfo：数字地址 + 端口数字 + 服务名（"http"->80） */
+    {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        int rc = getaddrinfo("10.0.2.2", "69", &hints, &res);
+        if (rc == 0 && res && res->ai_family == AF_INET &&
+            ((struct sockaddr_in *)res->ai_addr)->sin_port == 69 &&
+            ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr[0] == 10) {
+            lpass++;
+        } else {
+            lfail++; u_print("[nettest] FAIL getaddrinfo(ip,num)\n");
+        }
+        freeaddrinfo(res);
+
+        res = NULL;
+        rc = getaddrinfo("10.0.2.2", "http", &hints, &res);
+        if (rc == 0 && res &&
+            ((struct sockaddr_in *)res->ai_addr)->sin_port == 80) {
+            lpass++;
+        } else {
+            lfail++; u_print("[nettest] FAIL getaddrinfo(service)\n");
+        }
+        freeaddrinfo(res);
+    }
+
+    /* (3) libc socket()/sendto()/poll()/recvfrom()/close() 真实 UDP 往返 */
+    {
+        int lfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (lfd < 0) {
+            lfail++; u_print("[nettest] FAIL socket() wrapper\n");
+        } else {
+            struct sockaddr_in dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.sin_family = AF_INET;
+            dst.sin_port   = 69;
+            dst.sin_addr.s_addr[0] = 10; dst.sin_addr.s_addr[1] = 0;
+            dst.sin_addr.s_addr[2] = 2;  dst.sin_addr.s_addr[3] = 2;
+
+            int nw = -1;
+            for (int a = 0; a < 50; a++) {
+                nw = (int)sendto(lfd, rrq, (size_t)rl, 0,
+                                 (struct sockaddr *)&dst, sizeof(dst));
+                if (nw >= 0) break;
+                suki_syscall1(SYS_YIELD, 0);
+            }
+            if (nw < 0) {
+                lfail++; u_print("[nettest] FAIL sendto() wrapper\n");
+            } else {
+                struct pollfd pfd;
+                pfd.fd = lfd; pfd.events = POLLIN; pfd.revents = 0;
+                int pr = poll(&pfd, 1, 1000);
+                if (pr > 0 && (pfd.revents & POLLIN)) {
+                    uint8_t lb[512];
+                    struct sockaddr_in lfrom;
+                    socklen_t fl = (socklen_t)sizeof(lfrom);
+                    int nr = (int)recvfrom(lfd, lb, sizeof(lb), 0,
+                                           (struct sockaddr *)&lfrom, &fl);
+                    if (nr > 0) {
+                        u_print("[nettest] libc poll()+recvfrom() got ");
+                        pd((uint64_t)nr); u_print(" bytes\n");
+                        lpass++;
+                    } else {
+                        lfail++; u_print("[nettest] FAIL recvfrom() wrapper\n");
+                    }
+                } else {
+                    lfail++; u_print("[nettest] FAIL poll() not ready\n");
+                }
+            }
+            close(lfd);
+        }
+    }
+
+    u_print("[nettest] libc-net API: PASS="); pd((uint64_t)lpass);
+    u_print(" FAIL="); pd((uint64_t)lfail);
+    u_print(lfail == 0 ? "  ALL OK\n" : "  SOME FAILED\n");
 
     /* ---- SukiNative 原生 socket 冒烟 ---- */
     u_print("[nettest] === SukiNative SukiSocketCreate(DGRAM) ===\n");

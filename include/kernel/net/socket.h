@@ -33,4 +33,10 @@ suki_ssize_t net_write(struct task *t, int fd, const void *ubuf, size_t count);
 /* 分配一个 socket fd（类型为 FD_TYPE_SOCKET，backend = net_server 句柄） */
 int fd_socket(struct task *t, int handle);
 
+/* 查询某个 socket fd 的就绪掩码（POSIX POLL* 位）。供 sys_poll/sys_select 在
+ * 遇到 FD_TYPE_SOCKET 时调用：经 SOCK_MSG_POLL 问 net_server（lwIP 状态），
+ * 返回 net_server 算好的掩码（SUKI_POLLIN/SUKI_POLLOUT/SUKI_POLLERR/SUKI_POLLNVAL）。
+ * fd 非 socket 或查询失败时返回 0。 */
+uint32_t net_poll(int fd, uint32_t want);
+
 #endif /* _SUKI_KERNEL_NET_SOCKET_H */

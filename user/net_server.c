@@ -615,6 +615,26 @@ static void sock_handle(sock_req_t *req, uint32_t reply_port)
         if (s->type == SUKI_SOCK_STREAM && s->pcb.tcp) tcp_close(s->pcb.tcp);
         sock_reply(reply_port, 0, 0, 0, NULL, 0, NULL);
         break;
+    case SOCK_MSG_POLL: {
+        /* 基于 lwIP 状态计算就绪掩码，供内核 select/poll 查询 socket fd。
+         * req.flags=关注事件；resp.result=就绪掩码（SUKI_POLL*）。 */
+        sock_t *ps = sock_by_handle(req->sock);
+        uint32_t mask = 0;
+        if (!ps) {
+            mask = SUKI_POLLNVAL;
+        } else if (ps->type == SUKI_SOCK_STREAM) {
+            if (ps->rx_head || ps->rx_eof) mask |= SUKI_POLLIN;
+            if (ps->state == S_LISTENING && ps->accept_pcb) mask |= SUKI_POLLIN;
+            if (ps->state != S_LISTENING && ps->pcb.tcp
+                && tcp_sndbuf(ps->pcb.tcp) > 0) mask |= SUKI_POLLOUT;
+            if (!ps->pcb.tcp && ps->state == S_CONNECTED) mask |= SUKI_POLLERR;
+        } else {
+            if (ps->rx_head || ps->rx_eof) mask |= SUKI_POLLIN;
+            mask |= SUKI_POLLOUT;   /* UDP 无发送流控，恒可写 */
+        }
+        sock_reply(reply_port, 0, mask, 0, NULL, 0, NULL);
+        break;
+    }
     default:
         sock_reply(reply_port, (uint32_t)-SUKI_ENOSYS, 0, 0, NULL, 0, NULL);
         break;

@@ -12,14 +12,19 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <errno.h>
 #include <sukios/posix.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
 
-/* 基础类型（与内核/posix.h 一致） */
+/* 基础类型（与内核/posix.h 一致）。
+ * ssize_t 加守卫：<sys/socket.h> 亦需该类型，两处共用同一 typedef 以免重复定义。 */
+#ifndef _SUKI_SHIM_SSIZE_T_DEFINED
+#define _SUKI_SHIM_SSIZE_T_DEFINED
 typedef int64_t  ssize_t;
+#endif
 typedef int64_t  off_t;
 typedef uint32_t uid_t;
 typedef uint32_t gid_t;

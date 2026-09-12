@@ -33,6 +33,7 @@
 #include "lib/suki_gui.h"   /* 窗口化：shell 作为 WM 管理的窗口程序 */
 #include "lib/gui_ipc.h"
 #include "lib/font8x8.h"
+#include <zlib.h>           /* miniz zlib 兼容层（user/lib/shims/zlib.h）验证用 */
 
 #define MSG_ID_KEYCHAR 100   /* 与 input_server 一致；避开 FS_MSG_* */
 #define LINE_MAX 256
@@ -1032,6 +1033,59 @@ static void libc_selftest(void)
     if (u_strcmp(ev, "x=hi y=7") == 0) pass++;
     else { fail++; shell_out("[libc-test] FAIL expand_vars ("); shell_out(ev); shell_out(")\n"); }
     unsetenv("GREET");
+
+    /* 7) 时间：日历换算 gmtime_r / strftime / mktime 往返（纯 UTC，user/lib/time.c） */
+    {
+        /* 已知量：2021-01-01T00:00:00Z = 1609459200（周五，年内第 0 天） */
+        time_t t0 = (time_t)1609459200LL;
+        struct tm tm;
+        char tb[32];
+        gmtime_r(&t0, &tm);
+        size_t sn = strftime(tb, sizeof(tb), "%Y-%m-%dT%H:%M:%S", &tm);
+        if (sn > 0 && u_strcmp(tb, "2021-01-01T00:00:00") == 0 &&
+            tm.tm_wday == 5 && tm.tm_yday == 0 && tm.tm_mon == 0) {
+            time_t back = mktime(&tm);
+            if (back == t0) pass++;
+            else { fail++; shell_out("[libc-test] FAIL mktime roundtrip\n"); }
+        } else {
+            fail++; shell_out("[libc-test] FAIL gmtime_r/strftime ("); shell_out(tb); shell_out(")\n");
+        }
+        /* gettimeofday/clock_gettime 可用性（仅校验调用成功，不假定 RTC 已设） */
+        struct timeval tv0;
+        struct timespec ts0;
+        if (gettimeofday(&tv0, NULL) == 0 && clock_gettime(CLOCK_MONOTONIC, &ts0) == 0) pass++;
+        else { fail++; shell_out("[libc-test] FAIL gettimeofday/clock_gettime\n"); }
+    }
+
+    /* 8) miniz（user/lib/shims/zlib.h + build/libminiz.a）：压缩/解压往返一致性 */
+    {
+        static const char mmsg[] =
+            "SukiOS miniz zlib-compat round trip: The quick brown fox jumps "
+            "over the lazy dog. 0123456789 0123456789 0123456789";
+        static uint8_t comp[512];
+        static uint8_t decomp[512];
+        mz_ulong clen = (mz_ulong)sizeof(comp);
+        mz_ulong dlen = (mz_ulong)sizeof(decomp);
+        mz_ulong src_len = (mz_ulong)(u_strlen(mmsg) + 1);
+        int rc = mz_compress2(comp, &clen, (const unsigned char *)mmsg,
+                              src_len, MZ_DEFAULT_LEVEL);
+        if (rc == MZ_OK && clen > 0 && clen < src_len) {
+            rc = mz_uncompress(decomp, &dlen, comp, clen);
+            if (rc == MZ_OK && dlen == src_len &&
+                u_strcmp((char *)decomp, mmsg) == 0) {
+                pass++;
+                shell_out("[libc-test] miniz roundtrip OK ("); 
+                shell_out(u_utoa_s((uint64_t)src_len, nbuf, sizeof(nbuf)));
+                shell_out(" -> ");
+                shell_out(u_utoa_s((uint64_t)clen, nbuf, sizeof(nbuf)));
+                shell_out(" bytes)\n");
+            } else {
+                fail++; shell_out("[libc-test] FAIL mz_uncompress\n");
+            }
+        } else {
+            fail++; shell_out("[libc-test] FAIL mz_compress2\n");
+        }
+    }
 
     /* 汇总 */
     shell_out("[libc-test] PASS=");

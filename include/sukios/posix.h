@@ -341,13 +341,53 @@ struct suki_ucontext {
     uint8_t  fpu[512] __attribute__((aligned(16)));   /* fxsave/fxrstor 要求 16 字节对齐 */
 };
 
-/* socket（号位预留；协议栈未就绪时按 POSIX 语义返回 -ENOSYS） */
+/* socket（号位 150..166 已由内核 sys_net_dispatch 路由到 net_server，非 ENOSYS） */
 #define SUKI_AF_UNIX   1
 #define SUKI_AF_INET   2
 #define SUKI_AF_INET6  10
 #define SUKI_SOCK_STREAM 1
 #define SUKI_SOCK_DGRAM  2
 #define SUKI_SOCK_RAW    3
+
+/* socket 消息标志（MSG_*） */
+#define SUKI_MSG_OOB       0x1
+#define SUKI_MSG_PEEK      0x2
+#define SUKI_MSG_DONTROUTE 0x4
+#define SUKI_MSG_CTRUNC    0x8
+#define SUKI_MSG_TRUNC     0x10
+#define SUKI_MSG_WAITALL   0x20
+#define SUKI_MSG_DONTWAIT  0x40
+#define SUKI_MSG_EOR       0x80
+#define SUKI_MSG_NOSIGNAL  0x4000
+
+/* 协议层（level） */
+#define SUKI_SOL_SOCKET   0x1
+/* 注：SUKI_IPPROTO_* 已在 include/sukios/net.h 定义，用户态经 <sys/socket.h> 用字面量 */
+
+/* socket 选项（SO_*） */
+#define SUKI_SO_DEBUG      0x1
+#define SUKI_SO_REUSEADDR  0x2
+#define SUKI_SO_TYPE       0x3
+#define SUKI_SO_ERROR      0x4
+#define SUKI_SO_DONTROUTE  0x5
+#define SUKI_SO_BROADCAST  0x6
+#define SUKI_SO_SNDBUF     0x7
+#define SUKI_SO_RCVBUF     0x8
+#define SUKI_SO_KEEPALIVE  0x9
+#define SUKI_SO_LINGER     0xa
+#define SUKI_SO_RCVTIMEO   0xb
+#define SUKI_SO_SNDTIMEO   0xc
+#define SUKI_SO_ACCEPTCONN 0xd
+
+/* IP / TCP 选项 */
+#define SUKI_IP_TOS       1
+#define SUKI_IP_TTL       2
+#define SUKI_TCP_NODELAY  1
+
+/* shutdown() 方式 */
+#define SUKI_SHUT_RD   0
+#define SUKI_SHUT_WR   1
+#define SUKI_SHUT_RDWR 2
 
 /* sysconf 名字（_SC_*） */
 #define SUKI_SC_PAGESIZE        30

@@ -133,7 +133,7 @@ S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest dltest winhello
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test dltest winhello
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -182,6 +182,7 @@ USER_LIB_OBJS := $(BUILD)/user/lib/crt0.S.o $(BUILD)/user/lib/suki.c.o \
                   $(BUILD)/user/lib/setjmp.S.o \
                  $(BUILD)/user/lib/suki_native.c.o \
                  $(BUILD)/user/lib/dlfcn.c.o \
+                 $(BUILD)/user/lib/fileio.c.o \
                  $(BUILD)/user/lib/net.c.o
 
 # FatFs（ChaN R0.16）核心：fs_server 用 FatFs 做 FAT32 解析，diskio.c 对接
@@ -334,6 +335,32 @@ $(MINIZ_LIB): $(MINIZ_OBJS)
 	@mkdir -p $(dir $@)
 	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ $(MINIZ_OBJS)
 	@echo "==> miniz static lib $(MINIZ_LIB)"
+
+# ---- libcurl（HTTP/HTTPS 客户端静态库）----
+# 配置为手写 user/lib/curl_config.h（无法在宿主运行 configure）；经 -DHAVE_CONFIG_H
+# 使 curl_setup.h 引入该配置，并以 -I user/lib 命中它。关闭的协议/后端见该头。
+# 目录结构保持（lib/easy.c -> build/curl/lib/easy.c.o，lib/curlx/*.c 同理）。
+CURL_DIR    := lib/curl
+CURL_SRCS   := $(wildcard $(CURL_DIR)/lib/*.c) \
+               $(wildcard $(CURL_DIR)/lib/curlx/*.c) \
+               $(wildcard $(CURL_DIR)/lib/vauth/*.c) \
+               $(wildcard $(CURL_DIR)/lib/vdns/*.c) \
+               $(wildcard $(CURL_DIR)/lib/vtls/*.c) \
+               $(CURL_DIR)/lib/vquic/vquic.c
+CURL_OBJS   := $(patsubst $(CURL_DIR)/%.c,$(BUILD)/curl/%.c.o,$(CURL_SRCS))
+CURL_LIB    := $(BUILD)/libcurl.a
+CURL_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fcommon \
+               -fno-asynchronous-unwind-tables -fno-pic -fno-pie -mcmodel=small \
+               -DBUILDING_LIBCURL -DHAVE_CONFIG_H -DCURL_STATICLIB \
+               -I $(CURL_DIR)/include -I $(CURL_DIR)/lib \
+               -I user/lib -I user/lib/shims -I include -include $(CONFIG_H)
+$(BUILD)/curl/%.c.o: $(CURL_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(CURL_CFLAGS) -c $< -o $@
+$(CURL_LIB): $(CURL_OBJS)
+	@mkdir -p $(dir $@)
+	$(USER_CC) -nostdlib -r -Wl,--build-id=none -Wl,--allow-multiple-definition -o $@ $(CURL_OBJS)
+	@echo "==> libcurl static lib $(CURL_LIB) ($(words $(CURL_OBJS)) objects)"
 
 # 字体相关独立程序：fontsrv（常驻字体服务）与 pchfnt（渲染命令行工具）
 FONT_PROGS  := fontsrv pchfnt
@@ -599,6 +626,16 @@ $(BUILD)/user/net_server.elf: $(BUILD)/user/net_server.c.o $(USER_LIB_OBJS) $(LW
 $(BUILD)/user/nettest.c.o: user/apps/nettest.c
 	@mkdir -p $(dir $@)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
+
+# curl_test（libcurl 移植端到端验证）：源码在 user/apps/，额外链接 libcurl + miniz。
+$(BUILD)/user/curl_test.c.o: user/apps/curl_test.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -I $(CURL_DIR)/include -c $< -o $@
+$(BUILD)/user/curl_test.elf: $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(MINIZ_LIB) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-o $@ $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(MINIZ_LIB) -lgcc
+	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # 把 ELF 文件作为原始字节流嵌入内核镜像（objcopy -I binary 生成
 # _binary_build_user_<name>_elf_start/end 符号），并重命名为

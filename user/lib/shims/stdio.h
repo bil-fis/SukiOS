@@ -1,11 +1,14 @@
 /*
  * user/lib/shims/stdio.h
  * -----------------------------------------------------------------------------
- * SukiOS 用户态标准 <stdio.h> 实现头（freestanding libc 提供，最小子集）。
+ * SukiOS 用户态标准 <stdio.h>（freestanding libc 提供）。
  *
- * 实现归属：user/lib/stdio.c。本 libc 不提供 FILE* 流抽象（用户态直接面向
- * 内核 fd + 格式化输出），故仅提供无缓冲字符/字符串接口与格式化输出，不提供
- * fopen/fread 等文件流 API（可用 unistd.h 的 open/read/write 替代）。
+ * 实现归属：
+ *   - 格式化/无缓冲输出：user/lib/stdio.c（printf/snprintf/puts/putchar）
+ *   - FILE* 流抽象：user/lib/fileio.c（fopen/fread/fwrite/fgets/fprintf/std*）
+ *
+ * FILE 为内核 fd 的薄封装（结构体在 fileio.c 中定义，此处仅前置声明），
+ * 提供第三方库（如 libcurl）所需的 stdin/stdout/stderr 与 fread/fwrite 等符号。
  */
 #ifndef _SUKI_SHIM_STDIO_H
 #define _SUKI_SHIM_STDIO_H
@@ -17,14 +20,58 @@
 #define NULL ((void *)0)
 #endif
 
-/* 标准流文件号（SukiOS 复用 POSIX 文件号；无 FILE* 结构） */
+/* 标准流文件号（SukiOS 复用 POSIX 文件号） */
 #define STDIN_FILENO   0
 #define STDOUT_FILENO  1
 #define STDERR_FILENO  2
 
+#ifndef EOF
+#define EOF (-1)
+#endif
+
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#endif
+#ifndef SEEK_CUR
+#define SEEK_CUR 1
+#endif
+#ifndef SEEK_END
+#define SEEK_END 2
+#endif
+
+#ifndef BUFSIZ
+#define BUFSIZ 512
+#endif
+
+/* ---- FILE* 流（user/lib/fileio.c） ---- */
+typedef struct _SUKI_FILE FILE;
+
+extern FILE *stdin;
+extern FILE *stdout;
+extern FILE *stderr;
+
+FILE  *fopen(const char *path, const char *mode);
+FILE  *fdopen(int fd, const char *mode);
+int    fclose(FILE *fp);
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *fp);
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *fp);
+int    fflush(FILE *fp);
+int    ferror(FILE *fp);
+int    feof(FILE *fp);
+void   clearerr(FILE *fp);
+char  *fgets(char *s, int size, FILE *fp);
+int    fputc(int c, FILE *fp);
+int    fgetc(FILE *fp);
+int    fputs(const char *s, FILE *fp);
+int    fprintf(FILE *fp, const char *fmt, ...);
+int    vfprintf(FILE *fp, const char *fmt, va_list ap);
+int    fileno(FILE *fp);
+int    fseek(FILE *fp, long offset, int whence);
+long   ftell(FILE *fp);
+void   rewind(FILE *fp);
+
 /* ---- 格式化输出（user/lib/stdio.c） ---- */
 int printf(const char *fmt, ...);
-int fprintf(int fd, const char *fmt, ...);
 int snprintf(char *buf, size_t size, const char *fmt, ...);
 int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap);
 

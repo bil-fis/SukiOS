@@ -68,4 +68,38 @@ extern int *__errno_location(void);
 #define EINPROGRESS      SUKI_EINPROGRESS
 #define ECANCELED        SUKI_ECANCELED
 
+/* 网络/套接字相关（libcurl 等第三方库需要；取值同内核 SUKI_E*） */
+#define EWOULDBLOCK      SUKI_EAGAIN      /* SukiOS 与 EAGAIN 同值 */
+#define EADDRINUSE       SUKI_EADDRINUSE
+#define EADDRNOTAVAIL    SUKI_EADDRNOTAVAIL
+#define EAFNOSUPPORT     SUKI_EAFNOSUPPORT
+#define EISCONN          SUKI_EISCONN
+#define ECONNABORTED     SUKI_ECONNABORTED
+#define ECONNRESET       SUKI_ECONNRESET
+#define EDESTADDRREQ     SUKI_EDESTADDRREQ
+#define EHOSTDOWN        SUKI_EHOSTDOWN
+#define ENETDOWN         SUKI_ENETDOWN
+#define ENETRESET        SUKI_ENETRESET
+#define ENETUNREACH      SUKI_ENETUNREACH
+#define ENOBUFS          SUKI_ENOBUFS
+#define ENOTCONN         SUKI_ENOTCONN
+#define ENOPROTOOPT      SUKI_ENOPROTOOPT
+#define EPFNOSUPPORT     SUKI_EPFNOSUPPORT
+#define EPROTOTYPE       SUKI_EPROTOTYPE
+#define EPROTO           SUKI_EPROTO
+#define ESHUTDOWN        SUKI_ESHUTDOWN
+#define ESOCKTNOSUPPORT  SUKI_ESOCKTNOSUPPORT
+#define EOVERFLOW        SUKI_EOVERFLOW
+#define EBADMSG          SUKI_EBADMSG
+#define EBADR            SUKI_EBADR
+#define EDATA            SUKI_ENODATA
+#define ENODATA          SUKI_ENODATA
+#define ENOMSG           SUKI_ENOMSG
+#define ENOSTR           SUKI_ENOSTR
+#define ETIME            SUKI_ETIME
+#define EIDRM            SUKI_EIDRM
+#define EMULTIHOP        SUKI_EMULTIHOP
+#define ENOTBLK          SUKI_ENOTBLK
+#define ENOLINK          SUKI_ENOLCK      /* 近似映射（内核未单列 ENOLINK） */
+
 #endif /* _SUKI_SHIM_ERRNO_H */

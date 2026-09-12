@@ -40,6 +40,8 @@ struct timezone {
     int32_t tz_minuteswest;
     int32_t tz_dsttime;
 };
+#ifndef _SUKI_STRUCT_STAT_DEFINED
+#define _SUKI_STRUCT_STAT_DEFINED
 struct stat {
     uint64_t st_dev;
     uint64_t st_ino;
@@ -58,6 +60,7 @@ struct stat {
     int64_t  st_ctim_sec;
     int64_t  st_ctim_nsec;
 };
+#endif
 struct utsname {
     char sysname[65];
     char nodename[65];
@@ -76,7 +79,6 @@ struct rlimit {
     uint64_t rlim_cur;
     uint64_t rlim_max;
 };
-typedef struct stat     stat;
 typedef struct utsname  utsname;
 typedef struct tms      tms;
 typedef struct rlimit   rlimit;
@@ -165,7 +167,9 @@ typedef suki_sigset_t        sigset_t;
 /* POSIX struct sigaction（与内核 struct suki_sigaction 二进制布局一致）。
  * 必须以 struct 标签形式定义：struct 标签与下方函数名 sigaction 处于不同命名
  * 空间，不冲突；若用 typedef 名 sigaction 则会与普通标识符（函数名）冲突，
- * 触发「redefinition of sigaction」编译错误。 */
+ * 触发「redefinition of sigaction」编译错误。与 <signal.h> 共用守卫宏。 */
+#ifndef _SUKI_STRUCT_SIGACTION_DEFINED
+#define _SUKI_STRUCT_SIGACTION_DEFINED
 struct sigaction {
     union {
         sighandler_t           sa_handler;
@@ -175,6 +179,16 @@ struct sigaction {
     void          (*sa_restorer)(void);
     sigset_t        sa_mask;
 };
+#endif
+
+/* 与 glibc 一致：以宏暴露 union 内的处理器字段，使第三方代码可直接写
+ * `act.sa_handler = ...`（POSIX 标准写法）。此宏仅用户态头定义，内核不包含它。 */
+#ifndef sa_handler
+#define sa_handler   _u.sa_handler
+#endif
+#ifndef sa_sigaction
+#define sa_sigaction _u.sa_sigaction
+#endif
 
 #define SIG_DFL       SUKI_SIG_DFL
 #define SIG_IGN       SUKI_SIG_IGN

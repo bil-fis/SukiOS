@@ -123,7 +123,8 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 
 **开机自检程序**（随内核启动自动运行，输出经串口落盘，验证各子系统；其中 `RUSTHELLO` 经 `weak` 符号引用，对应 blob 缺失则跳过，其余恒随构建运行）：
 - **posixtest**：POSIX 系统调用层一致性测试，含 `pthread`/`clone`/`futex` 多线程用例。
-- **nettest**：socket 冒烟测试，验证 `net_server` 通路（ARP/DHCP/TCP 端到端）。
+- **nettest**：socket 冒烟测试，验证 `net_server` 通路（ARP/DHCP/TCP 端到端），并覆盖 libc 层 socket API（inet_*、getaddrinfo、poll）。
+- **curl_test**：libcurl 移植端到端验证（easy 接口对宿主机 HTTP 服务发起真实 GET，校验 HTTP 200 与响应体字节）。
 - **dltest**：动态链接端到端验证（DT_NEEDED 自动加载 + 运行期 `dlopen`/`dlsym`/`dlclose` + COPY 重定位 + 槽位回收）。
 - **RUSTHELLO**：Rust 程序（详见 §2.10），打印 `hello from rust on SukiOS` 后退出。
 
@@ -157,6 +158,13 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **libdl 封装**：用户态 `user/lib/dlfcn.c` 提供标准 `dlopen` / `dlsym` / `dlclose` / `dlerror` 接口（忽略 flags，当前仅立即绑定语义）。
 - **验证**：`dltest`（`user/apps/dltest.c`）开机自检覆盖 ① 加载期 `DT_NEEDED` 依赖自动加载与 `R_X86_64_COPY` 拷贝重定位；② 同名库 `dlopen` 去重；③ 纯运行期 `dlopen` + `dlclose` 真正回收物理页；④ 槽位复用。
 
+### 2.12 libcurl（HTTP 客户端库）
+- **来源/配置**：`lib/curl`（git submodule，`8.22.0`，见 §5.1）。不运行 autotools/CMake，改为**手写 `user/lib/curl_config.h`**（经 `-DHAVE_CONFIG_H` 被 `curl_setup.h` 引入），按 SukiOS 用户态实有能力声明 `HAVE_*`。
+- **libc 补齐**（libcurl 需要而原 libc 缺失的）：新增 `<sys/types.h>`/`<sys/stat.h>`/`<signal.h>` 标准头；新增 `FILE` 流层（`user/lib/fileio.c`：`fopen/fdopen/fread/fwrite/fgets/fprintf/...` 与 `stdin/stdout/stderr`）；新增 `strspn/strcspn/strpbrk`、`bsearch`、`fstat/stat/lstat`、`gethostname`；补网络 errno（`EWOULDBLOCK/EADDRINUSE/EISCONN/...`）与 `PF_*`。并按 POSIX/glibc 语义让 `<sys/socket.h>` 暴露 `fd_set`、`struct sigaction` 暴露 `sa_handler` 宏。
+- **构建**：`build/libcurl.a`（`lib/*.c` + `curlx/*` + `vauth/*` + `vdns/*` + `vtls/*` + `vquic/vquic.c`），链接进 `curl_test`。
+- **能力**：**HTTP**、FTP、TFTP；gzip/deflate 经 **miniz**（zlib 兼容层，`HAVE_LIBZ`）；仅 IPv4、同步 `getaddrinfo` 解析、无线程、无 c-ares；LDAP/SMTP/IMAP/POP3/... 经官方 `CURL_DISABLE_*` 关闭。**HTTPS/TLS 后端待 mbedTLS 接入**（见 §3）。
+- **验证**：开机自检 `curl_test`（`user/apps/curl_test.c`）用 easy 接口对宿主机 HTTP 服务发起真实 GET，得 **HTTP 200 + 正确响应体**，零 panic（详见 `results/step84.md`）。
+
 ---
 
 ## 3. 尚未实现 / 早期
@@ -173,7 +181,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **`.kdr` 内核模块加载器（未实现）**：**用户态共享库动态链接已实现**（`.sl` + 内核 `ld.suki` + syscall 126–129 + `dltest` 自检，见 §2.11）；但 **`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现**，当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
-- **HTTP/HTTPS 客户端（libcurl + mbedTLS，已备料未集成）**：libcurl `8.22.0` 与 mbedTLS `3.6.7`（LTS）已作为 **git submodule** 引入 `lib/`（见 §5.1），但**尚未接入构建**。其底座（BSD socket libc 包装、`getaddrinfo`/DNS、`select`/`poll`/`fcntl`、时间日历换算、miniz zlib 兼容层）已就绪（详见 `results/step82.md`）；后续按 `results/step81.md` 方案以手写 `curl_config.h` + `libcurl.a` 集成，并由 mbedTLS 提供 HTTPS/TLS。
+- **HTTPS / TLS 后端（mbedTLS，未接入）**：libcurl 已集成并可用（HTTP/FTP/TFTP + zlib via miniz，见 §2.12 与 `results/step84.md`），但**尚未接入 TLS 后端**，故暂不支持 `https://`。mbedTLS `3.6.7`（LTS）已作为 submodule 位于 `lib/mbedtls`（见 §5.1）；后续将其编译为静态库 + 提供用户态平台适配（熵源 RDRAND/软 PRNG、timing 经 `gettimeofday`），再以 `USE_MBEDTLS` 接入 libcurl。
 - **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
 
 ---
@@ -320,7 +328,7 @@ SukiOS/
 │   ├── lwip-2.2.1/        # lwIP TCP/IP 协议栈（BSD-3-Clause）@ tag STABLE-2_2_1_RELEASE，net_server 用
 │   ├── freetype-2.14.3/   # FreeType 字体光栅化引擎（FTL）@ tag VER-2-14-3，fontsrv 用
 │   ├── mbedtls/           # mbedTLS 3.6.7（LTS，Apache-2.0）@ tag mbedtls-3.6.7，TLS 后端（待接入）
-│   └── curl/              # libcurl 8.22.0（curl 许可）@ tag curl-8_22_0，HTTP/HTTPS 客户端（待集成）
+│   └── curl/              # libcurl 8.22.0（curl 许可）@ tag curl-8_22_0，HTTP/FTP/TFTP 客户端（已集成，见 §2.12）
 ├── compapps/              # 第三方【程序/工具】——以 git submodule 引入（程序文件放 compapps/）
 ├── include/               # 内核 / 用户态公共头
 ├── grub/                  # grub.cfg（ISO 引导配置）

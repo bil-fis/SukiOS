@@ -66,8 +66,10 @@
 #define ft_strrchr  strrchr
 #define ft_strstr   strstr
 
-/* ---- 文件处理（占位；本仓仅用内存流，不真正调用） ---- */
-typedef struct _suki_ft_file { int _unused; } FILE;
+/* ---- 文件处理（占位；本仓仅用内存流 FT_OPEN_MEMORY，不真正调用文件 API） ----
+ * 直接复用 SukiOS 标准 FILE（user/lib/shims/stdio.h + fileio.c），
+ * 避免与标准 <stdio.h> 中的 FILE 定义冲突。 */
+#include <stdio.h>
 #define FT_FILE      FILE
 
 /* ftsystem.c 编译需要的标准 seek  whence 常量（值等同 POSIX） */

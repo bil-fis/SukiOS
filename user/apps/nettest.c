@@ -15,6 +15,7 @@
  */
 #include "lib/suki.h"
 #include <string.h>
+#include <time.h>
 #include <sukios/posix.h>
 #include <sukios/net.h>
 /* libc 层标准网络/时间头（实现对应用 user/lib/net.c、user/lib/time.c）。
@@ -77,16 +78,19 @@ int main(int argc, char **argv)
     tftp.sin_addr[0]=10; tftp.sin_addr[1]=0; tftp.sin_addr[2]=2; tftp.sin_addr[3]=2;
 
     /* UDP send 在 DHCP 尚未完成（netif 还没有源 IP）时会因无路由返回 -EIO
-     * （ERR_RTE）。net_server 开机即发起 DHCP，约数百毫秒内 BOUND；这里重试至多
-     * 50 次并每次让出 CPU，确保 DHCP 完成后再真正发出（避免时序竞态导致 recvfrom
-     * 永不到达）。这与真实客户端「先等网络就绪再发」等价。 */
+     * （ERR_RTE）。net_server 开机即发起 DHCP，需若干毫秒~数十毫秒才 BOUND；
+     * 这里最多重试 400 次、每次小睡 20ms（共约 8s 预算）后再发，既给 DHCP 充分的
+     * 墙钟时间、又避免与 net_server 抢 CPU 造成互相饿死（只在每 20 次打印一次）。 */
     int nw = -1;
-    for (int attempt = 0; attempt < 50; attempt++) {
+    for (int attempt = 0; attempt < 400; attempt++) {
         nw = sys_sendto(fd, rrq, (size_t)rl, 0, &tftp, (int)sizeof(tftp));
         if (nw >= 0) break;
-        u_print("[nettest] sendto retry "); pd((uint64_t)attempt);
-        u_print(" (rc="); pd((uint64_t)nw); u_print(")\n");
-        suki_syscall1(SYS_YIELD, 0);
+        if ((attempt % 20) == 0) {
+            u_print("[nettest] sendto retry "); pd((uint64_t)attempt);
+            u_print(" (rc="); pd((uint64_t)nw); u_print(")\n");
+        }
+        struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 20 * 1000 * 1000;
+        nanosleep(&ts, (struct timespec *)0);
     }
     u_print("[nettest] sendto(TFTP RRQ) nwritten="); pd((uint64_t)nw); u_print("\n");
     if (nw < 0) { u_print("[nettest] sendto() FAIL\n"); sys_exit(2); }

@@ -111,6 +111,29 @@ char *strstr(const char *hay, const char *needle)
     return NULL;
 }
 
+size_t strspn(const char *s, const char *accept)
+{
+    size_t n = 0;
+    while (s[n] && strchr(accept, s[n])) n++;
+    return n;
+}
+
+size_t strcspn(const char *s, const char *reject)
+{
+    size_t n = 0;
+    while (s[n] && !strchr(reject, s[n])) n++;
+    return n;
+}
+
+char *strpbrk(const char *s, const char *accept)
+{
+    while (*s) {
+        if (strchr(accept, *s)) return (char *)s;
+        s++;
+    }
+    return NULL;
+}
+
 char *strtok_r(char *s, const char *sep, char **save)
 {
     char *p;
@@ -181,7 +204,7 @@ int isupper(int c) { return c >= 'A' && c <= 'Z'; }
 int islower(int c) { return c >= 'a' && c <= 'z'; }
 int isprint(int c) { return c >= 0x20 && c <= 0x7e; }
 int toupper(int c) { return islower(c) ? c - 'a' + 'A' : c; }
-int tolower(int c) { return isupper(c) ? c - 'a' + 'A' : c; }
+int tolower(int c) { return isupper(c) ? c - 'A' + 'a' : c; }
 
 /* ---- 错误号 -> 可读字符串（用于 shell/程序诊断输出） ---- */
 const char *strerror(int errnum)

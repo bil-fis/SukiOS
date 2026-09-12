@@ -70,6 +70,7 @@ extern const uint8_t user_posixtest_start[], user_posixtest_end[];
 extern const uint8_t user_mouse_server_start[], user_mouse_server_end[];
 extern const uint8_t user_net_server_start[], user_net_server_end[];
 extern const uint8_t user_nettest_start[], user_nettest_end[];
+extern const uint8_t user_curl_test_start[], user_curl_test_end[];
 extern const uint8_t user_dltest_start[], user_dltest_end[];
 extern const uint8_t user_winhello_start[], user_winhello_end[];
 
@@ -623,6 +624,13 @@ static void boot_late_init(void *arg)
                      (size_t)(user_nettest_end - user_nettest_start),
                      "SukiNetTest");
     kprintf("[boot-dbg] nettest spawn ret=%p\n", (void *)sp2);
+
+    /* libcurl 移植端到端验证：spawn curl_test（libcurl easy GET -> 宿主机 HTTP）。
+     * 输出经串口落盘，作为「libcurl 真实抓取」的验收依据。 */
+    task_t *sp2c = task_create_user(user_curl_test_start,
+                     (size_t)(user_curl_test_end - user_curl_test_start),
+                     "SukiCurlTest");
+    kprintf("[boot-dbg] curl_test spawn ret=%p\n", (void *)sp2c);
 
     /* 动态链接验证：spawn dltest（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
      * 验证内核 elf.c 的 ET_DYN 模块加载/重定位/符号解析（dlopen 路径）。 */

@@ -13,16 +13,12 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>
+#include <sys/select.h>   /* POSIX：<sys/socket.h> 提供 fd_set/FD_* 与 select() */
 #include <sukios/posix.h>
 
 /* ---- 基础类型 ---- */
-/* ssize_t：标准 <sys/socket.h> 自身即提供；与 <unistd.h> 共用守卫避免重复定义。 */
-#ifndef _SUKI_SHIM_SSIZE_T_DEFINED
-#define _SUKI_SHIM_SSIZE_T_DEFINED
-typedef int64_t ssize_t;
-#endif
-typedef uint32_t socklen_t;
-typedef uint16_t sa_family_t;
+/* ssize_t / socklen_t / sa_family_t 由 <sys/types.h> 提供（守卫宏避免重复定义）。 */
 
 struct sockaddr {
     sa_family_t sa_family;
@@ -34,6 +30,13 @@ struct sockaddr {
 #define AF_UNIX    SUKI_AF_UNIX
 #define AF_INET    SUKI_AF_INET
 #define AF_INET6   SUKI_AF_INET6
+
+/* ---- 协议族（与地址族同值；POSIX 定义 PF_* 为 AF_* 别名） ---- */
+#define PF_UNSPEC  AF_UNSPEC
+#define PF_UNIX    AF_UNIX
+#define PF_LOCAL   AF_UNIX
+#define PF_INET    AF_INET
+#define PF_INET6   AF_INET6
 
 /* ---- socket 类型 ---- */
 #define SOCK_STREAM SUKI_SOCK_STREAM

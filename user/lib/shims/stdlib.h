@@ -46,8 +46,10 @@ unsigned long strtoul(const char *nptr, char **endptr, int base);
 int    atoi(const char *nptr);
 long   atol(const char *nptr);
 
-/* ---- 排序（FreeType 等需要；实现见 stdlib.c） ---- */
+/* ---- 排序 / 二分查找（FreeType、libcurl 等需要；实现见 stdlib.c） ---- */
 void   qsort(void *base, size_t nmemb, size_t size,
              int (*compar)(const void *, const void *));
+void  *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+               int (*compar)(const void *, const void *));
 
 #endif /* _SUKI_SHIM_STDLIB_H */

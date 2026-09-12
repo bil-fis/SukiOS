@@ -21,4 +21,27 @@
 
 #include <kernel/abilities/miniz/miniz.h>
 
+/* ---- 补齐 miniz 未提供、而 libcurl 等 zlib 消费者使用的兼容符号 ---- */
+
+/* 真 zlib 在 ZLIB_CONST 下定义 z_const（curl 以 `z_const Bytef *` 声明输入缓冲）。 */
+#ifndef z_const
+#define z_const const
+#endif
+
+/* z_streamp 兼容别名（miniz 仅提供 mz_streamp）。 */
+#ifndef z_streamp
+#define z_streamp mz_streamp
+#endif
+
+/* miniz 无 inflateReset2()；以「结束 + 按新 windowBits 重新初始化」等价实现。
+ * curl 在 deflate_do_* 路径中用它切换 raw/带包头的 window 语义。 */
+#ifndef SUKI_MINIZ_INFLATE_RESET2_DEFINED
+#define SUKI_MINIZ_INFLATE_RESET2_DEFINED
+static inline int inflateReset2(z_streamp strm, int windowBits)
+{
+    (void)inflateEnd(strm);
+    return inflateInit2(strm, windowBits);
+}
+#endif
+
 #endif /* _SUKI_SHIM_ZLIB_H */

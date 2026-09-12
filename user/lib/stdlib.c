@@ -472,3 +472,20 @@ void qsort(void *base, size_t nmemb, size_t size,
         if (sp >= (int)(sizeof(stack)/sizeof(stack[0]))) break; /* 防御 */
     }
 }
+
+/* 标准二分查找（要求 base 已按 compar 升序排列）；命中返回元素指针，否则 NULL。 */
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+              int (*compar)(const void *, const void *))
+{
+    if (!key || !base || size == 0 || !compar) return NULL;
+    size_t lo = 0, hi = nmemb;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const char *p = (const char *)base + mid * size;
+        int c = compar(key, p);
+        if (c == 0) return (void *)p;
+        if (c < 0) hi = mid;
+        else       lo = mid + 1;
+    }
+    return NULL;
+}

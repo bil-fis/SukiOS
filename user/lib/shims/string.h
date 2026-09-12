@@ -49,6 +49,9 @@ char  *strrchr(const char *s, int c);         /* user/lib/string.c */
 char  *strstr(const char *haystack, const char *needle);
 char  *strtok(char *s, const char *delim);
 char  *strtok_r(char *s, const char *delim, char **save);
+size_t strspn(const char *s, const char *accept);
+size_t strcspn(const char *s, const char *reject);
+char  *strpbrk(const char *s, const char *accept);
 
 /* ---- 数值转换 ---- */
 long   strtol(const char *nptr, char **endptr, int base);

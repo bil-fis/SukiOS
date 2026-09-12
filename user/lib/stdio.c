@@ -147,16 +147,6 @@ int printf(const char *fmt, ...)
     return n;
 }
 
-int fprintf(int fd, const char *fmt, ...)
-{
-    char buf[512];
-    va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    suki_syscall3(SYS_WRITE, (uint64_t)fd, (uint64_t)buf, (uint64_t)n);
-    return n;
-}
-
 int snprintf(char *buf, size_t size, const char *fmt, ...)
 {
     va_list ap; va_start(ap, fmt);

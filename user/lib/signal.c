@@ -53,7 +53,7 @@ int raise(int sig)
 sighandler_t signal(int sig, sighandler_t handler)
 {
     struct sigaction sa;
-    sa._u.sa_handler = handler;
+    sa.sa_handler = handler;
     sa.sa_flags = SA_RESTORER;
     sa.sa_restorer = __sighandler_trampoline;
     sa.sa_mask = 0;

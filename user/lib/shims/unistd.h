@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <errno.h>
+#include <sys/types.h>
 #include <sukios/posix.h>
 
 #ifndef NULL
@@ -46,10 +47,16 @@ typedef int      pid_t;
 #define O_NONBLOCK  SUKI_O_NONBLOCK
 #define O_DIRECTORY SUKI_O_DIRECTORY
 
-/* 文件偏移基准 */
+/* 文件偏移基准（与 <stdio.h> 共用，取值一致：0/1/2） */
+#ifndef SEEK_SET
 #define SEEK_SET    SUKI_SEEK_SET
+#endif
+#ifndef SEEK_CUR
 #define SEEK_CUR    SUKI_SEEK_CUR
+#endif
+#ifndef SEEK_END
 #define SEEK_END    SUKI_SEEK_END
+#endif
 
 /* access() 模式 */
 #define F_OK  SUKI_F_OK
@@ -67,10 +74,10 @@ ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
 off_t lseek(int fd, off_t offset, int whence);
 int   unlink(const char *path);
-int   mkdir(const char *path, int mode);
+int   mkdir(const char *path, mode_t mode);
 int   rename(const char *oldpath, const char *newpath);
 int   access(const char *path, int mode);
-int   chmod(const char *path, int mode);
+int   chmod(const char *path, mode_t mode);
 int   chdir(const char *path);
 char *getcwd(char *buf, size_t size);
 int   fsync(int fd);
@@ -84,6 +91,7 @@ int   waitpid(int pid, int *status, int options);
 int   kill(int pid, int sig);
 int   getpid(void);
 int   getppid(void);
+int   gethostname(char *name, size_t len);
 void  _exit(int code);
 unsigned int sleep(unsigned int seconds);
 int   usleep(unsigned int usec);

@@ -48,7 +48,7 @@ int unlink(const char *path)
     return (int)libc_ret(r);
 }
 
-int mkdir(const char *path, int mode)
+int mkdir(const char *path, mode_t mode)
 {
     long r = suki_syscall2(SYS_MKDIR, (uint64_t)path, (uint64_t)mode);
     return (int)libc_ret(r);
@@ -66,9 +66,28 @@ int access(const char *path, int mode)
     return (int)libc_ret(r);
 }
 
-int chmod(const char *path, int mode)
+int chmod(const char *path, mode_t mode)
 {
     long r = suki_syscall2(SYS_CHMOD, (uint64_t)path, (uint64_t)mode);
+    return (int)libc_ret(r);
+}
+
+/* 文件元数据（供 libcurl 等第三方库使用）。suki_stat_t 布局与本 struct stat 一致。 */
+int stat(const char *path, struct stat *buf)
+{
+    long r = suki_syscall2(SYS_STAT, (uint64_t)path, (uint64_t)buf);
+    return (int)libc_ret(r);
+}
+
+int fstat(int fd, struct stat *buf)
+{
+    long r = suki_syscall2(SYS_FSTAT, (uint64_t)fd, (uint64_t)buf);
+    return (int)libc_ret(r);
+}
+
+int lstat(const char *path, struct stat *buf)
+{
+    long r = suki_syscall2(SYS_LSTAT, (uint64_t)path, (uint64_t)buf);
     return (int)libc_ret(r);
 }
 
@@ -132,4 +151,19 @@ int getpid(void)
 int getppid(void)
 {
     return (int)suki_syscall0(SYS_GETPPID);
+}
+
+/* 主机名（供 libcurl 等第三方库使用）。内核 SYS_GETHOSTNAME(115) 未实现时
+ * 回退固定名 "sukios"，保证接口始终可用。 */
+int gethostname(char *name, size_t len)
+{
+    if (!name || len == 0) return -1;
+    long r = suki_syscall2(SYS_GETHOSTNAME, (uint64_t)name, (uint64_t)len);
+    if (r < 0) {
+        const char *def = "sukios";
+        size_t i = 0;
+        while (def[i] && i + 1 < len) { name[i] = def[i]; i++; }
+        name[i] = '\0';
+    }
+    return 0;
 }

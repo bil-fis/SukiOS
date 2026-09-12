@@ -97,6 +97,21 @@ void pmm_init(const boot_info_t *bi)
         }
     }
 
+    /* 保留引导模块（GRUB 加载的内核模块/配置）占用的物理页，防止被 PMM 回收
+     * 而覆盖其内容（kdr 加载器、display 配置解析都需长期读取原物理页）。
+     * 模块页一旦标为已用即永不归还，与「模块常驻内核」语义一致。 */
+    for (int i = 0; i < bi->nmods; i++) {
+        uint64_t p = bi->mods[i].phys;
+        uint64_t s = bi->mods[i].size;
+        for (uint64_t a = p & ~(PAGE_SIZE - 1); a < p + s; a += PAGE_SIZE) {
+            uint64_t pg = a / PAGE_SIZE;
+            if (pg < g_total_pages && !bm_test(pg)) {
+                bm_set(pg);
+                g_used_pages++;
+            }
+        }
+    }
+
     kprintf("[pmm] total=%u MiB, pages=%lu, used=%lu, free=%lu, meta_end=%p\n",
             (unsigned)(g_total_pages * PAGE_SIZE / (1024 * 1024)),
             (unsigned long)g_total_pages,

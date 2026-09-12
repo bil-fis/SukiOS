@@ -22,6 +22,8 @@
 #include <kernel/serial.h>
 #include <kernel/framebuffer.h>
 #include <kernel/vga_text.h>
+#include <kernel/ksym.h>          /* EXPORT_SYMBOL 内核符号导出 */
+EXPORT_SYMBOL(kprintf);          /* 供 .kdr 内核模块调用 */
 #include <kernel/diagnostics.h>
 #include <kernel/spinlock.h>
 #include <kernel/smp.h>
@@ -37,6 +39,9 @@ static spinlock_t g_kp_lock = SPINLOCK_INIT("kprintf");
 static bool g_use_fb = false;
 /* 内核诊断是否镜像到帧缓冲（默认开；进入用户态服务前由 kmain 关闭）。 */
 static bool g_kernel_fb_diag = true;
+/* 启动期(第三步系统初始化)是否把日志镜像到帧缓冲：仅 -v/--verbose 时为真。
+ * 由 kmain 解析 GRUB 命令行设置；串口恒定输出。 */
+bool g_boot_verbose = false;
 /* M18 修复：kprintf 重入深度计数。单核下 irq_save 已保证一条消息原子输出，
  * 但若在输出途中触发 #PF 等异常二次进入 kprintf（如 panic 路径），会递归
  * 打印导致栈耗尽。超过阈值即放弃本次输出，既保证普通场景正常又防致命递归。
@@ -99,9 +104,13 @@ void kputc(char c)
         return;
     }
 
-    /* 显示未激活：正常路径 */
-    if (g_use_fb && g_kernel_fb_diag) {
-        fbcon_putc(c);
+    /* 显示未激活：正常路径。
+     * 启动期(第三步系统初始化)默认仅串口输出；仅当 -v/--verbose（g_boot_verbose）
+     * 时才镜像到帧缓冲。显示服务接管后由上方 g_display_active 分支处理（捕获进管道）。 */
+    if (g_use_fb) {
+        if (g_boot_verbose)
+            fbcon_putc(c);
+        /* 否则仅串口（不写 VGA，避免无谓寄存器访问） */
     } else {
         vga_putc(c);
     }

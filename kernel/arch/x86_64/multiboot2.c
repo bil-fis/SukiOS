@@ -14,6 +14,22 @@
 /* 前向声明：PVH 引导信息解析（GRUB 不可用时 QEMU -kernel 走此路径） */
 void pvh_parse(uint64_t hvm_phys, boot_info_t *out);
 
+/* 判断字符串是否以 suffix 结尾（用于识别 .kdr 内核驱动模块名） */
+static bool name_ends_with(const char *s, const char *suf)
+{
+    if (!s || !suf)
+        return false;
+    size_t ls = 0, lf = 0;
+    while (s[ls]) ls++;
+    while (suf[lf]) lf++;
+    if (lf > ls)
+        return false;
+    for (size_t i = 0; i < lf; i++)
+        if (s[ls - lf + i] != suf[i])
+            return false;
+    return true;
+}
+
 /*
  * bootinfo_prepare: 引导信息统一入口。
  *   magic == MULTIBOOT2_MAGIC -> GRUB multiboot2 路径
@@ -105,15 +121,41 @@ bool multiboot2_parse(uint64_t mbi_phys, boot_info_t *out)
             break;
         }
         case MULTIBOOT_TAG_TYPE_MODULE: {
-            /* 引导模块（configs/display.cfg）。仅采纳首个模块作为显示配置，
-             * 后续模块（若有）暂忽略。mod_start/mod_end 为物理地址区间。 */
-            if (out->cfg_phys == 0) {
-                const struct mb2_tag_module *mod =
-                    (const struct mb2_tag_module *)tag;
-                out->cfg_phys = (uint64_t)mod->mod_start;
-                out->cfg_size = mod->mod_end - mod->mod_start;
-                if (out->cfg_size > 65536) out->cfg_size = 65536;
+            const struct mb2_tag_module *mod =
+                (const struct mb2_tag_module *)tag;
+            uint32_t msize = mod->mod_end - mod->mod_start;
+            /* 收集所有模块到模块表，供内核加载 .kdr 与解析配置 */
+            if (out->nmods < BOOT_MOD_MAX) {
+                struct boot_module *bm = &out->mods[out->nmods++];
+                bm->phys = (uint64_t)mod->mod_start;
+                bm->size = msize > 65536 ? 65536 : msize;
+                kprintf("[mb2] module '%s' start=%p size=%u first4=%02x%02x%02x%02x\n",
+                        bm->name, (void *)(uintptr_t)mod->mod_start, msize,
+                        ((const uint8_t *)PHYS_TO_VIRT(mod->mod_start))[0],
+                        ((const uint8_t *)PHYS_TO_VIRT(mod->mod_start))[1],
+                        ((const uint8_t *)PHYS_TO_VIRT(mod->mod_start))[2],
+                        ((const uint8_t *)PHYS_TO_VIRT(mod->mod_start))[3]);
+                const char *src = mod->cmdline;
+                size_t n = 0;
+                while (src[n] && src[n] != ' ' && src[n] != '\t' && n < 63)
+                    bm->name[n] = src[n], n++;
+                bm->name[n] = 0;
+                /* 模块名含 ".kdr" => 内核驱动模块 */
+                bm->is_kdr = name_ends_with(bm->name, ".kdr");
             }
+            /* 兼容约定：首个非 .kdr 模块作显示配置（display.cfg）*/
+            if (out->cfg_phys == 0 && !name_ends_with(mod->cmdline, ".kdr")) {
+                out->cfg_phys = (uint64_t)mod->mod_start;
+                out->cfg_size = msize > 65536 ? 65536 : msize;
+            }
+            break;
+        }
+        case MULTIBOOT_TAG_TYPE_COMMAND_LINE: {
+            const char *cl = (const char *)(tag + 1);
+            size_t n = 0;
+            while (cl[n] && n < sizeof(out->cmdline) - 1)
+                out->cmdline[n] = cl[n], n++;
+            out->cmdline[n] = 0;
             break;
         }
         default:

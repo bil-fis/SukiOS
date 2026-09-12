@@ -58,6 +58,16 @@ SECTIONS
         __rodata_end = .;
     }
 
+    /* 内核符号导出表：EXPORT_SYMBOL 把 {name, addr} 放入此节。链接脚本暴露
+     * __ksymtab_start / __ksymtab_end，供 kdr 加载器把模块中未定义的外部符号
+     * 解析为内核虚拟地址（等价 Linux kallsyms 最小子集）。KEEP 防止被 GC。 */
+    .ksymtab ALIGN(8) : AT(ADDR(.ksymtab) - KERNEL_VMA)
+    {
+        __ksymtab_start = .;
+        KEEP(*(.ksymtab))
+        __ksymtab_end = .;
+    }
+
     .data ALIGN(4096) : AT(ADDR(.data) - KERNEL_VMA)
     {
         __data_start = .;

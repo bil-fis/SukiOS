@@ -24,6 +24,10 @@ void user_puts(const char *s);
  * Ring3 shell，避免按键时被 [ipc]/[sched] 等调试日志刷屏。 */
 void console_set_fb_diag(bool on);
 
+/* 启动期(第三步系统初始化)是否把内核日志镜像到帧缓冲：仅 -v/--verbose 时为真。
+ * 由 kmain 解析 GRUB 命令行设置；串口恒定输出。 */
+extern bool g_boot_verbose;
+
 /*
  * 早期控制台环形管道（early-console ring pipe）。
  * ---------------------------------------------------------------------------

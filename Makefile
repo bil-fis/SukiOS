@@ -232,6 +232,20 @@ $(LIBTEST_SL): $(BUILD)/libs/libtest.c.o
 		--no-dynamic-linker -o $@ $<
 	@echo "==> shared lib $@ ($$(stat -c%s $@) bytes)"
 
+# ---- .kdr 内核模块（Ring0 内核驱动，由内核 kdr 加载器运行时重定位加载）----
+# 编译模型 -mcmodel=large -fPIC（与内核地址空间一致，可安全加载到高半区）+ 链接
+# --unresolved-symbols=ignore-all（kprintf/kmalloc/driver_register 等内核符号运行期
+# 由内核 ksymtab 解析），--hash-style=sysv 供加载器取符号数。
+KDR_SRCS := kdrv/example_kdrv.c
+KDR_OBJS := $(patsubst kdrv/%.c,$(BUILD)/kdr/%.kdr,$(KDR_SRCS))
+KDR_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only -mcmodel=large -fPIC -fno-stack-protector -fno-asynchronous-unwind-tables -MMD -MP -I include -I include/sukios -include $(CONFIG_H)
+
+$(BUILD)/kdr/%.kdr: kdrv/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(KDR_CFLAGS) -c $< -o $(BUILD)/kdr/$*.kdr.o
+	$(USER_LD) -shared -export-dynamic --no-warn-rwx-segments --no-dynamic-linker --hash-style=sysv --unresolved-symbols=ignore-all -o $@ $(BUILD)/kdr/$*.kdr.o
+	@echo "==> kdr module $@ ($$(stat -c%s $@) bytes)"
+
 # ---- 共享库 libsuki_gui.sl（用户态 GUI 客户端库，供磁盘应用动态链接）----
 # 与 libtest.sl 同构：用 ld -shared 生成 ET_DYN；编译单元 gui.c 亦以静态对象
 # 形式链入内嵌自检 winhello（见 $(BUILD)/user/winhello.elf 专用规则）。
@@ -710,14 +724,11 @@ $(KERNEL): $(OBJS) $(RELK) boot/linker.ld
 
 # ---- 生成可引导 ISO (BIOS + UEFI 双启动) ----
 iso: $(ISO)
-$(ISO): $(KERNEL) grub/grub.cfg configs/display.cfg
+$(ISO): $(KERNEL) grub/grub.cfg $(KDR_OBJS)
 	@mkdir -p $(ISODIR)/boot/grub
 	cp $(KERNEL) $(ISODIR)/boot/kernel.ski
 	cp grub/grub.cfg $(ISODIR)/boot/grub/grub.cfg
-	# 显示服务配置文件：经 GRUB module2 加载，内核在 fb_init 前解析。
-	# 去掉 `-` 前缀：配置缺失应显式失败而非静默跳过，避免 ISO 不含配置导致
-	# 内核误用旧缓存/残留内容而把 video_mode 解析成错误值。
-	cp configs/display.cfg $(ISODIR)/boot/display.cfg
+	cp $(KDR_OBJS) $(ISODIR)/boot/
 	grub-mkrescue -o $(ISO) $(ISODIR) 2>/dev/null
 	@echo "==> Built $(ISO)"
 
@@ -737,6 +748,11 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/m
 	mcopy -i $@ $(BUILD)/HELLO.TXT ::HELLO.TXT
 	mcopy -i $@ $(BUILD)/ROADMAP.TXT ::ROADMAP.TXT
 	mmd -i $@ ::SYS
+	# 系统配置（registry hive）：configs/default/*.reg -> ::SYS/CONFIGS/
+	mmd -i $@ ::SYS/CONFIGS 2>/dev/null || true
+	mcopy -i $@ configs/default/system.reg ::SYS/CONFIGS/system.reg
+	mcopy -i $@ configs/default/user.reg ::SYS/CONFIGS/user.reg
+	mcopy -i $@ configs/default/services.reg ::SYS/CONFIGS/services.reg
 	mmd -i $@ ::BIN
 	# 图片资源目录：把 images/ 下【全部】.bmp 放入 ::IMAGES/，供 BMP 加载器
 	# 诊断显示用。注意 .gitignore 排除了 CG*.bmp（避免误提交大二进制资源），

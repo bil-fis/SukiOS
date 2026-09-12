@@ -15,6 +15,7 @@
 #define MULTIBOOT_TAG_TYPE_MMAP       6
 #define MULTIBOOT_TAG_TYPE_FRAMEBUFFER 8
 #define MULTIBOOT_TAG_TYPE_MODULE     3    /* 引导模块（如 /boot/display.cfg） */
+#define MULTIBOOT_TAG_TYPE_COMMAND_LINE 1  /* 内核命令行（GRUB 启动参数） */
 /* P0-6：UEFI 启动路径新增标签 */
 #define MULTIBOOT_TAG_TYPE_EFI64      12   /* EFI 64 位系统表指针（UEFI 启动标识） */
 #define MULTIBOOT_TAG_TYPE_ACPI_OLD   14   /* ACPI 1.0 RSDP 副本（20 字节） */
@@ -92,7 +93,24 @@ typedef struct boot_info {
      * [cfg_phys, cfg_phys + cfg_size)，内容为以 NUL 结尾的纯文本。 */
     uint64_t cfg_phys;            /* 配置模块物理地址（0=无） */
     uint32_t cfg_size;            /* 配置模块字节数（含 NUL，0=无） */
+
+    /* 内核命令行（GRUB 启动参数，如 "-v --verbose"）。由 tag 1 填充；PVH 下为空。 */
+    char     cmdline[256];
+
+    /* 引导模块表：GRUB module2 加载的全部模块（.kdr 内核驱动 + 配置文件）。
+     * kdr 加载器遍历本表，凡 is_kdr 者加载为内核模块。 */
+#define BOOT_MOD_MAX 16
+    struct boot_module {
+        uint64_t phys;           /* 模块数据物理地址 */
+        uint32_t size;           /* 模块字节数 */
+        char     name[64];        /* 模块名（来自 cmdline，截断至 63 字符） */
+        bool     is_kdr;         /* 是否为 .kdr 内核驱动模块 */
+    } mods[BOOT_MOD_MAX];
+    int nmods;
 } boot_info_t;
+
+/* 全局引导信息（由 kmain.c 持有，kdr 加载器共享访问） */
+extern boot_info_t g_boot;
 
 /* 解析物理地址处的 Multiboot2 info，填充 out。返回 true 成功。 */
 bool multiboot2_parse(uint64_t mbi_phys, boot_info_t *out);

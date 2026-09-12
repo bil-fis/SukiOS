@@ -950,6 +950,115 @@ suki_ssize_t fd_read_kern(struct task *t, int fd, void *kbuf, size_t count)
     return (suki_ssize_t)nread;
 }
 
+/*
+ * kern_fs_read_file —— 内核态同步读整个文件（仅 DISK 后端，经 FS_PORT 同步 RPC）。
+ *
+ * 用途：启动期由内核直接读取 /sys/configs/*.reg 等小配置文件，不依赖用户态任务，
+ *       也不绑定当前任务的 fd 表（避免内核任务 fd 表未初始化导致的槽分配异常）。
+ * 失败返回负 errno；成功返回 0 且 *out_n 为读取字节数。buffer 由调用方提供。
+ */
+int kern_fs_read_file(const char *path, uint8_t *buf, uint32_t cap, uint32_t *out_n)
+{
+    if (!path || !buf || cap == 0)
+        return -SUKI_EINVAL;
+    size_t plen = strlen(path);
+    if (plen >= FS_PATH_MAX)
+        return -SUKI_ENAMETOOLONG;
+
+    /* ---- OPEN ---- */
+    uint8_t *req = rpc_req_buf();
+    uint32_t reqsz = (uint32_t)(sizeof(mach_msg_header_t)
+                                + sizeof(fs_open_req_t) + plen + 1);
+    if (reqsz > FS_RPC_MAX)
+        return -SUKI_EINVAL;
+    memset(req, 0, reqsz);
+    mach_msg_header_t *h = (mach_msg_header_t *)req;
+    h->msgh_size = reqsz;
+    h->msgh_id = FS_MSG_OPEN;
+    h->msgh_remote_port = FS_PORT;
+    fs_open_req_t *or = (fs_open_req_t *)(req + sizeof(mach_msg_header_t));
+    or->flags = SUKI_O_RDONLY;
+    or->mode = 0;
+    memcpy(req + sizeof(mach_msg_header_t) + sizeof(fs_open_req_t), path, plen + 1);
+
+    uint32_t got = 0;
+    int rc = fs_rpc(req, reqsz, &got);
+    if (rc < 0)
+        return rc;
+    fs_resp_t *fr = resp_hdr(rpc_resp_buf());
+    if (fr->status != FS_OK)
+        return fs_status_to_errno(fr->status);
+    if (got < RESP_RET_SIZE)
+        return -SUKI_EIO;
+    int64_t bfd = resp_ret(rpc_resp_buf())->value;
+    if (bfd < 0)
+        return fs_status_to_errno((uint32_t)(-bfd));
+
+    uint32_t off = 0;
+    while (off < cap) {
+        uint32_t chunk = cap - off;
+        if (chunk > FS_READ_MAX)
+            chunk = FS_READ_MAX;
+        req = rpc_req_buf();
+        uint32_t rsz = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_read_req_t));
+        memset(req, 0, rsz);
+        h = (mach_msg_header_t *)req;
+        h->msgh_size = rsz;
+        h->msgh_id = FS_MSG_READFD;
+        h->msgh_remote_port = FS_PORT;
+        fs_read_req_t *rr = (fs_read_req_t *)(req + sizeof(mach_msg_header_t));
+        rr->fd = (uint32_t)bfd;
+        rr->length = chunk;
+        got = 0;
+        rc = fs_rpc(req, rsz, &got);
+        if (rc < 0)
+            goto close_out;
+        fr = resp_hdr(rpc_resp_buf());
+        if (fr->status != FS_OK) {
+            rc = fs_status_to_errno(fr->status);
+            goto close_out;
+        }
+        if (got < RESP_RET_SIZE) {
+            rc = -SUKI_EIO;
+            goto close_out;
+        }
+        int64_t nread = resp_ret(rpc_resp_buf())->value;
+        if (nread < 0) {
+            rc = fs_status_to_errno((uint32_t)(-nread));
+            goto close_out;
+        }
+        if (nread == 0)
+            break;
+        if ((uint32_t)nread > FS_READ_MAX || got < RESP_RET_SIZE + (uint32_t)nread) {
+            rc = -SUKI_EIO;
+            goto close_out;
+        }
+        const uint8_t *data = rpc_resp_buf() + RESP_RET_SIZE;
+        memcpy(buf + off, data, (size_t)nread);
+        off += (uint32_t)nread;
+    }
+    rc = 0;
+
+close_out:
+    /* ---- CLOSE（尽量释放 FS_SERVER 侧句柄）---- */
+    {
+        uint8_t *creq = rpc_req_buf();
+        uint32_t csz = (uint32_t)(sizeof(mach_msg_header_t) + sizeof(fs_fd_req_t));
+        memset(creq, 0, csz);
+        mach_msg_header_t *ch = (mach_msg_header_t *)creq;
+        ch->msgh_size = csz;
+        ch->msgh_id = FS_MSG_CLOSE;
+        ch->msgh_remote_port = FS_PORT;
+        fs_fd_req_t *cr = (fs_fd_req_t *)(creq + sizeof(mach_msg_header_t));
+        cr->fd = (uint32_t)bfd;
+        uint32_t cgot = 0;
+        fs_rpc(creq, csz, &cgot);
+    }
+    if (out_n)
+        *out_n = off;
+    return rc;
+}
+
 suki_ssize_t fd_write(struct task *t, int fd, const void *ubuf, size_t count)
 {
     if (count == 0) {

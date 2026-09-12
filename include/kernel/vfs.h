@@ -125,6 +125,10 @@ int vfs_readdir(int dd, fs_dirent_t *de);
 /* closedir：成功返回 0 */
 int vfs_closedir(int dd);
 
+/* 内核态同步读整个文件（仅 DISK 后端，供启动期读 registry 等小文件）。
+ * 成功返回 0，*out_n 为读取字节；失败返回负 errno。 */
+int kern_fs_read_file(const char *path, uint8_t *buf, uint32_t cap, uint32_t *out_n);
+
 /* ===================== 内建后端统一入口（供 fd.c 调用） =====================
  * 这些函数假定入参路径已是相对挂载点的路径（fd.c 经 vfs_resolve 剥离前缀后传入）。
  * DISK 后端不在此处理——由 fd.c 直发 FS_PORT（保持 FatFs 兼容）。 */

@@ -15,6 +15,9 @@
 #include <kernel/string.h>
 #include <kernel/console.h>
 #include <kernel/spinlock.h>
+#include <kernel/ksym.h>          /* EXPORT_SYMBOL 内核符号导出 */
+EXPORT_SYMBOL(kmalloc);          /* 供 .kdr 内核模块调用 */
+EXPORT_SYMBOL(kfree);            /* 供 .kdr 内核模块调用 */
 
 /* P0-3：内核堆全局锁。锁序（外层->内层）：kmalloc -> pmm -> console，
  * 即持本锁期间可再拿 pmm 锁（kheap_grow）与 console 锁（诊断打印），

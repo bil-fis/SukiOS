@@ -10,6 +10,7 @@
  */
 #include <kernel/types.h>
 #include <kernel/serial.h>
+#include <sukios/kdr.h>
 #include <kernel/console.h>
 #include <kernel/multiboot2.h>
 #include <kernel/framebuffer.h>
@@ -22,7 +23,9 @@
 #include <kernel/ioapic.h>
 #include <kernel/clock.h>
 #include <kernel/config.h>      /* CONFIG_SMP：构建形态（默认单核） */
-#include <kernel/display_cfg.h> /* g_display：显示配置文件（video_mode/分辨率） */
+#include <kernel/display_cfg.h> /* g_display：显示配置（内置默认值；运行时可被 registry 覆盖） */
+#include <kernel/registry.h>   /* SukiRegistry Hive 解析（/sys/configs） */
+#include <kernel/vfs.h>        /* kern_fs_read_file：内核态同步读文件 */
 #include <kernel/posix.h>       /* posix_init()：完整 POSIX 系统调用层 */
 #include <kernel/rtc.h>         /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
 #include <kernel/smp.h>
@@ -89,7 +92,7 @@ static void console_srv(void *arg)
     }
 }
 
-static boot_info_t g_boot;
+boot_info_t g_boot;
 
 static void draw_boot_logo(void)
 {
@@ -152,6 +155,100 @@ static void mm_selftest(void)
             (unsigned long)pmm_free_pages());
 }
 
+/* ===================== 启动阶段辅助（含预留接入点） ===================== */
+
+/* 全局：registry 是否允许加载 kdr（可由 /System/Kernel/KdrEnabled 关闭） */
+static bool g_kdr_enabled = true;
+
+/* 解析 GRUB 内核命令行（-v/--verbose）。预留 suki.debug=1（后期权限子系统调试角色）。 */
+static void ParseBootCmdline(void)
+{
+    const char *cl = g_boot.cmdline;
+    if (!cl[0])
+        return;
+    for (size_t i = 0; cl[i]; ) {
+        while (cl[i] == ' ' || cl[i] == '\t') i++;
+        if (!cl[i]) break;
+        size_t s = i;
+        while (cl[i] && cl[i] != ' ' && cl[i] != '\t') i++;
+        size_t len = i - s;
+        if ((len == 2 && memcmp(cl + s, "-v", 2) == 0) ||
+            (len == 9 && memcmp(cl + s, "--verbose", 9) == 0)) {
+            g_boot_verbose = true;
+        }
+        /* 预留：suki.debug=1 -> 后期权限子系统调试角色启用点（本期未实现） */
+    }
+    kprintf("[boot] cmdline: '%s' (verbose=%s)\n", cl, g_boot_verbose ? "on" : "off");
+}
+
+/* 预留：混合风格权限提升子系统（UAC/授权/调试角色）。
+ * 设计见《SukiOS 混合风格权限提升设计文档》，本期不实现，仅保留接入点。 */
+static void SecurityReserve(void)
+{
+    kprintf("[boot] security: 权限提升子系统(UAC/授权)预留，本期不实现（见设计文档）；仅保留接入点\n");
+}
+
+/* 预留：启动动画。后期实现（详见后续启动动画设计），本期留空。 */
+static void BootPlayAnimation(void)
+{
+    kprintf("[boot] stage3: boot animation reserved (not implemented yet)\n");
+}
+
+/* 第三步：读取 registry 配置（/sys/configs/system.reg）并按配置门控 kdr。
+ * 文件缺失/CRC 失败则回退默认，绝不阻塞启动。 */
+static void Stage3LoadConfigAndKdr(void)
+{
+    uint8_t *buf = kmalloc(65536);
+    if (!buf) {
+        kprintf("[boot] config: kmalloc failed, use defaults\n");
+        return;
+    }
+    uint32_t n = 0;
+    int rc = kern_fs_read_file("/sys/configs/system.reg", buf, 65536, &n);
+    if (rc != 0 || n == 0) {
+        kprintf("[boot] config: cannot read /sys/configs/system.reg (rc=%d), using defaults\n", rc);
+        kfree(buf);
+        return;
+    }
+    const sukreg_header_t *h = (const sukreg_header_t *)buf;
+    system_config_t cfg;
+    if (!RegistryParseSystem(buf, n, &cfg)) {
+        kprintf("[boot] config: hive parse/CRC failed, using defaults\n");
+        kfree(buf);
+        return;
+    }
+    kprintf("[boot] config: loaded system.reg (generation=%llu)\n",
+            (unsigned long long)h->generation);
+    if (cfg.have_display) {
+        g_display.width  = cfg.display_width;
+        g_display.height = cfg.display_height;
+        kprintf("[boot] config: display %ux%u\n",
+                cfg.display_width, cfg.display_height);
+    }
+    if (cfg.have_verbose)
+        g_boot_verbose = cfg.boot_verbose;
+    if (cfg.have_kdr)
+        g_kdr_enabled = cfg.kdr_enabled;
+    kfree(buf);
+}
+
+/* 预留：SukiDesktopManager（sdm）桌面管理器。
+ * 后期负责合成桌面/启动用户会话；本期以 SukiShell 作为桌面占位替身。 */
+static void SukiDesktopManager(void)
+{
+    kprintf("[boot] SukiDesktopManager: reserved; launching SukiShell as desktop surrogate\n");
+    task_create_user(user_shell_start,
+                     (size_t)(user_shell_end - user_shell_start), "SukiShell");
+}
+
+/* 预留：SukiLogon 登录管理器（类 winlogon）。
+ * 后期依据用户数据库/密码决定是否显示登录页；本期无用户库，直接进入桌面。 */
+static void SukiLogon(void)
+{
+    kprintf("[boot] SukiLogon: reserved; no password configured -> proceed to desktop\n");
+    SukiDesktopManager();
+}
+
 void kmain(uint64_t magic, uint64_t mbi_phys)
 {
     serial_init();
@@ -170,10 +267,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
         }
     }
 
-    /* 显示配置文件（configs/display.cfg，经 GRUB module2 加载）必须在 fb_init
-     * 之前解析，使 video_mode 开关生效：off 时 fb_init 不初始化帧缓冲、内核
-     * 回退 VGA 文本模式。缺失配置则保留默认 1280x720 视频模式。 */
-    display_cfg_parse(g_boot.cfg_phys, g_boot.cfg_size);
+    /* 解析 GRUB 内核命令行（-v/--verbose 等）。第三步系统初始化默认仅串口输出，
+     * 仅当 -v/--verbose 时才镜像到屏幕。显示配置不再经 GRUB 模块传递，改由第三步
+     * 从 registry（/sys/configs/system.reg）读取，并以内置默认值兜底。 */
+    ParseBootCmdline();
 
     fb_init(&g_boot);
     fbcon_init();
@@ -213,6 +310,9 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
      * UMIP 使能 + NXE/SMEP/SMAP 复核 + BSP 守卫页 IST 栈 + Meltdown 检测 */
     security_init();
 
+    /* 预留：混合风格权限提升子系统（UAC/授权）。本期不实现，仅保留接入点。 */
+    SecurityReserve();
+
     /* ---- P0-R3：可诊断性设施 ----
      * gdbstub：COM2 常备 GDB 远程调试（断点/单步/读写内存寄存器/monitor klog）；
      * diag_selftest：故意触发一次 WARN_ON 验证「打印+回溯+继续」全链路。 */
@@ -223,6 +323,21 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     acpi_set_rsdp_hint(g_boot.rsdp_copy_phys); /* P0-6：UEFI 下唯一 RSDP 来源 */
     acpi_init();                               /* 解析 RSDP/XSDT/MADT/HPET/MCFG/_PRT */
     pci_cfg_init();                            /* P0-1：MCFG 存在则切 ECAM，否则 PIO 回退 */
+
+    /* ---- 驱动/设备管理器 + .kdr 内核模块加载 ----
+     * driver_manager_init / device_manager_init 建立驱动与设备注册表；
+     * scan_pci 枚举真实 PCI 设备并注册为 device_t；
+     * kdr_load_all 从引导模块加载 .kdr 内核驱动（其 kdr_init 注册 driver_t）；
+     * 随后注册 2 个同型虚拟演示设备，验证「一套驱动驱动多个设备」。 */
+    driver_manager_init();
+    device_manager_init();
+    ksym_dump_count();
+    device_manager_scan_pci();
+    /* kdr 加载移至第三步（boot_late_init 内 Stage3LoadConfigAndKdr 之后），
+     * 由 registry 配置门控，默认启用。此处仅注册演示设备，待 kdr 加载后绑定。 */
+    device_manager_add_demo(0, "demo-led-0");
+    device_manager_add_demo(1, "demo-led-1");
+
     uint8_t bsp_lapic = lapic_init();          /* 启用本地 APIC */
     ioapic_init();                             /* 初始化 I/O APIC（屏蔽全部） */
     ioapic_set_dest(bsp_lapic);                /* 中断投递到 BSP */
@@ -265,7 +380,7 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
      * （fd_install_stdio 在每个 Ring3 任务创建时执行，需要槽池已初始化）。 */
     posix_init();
 
-    task_create_kernel(console_srv, NULL, "console-srv");
+    task_create_kernel(console_srv, NULL, "SukiConsoleServer");
 
     /* ---- 阶段八·补：Intel HDA 音频（内核态特例，类 ATA） ---- */
     hda_init();
@@ -301,7 +416,7 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
      *   idle0 的 bsp_idle 才 sti，此时 self-IPI 在独立栈上下文被响应、调度到
      *   boot_late_init——BSP 引导栈早已冻结，真正『内核稳定后再加载用户态』。 */
     interrupts_disable();
-    task_create_kernel(boot_late_init, NULL, "boot-late");
+    task_create_kernel(boot_late_init, NULL, "SukiBootLate");
 
     /* task0 = idle0：将 BSP 引导流切换到 idle0 的独立内核栈，BSP 引导栈从此冻结。
      * 切换后 idle0 在独立栈上运行 bsp_idle（hlt + schedule 循环），避免 idle0 复
@@ -369,12 +484,12 @@ static void boot_late_init(void *arg)
         task_t *fs_task = task_create_user(
             user_fs_server_start,
             (size_t)(user_fs_server_end - user_fs_server_start),
-            "fs-server");
+            "SukiFsServer");
         /* A2 项：仅 FS_SERVER 被授权向内核 DISK_PORT 发送磁盘请求 */
         if (fs_task)
         {
             port_grant_send(DISK_PORT, fs_task);
-            kprintf("[boot] fs-server spawned (pid=%lu), POSIX file syscalls "
+            kprintf("[boot] SukiFsServer spawned (pid=%lu), POSIX file syscalls "
                     "enabled\n",
                     (unsigned long)fs_task->id);
         }
@@ -385,6 +500,16 @@ static void boot_late_init(void *arg)
         vfs_init();
         extern void vfs_selftest(void);
         vfs_selftest();
+
+        /* 第三步：读取 registry 配置（/sys/configs/system.reg）并按配置门控 kdr。
+         * 文件缺失/CRC 失败则回退默认，绝不阻塞启动。 */
+        Stage3LoadConfigAndKdr();
+        if (g_kdr_enabled) {
+            kdr_load_all();
+        } else {
+            kprintf("[boot] kdr loading disabled by registry config\n");
+        }
+        BootPlayAnimation();   /* 预留：启动动画（本期未实现） */
     }
     else
     {
@@ -405,7 +530,7 @@ static void boot_late_init(void *arg)
     {
         task_t *net_task = task_create_user(user_net_server_start,
                 (size_t)(user_net_server_end - user_net_server_start),
-                "net-server");
+                "SukiNetServer");
         if (net_task) {
             port_grant_send(NET_PORT, net_task);
             kprintf("[boot] net-server spawned (pid=%lu), lwIP stack coming up\n",
@@ -423,10 +548,10 @@ static void boot_late_init(void *arg)
      * shell 的启动将作为后续独立里程碑，在显示层就绪后再接入。 */
     task_create_user(user_input_server_start,
                      (size_t)(user_input_server_end - user_input_server_start),
-                     "input-server");
+                     "SukiInputServer");
     task_create_user(user_display_server_start,
                      (size_t)(user_display_server_end - user_display_server_start),
-                     "display-server");
+                     "SukiDisplayServer");
 
     /* ============================================================
      * 启动屏障（关键修复）：必须先等【显示服务完全就绪】再挂载后续服务。
@@ -475,11 +600,10 @@ static void boot_late_init(void *arg)
      * 发给 display-server 渲染。须在显示服务就绪后挂载，确保其消息能被立即接收。 */
     task_create_user(user_mouse_server_start,
                      (size_t)(user_mouse_server_end - user_mouse_server_start),
-                     "mouse-server");
-    /* 显示层就绪后再 spawn shell；shell 可经 SYS_CONSOLE_READ 取回内核启动日志
-     * 并渲染到显示服务的终端窗口。 */
-    task_create_user(user_shell_start,
-                     (size_t)(user_shell_end - user_shell_start), "shell");
+                     "SukiMouseServer");
+    /* 启动 SukiLogon（预留：登录管理器）。当前无用户/密码库，直接进入桌面
+     * （SukiDesktopManager 以 SukiShell 作为桌面占位替身）。 */
+    SukiLogon();
 
     /* ---- POSIX 一致性测试（Ring3，开机自检）----
      * 在 fs-server 之后启动：posixtest 内部会轮询等待 FS 就绪（wait_fs_ready），
@@ -490,28 +614,28 @@ static void boot_late_init(void *arg)
      * 输出经串口落盘，用于 QEMU 无头回归判定（验证多线程零 panic + 计数精确）。 */
     task_t *sp1 = task_create_user(user_posixtest_start,
                      (size_t)(user_posixtest_end - user_posixtest_start),
-                     "posixtest");
+                     "SukiPosixTest");
     kprintf("[boot-dbg] posixtest spawn ret=%p\n", (void *)sp1);
 
     /* 网络子系统端到端验证：spawn nettest（UDP -> QEMU TFTP 10.0.2.2:69 往返 +
      * SukiNative 原生 socket 冒烟）。与 posixtest 同为开机自检，输出经串口落盘。 */
     task_t *sp2 = task_create_user(user_nettest_start,
                      (size_t)(user_nettest_end - user_nettest_start),
-                     "nettest");
+                     "SukiNetTest");
     kprintf("[boot-dbg] nettest spawn ret=%p\n", (void *)sp2);
 
     /* 动态链接验证：spawn dltest（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
      * 验证内核 elf.c 的 ET_DYN 模块加载/重定位/符号解析（dlopen 路径）。 */
     task_t *sp3 = task_create_user(user_dltest_start,
                      (size_t)(user_dltest_end - user_dltest_start),
-                     "dltest");
+                     "SukiDlTest");
     kprintf("[boot-dbg] dltest spawn ret=%p\n", (void *)sp3);
 
     /* 窗口系统端到端自检：spawn winhello（libsuki_gui 创建窗口 + OOL 零拷贝合成）。
      * 验证「应用 -> WM_PORT -> 显示服务合成 -> 帧缓冲」全链路，输出经串口落盘。 */
     task_t *sp4 = task_create_user(user_winhello_start,
                      (size_t)(user_winhello_end - user_winhello_start),
-                     "winhello");
+                     "SukiWinHello");
     kprintf("[boot-dbg] winhello spawn ret=%p\n", (void *)sp4);
 
     /* Rust 工具链开机自检（Part 2 验收，见 results/step70.md）：
@@ -525,7 +649,7 @@ static void boot_late_init(void *arg)
         const uint8_t *rb = _binary_rusthello_start;
         const uint8_t *re = _binary_rusthello_end;
         if (rb && re && re > rb) {
-            task_t *rt = task_create_user(rb, (size_t)(re - rb), "RUSTHELLO");
+            task_t *rt = task_create_user(rb, (size_t)(re - rb), "SukiRustHello");
             if (rt)
                 kprintf("[rust-boot] spawned RUSTHELLO pid=%lu\n",
                         (unsigned long)rt->id);

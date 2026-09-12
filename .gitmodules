@@ -4,3 +4,9 @@
 [submodule "lib/curl"]
 	path = lib/curl
 	url = https://github.com/curl/curl.git
+[submodule "lib/lwip-2.2.1"]
+	path = lib/lwip-2.2.1
+	url = https://github.com/lwip-tcpip/lwip.git
+[submodule "lib/freetype-2.14.3"]
+	path = lib/freetype-2.14.3
+	url = https://github.com/freetype/freetype.git

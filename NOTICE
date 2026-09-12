@@ -279,4 +279,84 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
        开机自检在 SukiOS 上真实运行（见 results/step70.md）。
 ------------------------------------------------------------------------------
 
+------------------------------------------------------------------------------
+8. lwIP - A Lightweight TCP/IP stack
+   路径:      lib/lwip-2.2.1/   (git submodule；全部源码：src/, doc/, COPYING 等)
+   上游:      https://savannah.nongnu.org/projects/lwip/
+              (git: https://github.com/lwip-tcpip/lwip.git)
+   版本:      2.2.1 (tag STABLE-2_2_1_RELEASE)
+   作者:      Adam Dunkels 及 lwIP 项目贡献者（Simon Goldschmidt 等）
+   许可证:    BSD-3-Clause（3 条款 BSD）
+   版权声明 (取自 lib/lwip-2.2.1/COPYING):
+      Copyright (c) 2001, 2002 Swedish Institute of Computer Science.
+      All rights reserved.
+
+      Redistribution and use in source and binary forms, with or without
+      modification, are permitted provided that the following conditions
+      are met:
+      1. Redistributions of source code must retain the above copyright
+         notice, this list of conditions and the following disclaimer.
+      2. Redistributions in binary form must reproduce the above copyright
+         notice, this list of conditions and the following disclaimer in the
+         documentation and/or other materials provided with the distribution.
+      3. The name of the author may not be used to endorse or promote products
+         derived from this software without specific prior written permission.
+
+      THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+      IMPLIED WARRANTIES ARE DISCLAIMED.  See lib/lwip-2.2.1/COPYING for the
+      full text.
+   附加说明:
+      SukiOS 以 git submodule 引入（见 README §5.1），不在上游源码内部做改动；
+      项目侧裁剪全部通过外部配置头完成：user/lib/lwipopts.h（协议栈选项）与
+      user/lib/arch/cc.h（平台适配）。lwIP 以 NO_SYS=1 raw API 编入用户态
+      net_server，驱动 SukiOS 的 socket 子系统（系统调用 150–166）。
+------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------
+9. Mbed TLS
+   路径:      lib/mbedtls/   (git submodule；library/, include/, LICENSE 等)
+   上游:      https://github.com/Mbed-TLS/mbedtls
+   版本:      3.6.7 (tag mbedtls-3.6.7；3.6 为长期支持 LTS 分支)
+   作者:      The Mbed TLS Contributors (Arm / TrustedFirmware)
+   许可证:    Apache-2.0 或 GPL-2.0-or-later（双重许可，用户可任选其一）
+   版权声明 (取自 lib/mbedtls/LICENSE):
+      Mbed TLS files are provided under a dual Apache-2.0 OR GPL-2.0-or-later
+      license. This means that users may choose which of these licenses they
+      take the code under.
+      Copyright The Mbed TLS Contributors.
+      完整许可文本见 lib/mbedtls/LICENSE（含 Apache License 2.0 全文）。
+   附加说明:
+      SukiOS 以 git submodule 引入（见 README §5.1），**尚未接入构建**；规划为
+      SukiOS 的 TLS/HTTPS 加密后端（供 libcurl 使用）。接入时将编译为静态库并
+      通过用户态平台适配层（熵源 RDRAND / 软 PRNG、timing 经 gettimeofday）
+      提供宿主能力，不修改上游源码。GPL-2.0-or-later 与本仓库 GPL-3.0 兼容。
+------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------
+10. curl / libcurl
+   路径:      lib/curl/   (git submodule；lib/, include/, COPYING 等)
+   上游:      https://curl.se/   (git: https://github.com/curl/curl.git)
+   版本:      8.22.0 (tag curl-8_22_0)
+   作者:      Daniel Stenberg 及众多贡献者（见 lib/curl/THANKS）
+   许可证:    curl 许可（MIT/X 风格）
+   版权声明 (取自 lib/curl/COPYING):
+      COPYRIGHT AND PERMISSION NOTICE
+      Copyright (c) 1996 - 2026, Daniel Stenberg, <daniel@haxx.se>, and many
+      contributors, see the THANKS file.
+      All rights reserved.
+
+      Permission to use, copy, modify, and distribute this software for any
+      purpose with or without fee is hereby granted, provided that the above
+      copyright notice and this permission notice appear in all copies.
+      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. See
+      lib/curl/COPYING for the full text.
+   附加说明:
+      SukiOS 以 git submodule 引入（见 README §5.1），**尚未接入构建**；规划为
+      SukiOS 的 HTTP/HTTPS 客户端。接入方式见 results/step81.md（手写
+      curl_config.h + 静态库集成），HTTPS 由 mbedTLS 提供后端。
+------------------------------------------------------------------------------
+
+
 本 NOTICE 文件应随本仓库的源代码与二进制分发一并提供。

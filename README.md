@@ -173,6 +173,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **`.kdr` 内核模块加载器（未实现）**：**用户态共享库动态链接已实现**（`.sl` + 内核 `ld.suki` + syscall 126–129 + `dltest` 自检，见 §2.11）；但 **`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现**，当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
+- **HTTP/HTTPS 客户端（libcurl + mbedTLS，已备料未集成）**：libcurl `8.22.0` 与 mbedTLS `3.6.7`（LTS）已作为 **git submodule** 引入 `lib/`（见 §5.1），但**尚未接入构建**。其底座（BSD socket libc 包装、`getaddrinfo`/DNS、`select`/`poll`/`fcntl`、时间日历换算、miniz zlib 兼容层）已就绪（详见 `results/step82.md`）；后续按 `results/step81.md` 方案以手写 `curl_config.h` + `libcurl.a` 集成，并由 mbedTLS 提供 HTTPS/TLS。
 - **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
 
 ---
@@ -195,6 +196,9 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 ### 4.2 构建命令
 
 ```bash
+# 0) 首次克隆后拉取第三方子模块（lwip / freetype / mbedtls / curl；缺失会构建失败）
+git submodule update --init --recursive
+
 # 1) 清理（会删除 build/ 下全部产物，含 disk.img；用 make clean，勿用 rm -rf）
 make clean
 
@@ -204,6 +208,10 @@ make iso
 # 3) 生成 FAT32 磁盘镜像（含 README/HELLO/ROADMAP、::SYS、::BIN/*、MOONHALO.MP3）
 make disk
 ```
+
+> **第三方依赖以 git submodule 引入**：库类放在 `lib/`，程序 / 工具类放在 `compapps/`
+> （详见 §5 与 §5.1）。克隆仓库时建议 `git clone --recursive`，或在已有克隆中执行
+> `git submodule update --init --recursive` 拉齐 `lib/{lwip-2.2.1,freetype-2.14.3,mbedtls,curl}`。
 
 > **默认即为单核**：`make iso` / `make run` 等目标默认 `CONFIG_SMP=0`（单核）。如需多核，用 `make iso SMP=1`（同时 QEMU 自动 `-smp 4`），但当前主线验证以单核为准。
 
@@ -270,7 +278,7 @@ SukiOS>
 5. **headless 下鼠标不移动**：QEMU `-display none` 不向 PS/2 鼠标投递物理移动（monitor `mouse_move` 依赖图形后端），故真实鼠标移动的图形验证须在 `make run` 图形窗口人工操作。
 6. **构建需完整链路**：`make iso` 须配合 `make disk` 才有 FAT32 磁盘；改源码后若异常，先 `make clean && make iso && make disk` 全量重建。
 7. **KASLR 两阶段链接**：若 `tools/gen_relk.py` 或 Python 缺失，链接阶段会失败。
-8. **第三方库**：`minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`lib/freetype-2.14.3/`、`resources/ResourceHanRoundedCN-Medium.ttf` 等均为第三方组件，版权见 `NOTICE`。
+8. **第三方依赖**：`minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`resources/ResourceHanRoundedCN-Medium.ttf` 等为随仓库分发的第三方组件；`lib/{lwip-2.2.1,freetype-2.14.3,mbedtls,curl}` 为 **git submodule**（需 `--recursive` 拉取，见 §5.1）。版权见 `NOTICE`。
 
 ---
 
@@ -308,9 +316,12 @@ SukiOS/
 ├── drivers/FatFs/         # ChaN FatFs R0.16
 ├── minimp3/               # minimp3 解码库（CC0，playaudio 用）
 ├── resources/             # ResourceHanRoundedCN-Medium.ttf（界面字体，OFL-1.1）
-├── lib/                   # 第三方库（vendor，随仓库分发）
-│   ├── freetype-2.14.3/   # FreeType 字体光栅化引擎（FTL，fontsrv 用）
-│   └── lwip-2.2.1/        # lwIP TCP/IP 协议栈（BSD-2-Clause，net_server 用）
+├── lib/                   # 第三方【库】——全部以 git submodule 引入（库文件放 lib/）
+│   ├── lwip-2.2.1/        # lwIP TCP/IP 协议栈（BSD-3-Clause）@ tag STABLE-2_2_1_RELEASE，net_server 用
+│   ├── freetype-2.14.3/   # FreeType 字体光栅化引擎（FTL）@ tag VER-2-14-3，fontsrv 用
+│   ├── mbedtls/           # mbedTLS 3.6.7（LTS，Apache-2.0）@ tag mbedtls-3.6.7，TLS 后端（待接入）
+│   └── curl/              # libcurl 8.22.0（curl 许可）@ tag curl-8_22_0，HTTP/HTTPS 客户端（待集成）
+├── compapps/              # 第三方【程序/工具】——以 git submodule 引入（程序文件放 compapps/）
 ├── include/               # 内核 / 用户态公共头
 ├── grub/                  # grub.cfg（ISO 引导配置）
 ├── tools/                 # gen_relk.py（KASLR 重定位）等
@@ -327,6 +338,38 @@ SukiOS/
 └── README.md              # 本文件
 ```
 
+### 5.1 第三方依赖：git submodule 约定
+
+SukiOS 引入外部第三方项目**一律使用 `git submodule`**（不再把上游源码直接拷贝入库），约定：
+
+| 类别 | 位置 | 示例 |
+|---|---|---|
+| **库（library）** | `lib/` | `lib/lwip-2.2.1`、`lib/freetype-2.14.3`、`lib/mbedtls`、`lib/curl` |
+| **程序 / 工具（program / tool）** | `compapps/` | 当前为空占位（见 `compapps/README.md`） |
+
+当前已登记的子模块（`.gitmodules`，均为 `--depth 1` 浅克隆并按 tag 固定）：
+
+| 子模块 | 上游 | 固定版本 | 用途 |
+|---|---|---|---|
+| `lib/lwip-2.2.1` | `lwip-tcpip/lwip` | `STABLE-2_2_1_RELEASE` | 用户态 `net_server` 的 TCP/IP 协议栈 |
+| `lib/freetype-2.14.3` | `freetype/freetype` | `VER-2-14-3` | `fontsrv` 字形光栅化 |
+| `lib/mbedtls` | `Mbed-TLS/mbedtls` | `mbedtls-3.6.7`（3.6 LTS） | HTTPS/TLS 后端（供 libcurl，待接入） |
+| `lib/curl` | `curl/curl` | `curl-8_22_0` | HTTP/HTTPS 客户端（待集成） |
+
+使用方式：
+
+```bash
+git clone --recursive <SukiOS-url>            # 初次克隆连子模块一起拉取
+git submodule update --init --recursive       # 已有克隆补齐/同步子模块
+git submodule status                          # 查看各子模块当前提交
+```
+
+> 说明：`lwip-2.2.1` / `freetype-2.14.3` 此前为 vendored（随仓库分发的源码副本），
+> 现已切换为上述固定 tag 的子模块；两者内容与上游 tag 逐文件一致（构建产物尺寸不变），
+> 项目侧的裁剪 / 配置全部通过外部头（`user/lib/lwipopts.h`、`user/lib/arch/cc.h`、
+> `user/lib/freetype_shim.h`、`user/lib/ftmodule_min.h`）完成，**不修改上游源码**。
+> `mbedtls` 与 `curl` 已作为子模块就绪但**尚未接入构建**（见 §3）。
+
 ---
 
 ## 6. 向仓库贡献
@@ -336,13 +379,15 @@ SukiOS/
 ### 6.1 开发环境准备
 
 ```bash
-git clone https://github.com/bil-fis/SukiOS SukiOS && cd SukiOS
+git clone --recursive https://github.com/bil-fis/SukiOS SukiOS && cd SukiOS
+# 若未带 --recursive：git submodule update --init --recursive
 make info                 # 打印 CC / 工具链 / 对象列表
 which grub-mkrescue mformat mcopy mmd qemu-system-x86_64 python3
 ```
 
 - 推荐启用 KVM（`/dev/kvm` 存在）获得接近真实的运行速度。
 - 构建与运行**不需要** `source` 任何 env 脚本；构建环境由 `Makefile` 自身处理。
+- 第三方依赖以 `git submodule` 引入（库放 `lib/`，程序放 `compapps/`）；拉齐子模块见 §5.1。
 - 清理构建产物请用 `make clean`，勿用 `rm -rf build`。
 
 ### 6.2 分支与提交约定
@@ -389,7 +434,8 @@ tail -8 /tmp/sukios.log
 
 ### 6.5 第三方组件贡献边界
 
-- `minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`lib/freetype-2.14.3/`、`resources/ResourceHanRoundedCN-Medium.ttf` 为上游第三方组件，**一般不要在其内部做功能修改**；如需修复优先以上游 PR 方式进行，并在 `NOTICE` 记录偏差。
+- `minimp3/`、`drivers/FatFs/`、`kernel/abilities/miniz/`、`resources/ResourceHanRoundedCN-Medium.ttf` 为随仓库分发的上游第三方组件；`lib/`、`compapps/` 下的 submodule（lwip / freetype / mbedtls / curl 等）为上游独立仓库，**一般不要在其内部做功能修改**（子模块改动不会随主仓库提交）。项目侧一律通过外部配置文件（如 `user/lib/lwipopts.h`、`user/lib/arch/cc.h`、`user/lib/freetype_shim.h`、`user/lib/ftmodule_min.h`）适配；如需上游修复优先走上游 PR，并在 `NOTICE` 记录偏差。
+- 引入新的第三方库 / 程序请**使用 `git submodule`**：库放 `lib/`，程序 / 工具放 `compapps/`（见 §5.1）。
 - 内核为 freestanding，用户态为自供桩；不要把 newlib 整体编入内核。
 
 ---
@@ -401,8 +447,10 @@ tail -8 /tmp/sukios.log
 - **lieff** —— minimp3（CC0 公共领域），MP3 解码能力。
 - **Rich Geldreich / RAD Game Tools / Valve** —— miniz（zlib 风格许可）。
 - **Cyano Hao** —— Resource Han Rounded（资源圆体，OFL-1.1），界面字体。
-- **FreeType Project** —— FreeType 字体光栅化引擎（FTL 许可），`lib/freetype-2.14.3/`，驱动 TTF 字形渲染。
-- **lwIP（Adam Dunkels / Simon Goldschmidt 等）** —— lwIP 轻量级 TCP/IP 协议栈（BSD-2-Clause），`lib/lwip-2.2.1/`，驱动 `net_server` 网络能力。
+- **FreeType Project** —— FreeType 字体光栅化引擎（FTL 许可），`lib/freetype-2.14.3/`（submodule），驱动 TTF 字形渲染。
+- **lwIP（Adam Dunkels / Simon Goldschmidt 等）** —— lwIP 轻量级 TCP/IP 协议栈（BSD-3-Clause），`lib/lwip-2.2.1/`（submodule），驱动 `net_server` 网络能力。
+- **Mbed TLS（Arm / TrustedFirmware）** —— 轻量级 TLS/加密库（Apache-2.0 或 GPL-2.0-or-later 双许可），`lib/mbedtls/`（submodule，3.6 LTS），规划为 SukiOS HTTPS/TLS 后端。
+- **curl（Daniel Stenberg 等）** —— libcurl 传输库（curl 许可），`lib/curl/`（submodule），规划为 SukiOS 的 HTTP/HTTPS 客户端。
 - **newlib 贡献者**（Red Hat、UC Berkeley 等）—— freestanding 用户态实现参考。
 - **GRUB / SeaBIOS / OVMF / QEMU** —— 可引导固件与验证环境。
 - **CodeBuddy** —— 代码生成与调试支持。
@@ -426,7 +474,10 @@ tail -8 /tmp/sukios.log
 | newlib（参考，不入库） | `lib/newlib-4.6.0.20260123/` | BSD 风格（Red Hat / UC Berkeley 等） |
 | FatFs | `drivers/FatFs/` | 1-clause BSD 风格（ChaN） |
 | Resource Han Rounded | `resources/ResourceHanRoundedCN-Medium.ttf` | SIL OFL-1.1（Cyano Hao） |
-| lwIP | `lib/lwip-2.2.1/` | BSD-2-Clause（Adam Dunkels 等） |
+| lwIP（submodule） | `lib/lwip-2.2.1/` | BSD-3-Clause（Adam Dunkels / SICS 等） |
+| FreeType（submodule） | `lib/freetype-2.14.3/` | FTL 或 GPLv2（双许可，FreeType Project） |
+| mbedTLS（submodule） | `lib/mbedtls/` | Apache-2.0 或 GPL-2.0-or-later（双许可，Arm / TrustedFirmware） |
+| libcurl（submodule） | `lib/curl/` | curl 许可（MIT/X 风格，Daniel Stenberg 等） |
 | Rust 工具链（rustup / rustc / cargo） | 本地安装（不随仓库分发） | MIT OR Apache-2.0（Rust Project Developers） |
 
 ---

@@ -1756,14 +1756,113 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, int32_t prot,
     if (prot & ~(SUKI_PROT_READ | SUKI_PROT_WRITE | SUKI_PROT_NONE)) {
         return -SUKI_EINVAL;
     }
+    /* ---- 文件映射（非匿名）---- */
     if (!(flags & SUKI_MAP_ANONYMOUS)) {
-        return -SUKI_ENOSYS;              /* 文件映射需页缓存，尚未就绪 */
+        /* MAP_SHARED 需要页缓存回写（P1-4），当前未就绪 -> 明确 ENOSYS。 */
+        if (flags & SUKI_MAP_SHARED)
+            return -SUKI_ENOSYS;
+        if (fd < 0)
+            return -SUKI_EBADF;
+
+        suki_stat_t st;
+        if (fd_fstat(t, fd, &st) != 0)
+            return -SUKI_EBADF;
+        if (off < 0 || (uint64_t)off > (uint64_t)st.st_size)
+            return -SUKI_EINVAL;
+        uint64_t file_avail = (uint64_t)st.st_size - (uint64_t)off;
+        if (file_avail > len)
+            file_avail = len;            /* 仅映射 [off, off+len) */
+
+        uint64_t base;
+        if (flags & SUKI_MAP_FIXED) {
+            if (!addr || addr < VMA_MMAP_BASE || addr + len > VMA_MMAP_TOP)
+                return -SUKI_EINVAL;
+            vma_unmap_range(t, addr, addr + len);   /* 替换语义 */
+            base = addr;
+        } else {
+            base = vma_find_free(t, VMA_MMAP_BASE, VMA_MMAP_TOP, len);
+        }
+        if (!base)
+            return -SUKI_ENOMEM;
+
+        uint64_t vprot = PTE_NX | ((prot & SUKI_PROT_WRITE) ? PTE_WRITE : 0);
+        if (!vma_insert(t, base, base + len, vprot, VMA_TYPE_ANON)) {
+            return -SUKI_ENOMEM;
+        }
+
+        /* 把文件 [off, off+file_avail) 按页读入新映射的前部；超出 EOF 的部分
+         * 保持未映射 -> 按需零填充（POSIX 语义）。读过程临时定位 fd 偏移并还原，
+         * mmap 不改变调用方 fd 的当前偏移。 */
+        if (file_avail > 0) {
+            fd_entry_t *fe = fd_get(t, fd);
+            if (!fe) {
+                vma_unmap_range(t, base, base + len);
+                return -SUKI_EBADF;
+            }
+            /* 用【独立重开的只读 fd】读文件内容，避免改动调用方 fd 的当前偏移：
+             * DISK 后端的真实偏移由 FS_SERVER 按后端句柄维护（内核侧 e->offset
+             * 不可见），直接复用原 fd 会把它推进到 EOF，破坏后续 read/lseek 语义；
+             * 重开一个独立 fd 让 FS_SERVER 分配新的后端句柄（偏移 0），原 fd 不受影响。 */
+            int read_fd;
+            uint64_t saved_off = 0;
+            bool used_orig = false;
+            char pathbuf[256];
+            if (fe->path) {
+                strncpy(pathbuf, fe->path, sizeof(pathbuf) - 1);
+                pathbuf[sizeof(pathbuf) - 1] = '\0';
+                read_fd = fd_open(t, pathbuf, SUKI_O_RDONLY, 0);
+                if (read_fd < 0) {
+                    vma_unmap_range(t, base, base + len);
+                    return (int64_t)read_fd;
+                }
+            } else {
+                read_fd = fd;
+                saved_off = fe->offset;
+                fe->offset = (uint64_t)off;
+                used_orig = true;
+            }
+
+            uint64_t va = base;
+            uint64_t rem = file_avail;
+            int64_t rc = 0;
+            while (rem > 0) {
+                uint64_t chunk = (rem > PAGE_SIZE) ? PAGE_SIZE : rem;
+                void *page = pmm_alloc_page();
+                if (!page) { rc = -SUKI_ENOMEM; break; }
+                suki_ssize_t n = fd_read_kern(t, read_fd, PHYS_TO_VIRT(page), chunk);
+                if (n < 0) {
+                    pmm_free_page(page);
+                    rc = (int64_t)n;
+                    break;
+                }
+                /* page 已由 pmm_alloc_page 清零，短读尾部自然为零 */
+                uint64_t pflags = PTE_PRESENT | PTE_USER | vprot;
+                if (!vmm_map_page(t->cr3, va, (uint64_t)page, pflags)) {
+                    pmm_free_page(page);
+                    rc = -SUKI_ENOMEM;
+                    break;
+                }
+                va += PAGE_SIZE;
+                rem -= chunk;
+                if ((uint64_t)n < chunk)
+                    break;               /* 提前 EOF：其余保持零填充 */
+            }
+            if (used_orig)
+                fe->offset = saved_off;
+            else
+                fd_close(t, read_fd);
+            if (rc != 0) {
+                vma_unmap_range(t, base, base + len);
+                return rc;
+            }
+        }
+        return (int64_t)base;
     }
+
+    /* ---- 匿名映射 ---- */
     if ((flags & SUKI_MAP_SHARED) && (flags & SUKI_MAP_PRIVATE)) {
         return -SUKI_EINVAL;
     }
-    (void)fd;
-    (void)off;
 
     len = (len + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
     uint64_t base;
@@ -1838,19 +1937,101 @@ static int64_t sys_mincore(uint64_t a, uint64_t l, void *v)
     (void)a; (void)l; (void)v;
     return -SUKI_EINVAL;
 }
-/* mremap：仅支持「原地不变长」（new_len == old_len），否则 ENOSYS。
- * 这是真实可用的最小语义，而非桩：请求等长时就是 no-op 成功。 */
+/*
+ * sys_mremap —— 扩展/收缩既有 mmap 区（Linux mremap 语义子集）。
+ *   flags: SUKI_MREMAP_MAYMOVE（可搬到新地址）、SUKI_MREMAP_FIXED（须落在 new_addr）。
+ *   - 等长：原址 no-op 返回 old_addr（兼容旧行为）。
+ *   - 收缩(new_len<old_len)：munmap 尾部 [old+new_len, old+old_len)。
+ *   - 增长：
+ *       * MREMAP_FIXED：先清掉 new_addr 区（不与 old 重叠），建新 VMA，逐页拷贝
+ *         已填充内容，再撤 old 区；
+ *       * MREMAP_MAYMOVE：在 mmap 区间找新空闲址，同上拷贝；
+ *       * 无 move 标志：无法移动，增长不支持 -> -EINVAL（与 Linux 行为一致）。
+ *   拷贝策略：仅拷贝 old 区中【已填充】的页（PTE_PRESENT），未填充页在新映射中
+ *   同样按 demand-zero 补零（与旧区一致）；COW 只读页按内容拷贝断开（新映射独立）。
+ *   完成后刷 CR3 使 TLB 失效（与 vma_protect 一致，避免旧映射残留）。
+ */
 static int64_t sys_mremap(uint64_t old_addr, uint64_t old_len,
                           uint64_t new_len, int32_t flags, uint64_t new_addr)
 {
-    (void)flags; (void)new_addr;
-    if (old_len != new_len) {
-        return -SUKI_ENOSYS;
-    }
-    if (!old_addr || (old_addr & (PAGE_SIZE - 1))) {
+    task_t *t = sched_current();
+    if (!old_addr || (old_addr & (PAGE_SIZE - 1)) ||
+        (old_len & (PAGE_SIZE - 1)) || (new_len & (PAGE_SIZE - 1)) ||
+        old_len == 0 || new_len == 0) {
         return -SUKI_EINVAL;
     }
-    return (int64_t)old_addr;
+    if (new_len == old_len) {
+        return (int64_t)old_addr;       /* 等长 no-op */
+    }
+
+    /* 整段 old 区必须落在 VMA 覆盖内（否则无法安全搬迁） */
+    for (uint64_t a = old_addr; a < old_addr + old_len; a += PAGE_SIZE) {
+        if (!vma_find(t, a))
+            return -SUKI_EINVAL;
+    }
+
+    /* 收缩：撤尾部 */
+    if (new_len < old_len) {
+        if (!vma_unmap_range(t, old_addr + new_len, old_addr + old_len))
+            return -SUKI_EINVAL;
+        return (int64_t)old_addr;
+    }
+
+    bool fixed = (flags & SUKI_MREMAP_FIXED) != 0;
+    bool maymove = (flags & SUKI_MREMAP_MAYMOVE) != 0;
+
+    uint64_t new_base;
+    if (fixed) {
+        if (!new_addr || (new_addr & (PAGE_SIZE - 1)) ||
+            new_addr < VMA_MMAP_BASE || new_addr + new_len > VMA_MMAP_TOP) {
+            return -SUKI_EINVAL;
+        }
+        /* FIXED 不允许与 old 区重叠（否则拷贝/释放顺序自相残杀） */
+        if (new_addr + new_len > old_addr && new_addr < old_addr + old_len)
+            return -SUKI_EINVAL;
+        vma_unmap_range(t, new_addr, new_addr + new_len);   /* 替换语义 */
+        new_base = new_addr;
+    } else if (maymove) {
+        new_base = vma_find_free(t, VMA_MMAP_BASE, VMA_MMAP_TOP, new_len);
+    } else {
+        return -SUKI_EINVAL;           /* 无 move 标志且需增长：不支持 */
+    }
+    if (!new_base)
+        return -SUKI_ENOMEM;
+
+    /* 取 old 区首 VMA 的 prot 作为新 VMA 权限 */
+    vm_area_t *v0 = vma_find(t, old_addr);
+    uint64_t prot = v0 ? v0->prot : (PTE_WRITE | PTE_NX);
+
+    if (!vma_insert(t, new_base, new_base + new_len, prot, VMA_TYPE_ANON))
+        return -SUKI_ENOMEM;            /* 重叠/分配失败 */
+
+    /* 拷贝 old 区已填充页内容到新址对应页 */
+    uint64_t npflags = PTE_PRESENT | PTE_USER | (prot & (PTE_WRITE | PTE_NX));
+    for (uint64_t a = old_addr; a < old_addr + old_len; a += PAGE_SIZE) {
+        uint64_t pte = vmm_pte(t->cr3, a);
+        if (!(pte & PTE_PRESENT))
+            continue;                   /* 未填充 -> 新页 demand-zero（与旧一致） */
+        uint64_t src_phys = pte & PTE_ADDR_MASK;
+        void *np = pmm_alloc_page();
+        if (!np) {
+            vma_unmap_range(t, new_base, new_base + new_len);
+            return -SUKI_ENOMEM;
+        }
+        memcpy(PHYS_TO_VIRT(np), PHYS_TO_VIRT(src_phys), PAGE_SIZE);
+        vmm_map_page(t->cr3, new_base + (a - old_addr), (uint64_t)np, npflags);
+    }
+
+    /* 撤旧区（含释放其物理页） */
+    vma_unmap_range(t, old_addr, old_addr + old_len);
+
+    /* 刷 TLB：地址空间页表已改，重载 CR3 使旧映射失效 */
+    {
+        uint64_t cr3;
+        __asm__ volatile("movq %%cr3, %0" : "=r"(cr3) :: "memory");
+        __asm__ volatile("movq %0, %%cr3" :: "r"(cr3) : "memory");
+    }
+    return (int64_t)new_base;
 }
 
 /* ========================================================================== */
@@ -2059,17 +2240,63 @@ static int64_t sys_alarm(uint32_t sec)
     return 0;
 }
 
-/* getitimer/setitimer：间隔定时器需信号投递，本阶段返回 ENOSYS（POSIX 允许
- * 「不支持该定时器」返回 ENOSYS，应用据此降级）。 */
+/* ===================== 间隔定时器（itimer） ===================== */
+/* ns <-> timeval 互转（用于 itimerval 的内核表达与用户接口对齐） */
+static void ns_to_timeval(int64_t ns, suki_timeval_t *tv)
+{
+    if (ns < 0) ns = 0;
+    tv->tv_sec  = ns / 1000000000LL;
+    tv->tv_usec = (ns % 1000000000LL) / 1000LL;
+}
+static int64_t timeval_to_ns(const suki_timeval_t *tv)
+{
+    if (tv->tv_sec < 0) return 0;
+    return (int64_t)tv->tv_sec * 1000000000LL + (int64_t)tv->tv_usec * 1000LL;
+}
+
+/*
+ * getitimer/setitimer —— POSIX 间隔定时器。
+ *   which: ITIMER_REAL(->SIGALRM) / ITIMER_VIRTUAL(->SIGVTALRM) / ITIMER_PROF(->SIGPROF)
+ * 内部以「剩余 ns / 间隔 ns」存于 task_t.itimers[3]；100Hz 节拍在 sched_tick 中
+ * 递减，归零即经 task_signal_send 置 pending 位，待返回用户态边界由
+ * sig_deliver_check 注入 handler（与 kill/raise 同一套投递机制，无需新代码路径）。
+ */
 static int64_t sys_getitimer(int32_t which, void *val)
 {
-    (void)which; (void)val;
-    return -SUKI_ENOSYS;
+    if (which < 0 || which > 2)
+        return -SUKI_EINVAL;
+    if (!val)
+        return -SUKI_EFAULT;
+    task_t *t = sched_current();
+    suki_itimerval_t it;
+    memset(&it, 0, sizeof(it));
+    ns_to_timeval(t->itimers[which].interval, &it.it_interval);
+    ns_to_timeval(t->itimers[which].value,    &it.it_value);
+    if (copy_to_user(val, &it, sizeof(it)) != sizeof(it))
+        return -SUKI_EFAULT;
+    return 0;
 }
 static int64_t sys_setitimer(int32_t which, const void *nv, void *ov)
 {
-    (void)which; (void)nv; (void)ov;
-    return -SUKI_ENOSYS;
+    if (which < 0 || which > 2)
+        return -SUKI_EINVAL;
+    task_t *t = sched_current();
+    if (ov) {
+        suki_itimerval_t old;
+        memset(&old, 0, sizeof(old));
+        ns_to_timeval(t->itimers[which].interval, &old.it_interval);
+        ns_to_timeval(t->itimers[which].value,    &old.it_value);
+        if (copy_to_user(ov, &old, sizeof(old)) != sizeof(old))
+            return -SUKI_EFAULT;
+    }
+    if (nv) {
+        suki_itimerval_t it;
+        if (copy_from_user(&it, nv, sizeof(it)) != sizeof(it))
+            return -SUKI_EFAULT;
+        t->itimers[which].interval = timeval_to_ns(&it.it_interval);
+        t->itimers[which].value    = timeval_to_ns(&it.it_value);
+    }
+    return 0;
 }
 
 /* ========================================================================== */

@@ -550,6 +550,116 @@ static void test_memory(void)
     }
 }
 
+/* ===================== 进阶内存 / itimer 测试 ===================== */
+static volatile int g_alrm = 0;
+static void h_alrm(int s) { (void)s; g_alrm = 1; }
+
+/* 6 参 mmap 匿名映射辅助（避免与既有内联 asm 样板重复） */
+static uint64_t tst_mmap_anon(uint64_t len, int prot)
+{
+    uint64_t r;
+    register uint64_t r10 __asm__("r10") = (uint64_t)(SUKI_MAP_PRIVATE | SUKI_MAP_ANONYMOUS);
+    register uint64_t r8  __asm__("r8")  = (uint64_t)(int64_t)-1;
+    register uint64_t r9  __asm__("r9")  = 0;
+    __asm__ volatile("syscall"
+                     : "=a"(r)
+                     : "a"((uint64_t)SYS_MMAP), "D"((uint64_t)0),
+                       "S"(len), "d"((uint64_t)prot),
+                       "r"(r10), "r"(r8), "r"(r9)
+                     : "rcx", "r11", "rbx", "memory");
+    return r;
+}
+
+static void test_mm_advanced(void)
+{
+    print_str("--- mremap grow/shrink ---\n");
+
+    /* 增长：8KB -> 16KB（MREMAP_MAYMOVE），内容应保留，新增页为零 */
+    uint64_t m = tst_mmap_anon(8192, SUKI_PROT_READ | SUKI_PROT_WRITE);
+    ck("mremap: mmap anon 8K", m != (uint64_t)-1 && m != 0);
+    if (m != (uint64_t)-1 && m != 0) {
+        volatile uint8_t *p = (volatile uint8_t *)m;
+        for (int i = 0; i < 8192; i++) p[i] = (uint8_t)(i & 0xFF);
+        int64_t g = (int64_t)suki_syscall5(SYS_MREMAP, m, 8192, 16384,
+                                           SUKI_MREMAP_MAYMOVE, 0);
+        ck("mremap grow MAYMOVE returns valid addr", g != (int64_t)-1 && g != 0);
+        if (g > 0) {
+            volatile uint8_t *q = (volatile uint8_t *)g;
+            bool preserved = true;
+            for (int i = 0; i < 8192; i++)
+                if (q[i] != (uint8_t)(i & 0xFF)) { preserved = false; break; }
+            ck("mremap grow preserves old content", preserved);
+            bool z = true;
+            for (int i = 8192; i < 16384; i++)
+                if (q[i] != 0) { z = false; break; }
+            ck("mremap grow new pages are zero", z);
+            suki_syscall2(SYS_MUNMAP, g, 16384);
+        } else {
+            suki_syscall2(SYS_MUNMAP, m, 8192);
+        }
+    }
+
+    /* 收缩：16KB -> 8KB，头部内容保留 */
+    uint64_t s = tst_mmap_anon(16384, SUKI_PROT_READ | SUKI_PROT_WRITE);
+    ck("mremap: mmap anon 16K", s != (uint64_t)-1 && s != 0);
+    if (s != (uint64_t)-1 && s != 0) {
+        volatile uint8_t *p = (volatile uint8_t *)s;
+        for (int i = 0; i < 16384; i++) p[i] = (uint8_t)(i & 0xFF);
+        int64_t sh = (int64_t)suki_syscall5(SYS_MREMAP, s, 16384, 8192, 0, 0);
+        ck("mremap shrink returns same addr", sh == (int64_t)s);
+        bool ok = true;
+        for (int i = 0; i < 8192; i++)
+            if (p[i] != (uint8_t)(i & 0xFF)) { ok = false; break; }
+        ck("mremap shrink preserves head", ok);
+        suki_syscall2(SYS_MUNMAP, s, 8192);
+    }
+
+    print_str("--- itimer (setitimer/getitimer) ---\n");
+    suki_itimerval_t cur0;
+    int64_t gr = suki_syscall2(SYS_GETITIMER, SUKI_ITIMER_REAL, (int64_t)&cur0);
+    ck("getitimer(REAL) returns 0 when disabled",
+       gr == 0 && cur0.it_value.tv_sec == 0 && cur0.it_value.tv_usec == 0);
+
+    signal(SIGALRM, h_alrm);
+    suki_itimerval_t it, old;
+    it.it_interval.tv_sec = 0; it.it_interval.tv_usec = 0;
+    it.it_value.tv_sec   = 0; it.it_value.tv_usec   = 30000;  /* 30ms */
+    int64_t sr = suki_syscall3(SYS_SETITIMER, SUKI_ITIMER_REAL,
+                               (int64_t)&it, (int64_t)&old);
+    ck("setitimer(REAL,30ms) returns 0", sr == 0);
+
+    g_alrm = 0;
+    suki_timeval_t tv;
+    for (int i = 0; i < 200000 && !g_alrm; i++)
+        suki_syscall2(SYS_GETTIMEOFDAY, (int64_t)&tv, 0);
+    ck("ITIMER_REAL fires SIGALRM within ~30ms", g_alrm == 1);
+
+    /* 文件映射（需 FS 就绪）：内容应与 read() 一致 */
+    if (wait_fs_ready()) {
+        print_str("--- mmap file-backed ---\n");
+        int fd = open("/README.TXT", O_RDONLY);
+        ck("mmap-file: open /README.TXT", fd >= 0);
+        if (fd >= 0) {
+            uint64_t ma = suki_syscall6(SYS_MMAP, 0, 4096, SUKI_PROT_READ,
+                                       (uint64_t)SUKI_MAP_PRIVATE,
+                                       (uint64_t)fd, 0);
+            ck("mmap file-backed returns mapping",
+               ma != (uint64_t)-1 && ma != 0);
+            if (ma != (uint64_t)-1 && ma != 0) {
+                char rb[64];
+                int n = read(fd, rb, 64);
+                volatile uint8_t *mp = (volatile uint8_t *)ma;
+                bool same = (n > 0);
+                for (int i = 0; i < n; i++)
+                    if (mp[i] != (uint8_t)rb[i]) { same = false; break; }
+                ck("mmap file content matches read()", same);
+                suki_syscall2(SYS_MUNMAP, ma, 4096);
+            }
+            close(fd);
+        }
+    }
+}
+
 static void test_time(void)
 {
     print_str("[time]\n");
@@ -1061,6 +1171,7 @@ int main(void)
     test_process();
     test_libc();
     test_memory();
+    test_mm_advanced();
     test_time();
     test_system();
     test_fork();

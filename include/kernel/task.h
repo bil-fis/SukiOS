@@ -115,6 +115,9 @@ typedef struct task {
     uint64_t sig_altstack;      /* 信号栈基址（sigaltstack；0=未设置） */
     uint64_t sig_altstack_size; /* 信号栈大小 */
 
+    /* --- 间隔定时器（getitimer/setitimer，由 sched_tick 每 100Hz 节拍推进）--- */
+    struct suki_itimer itimers[3];   /* [REAL, VIRTUAL, PROF]；全 0 = 禁用 */
+
     /* --- SukiNative 对象/句柄（Phase 1，详见 kernel/suki_native.c）---
      * 句柄表惰性分配（首次 SukiNative 调用时），fork/clone 子任务继承空表（不继承父句柄）。
      * 等待态：任务阻塞于 SYS_SUKI_WAIT 时，用 suki_wait_nodes[] 串入各对象的 waiter

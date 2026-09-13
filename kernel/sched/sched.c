@@ -826,6 +826,35 @@ void sched_tick(registers_t *r)
      * 位即 CPL：0=Ring0 内核态，3=Ring3 用户态）。
      * 供 times()/getrusage()/clock_gettime(CLOCK_PROCESS_CPUTIME_ID) 使用。 */
     task_account_tick(r ? ((r->cs & 0x3) == 3) : false);
+
+    /* POSIX 间隔定时器推进（getitimer/setitimer）：每 100Hz 节拍递减。
+     * ITIMER_REAL    任何模式皆递减 -> SIGALRM；
+     * ITIMER_VIRTUAL 仅用户态节拍递减 -> SIGVTALRM；
+     * ITIMER_PROF    用户+内核态节拍递减 -> SIGPROF。
+     * 剩余归零即置对应信号 pending 位，待返回用户态边界由 sig_deliver_check 注入
+     * handler（与 kill/raise 同一套投递机制，无需新代码路径）。 */
+    {
+        bool user_mode = r ? ((r->cs & 0x3) == 3) : false;
+        const int64_t tick_ns = 10000000LL;   /* 100Hz = 10ms */
+        for (int i = 0; i < 3; i++) {
+            int64_t v = cur->itimers[i].value;
+            if (v <= 0)
+                continue;
+            bool dec = (i == SUKI_ITIMER_REAL) || (i == SUKI_ITIMER_PROF) ||
+                       (i == SUKI_ITIMER_VIRTUAL && user_mode);
+            if (!dec)
+                continue;
+            v -= tick_ns;
+            if (v <= 0) {
+                int sig = (i == SUKI_ITIMER_REAL)    ? SUKI_SIGALRM
+                        : (i == SUKI_ITIMER_VIRTUAL) ? SUKI_SIGVTALRM
+                        :                              SUKI_SIGPROF;
+                task_signal_send(cur, sig);
+                v = (cur->itimers[i].interval > 0) ? cur->itimers[i].interval : 0;
+            }
+            cur->itimers[i].value = v;
+        }
+    }
     if (cur->ticks_remaining > 0) {
         cur->ticks_remaining--;
     }

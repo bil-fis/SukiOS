@@ -217,6 +217,10 @@ typedef int32_t  suki_key_t;
 #define SUKI_MAP_ANON      SUKI_MAP_ANONYMOUS
 #define SUKI_MAP_FAILED    ((void *)-1)
 
+/* mremap flags */
+#define SUKI_MREMAP_MAYMOVE  0x1   /* 允许把映射搬到新地址（glibc 默认） */
+#define SUKI_MREMAP_FIXED    0x2   /* 必须落在调用方指定的 new_addr */
+
 /* dirent d_type */
 #define SUKI_DT_UNKNOWN  0
 #define SUKI_DT_FIFO     1
@@ -448,6 +452,21 @@ typedef struct suki_timeval {
     int64_t tv_sec;
     int64_t tv_usec;
 } suki_timeval_t;
+
+/* 间隔定时器（getitimer/setitimer） */
+#define SUKI_ITIMER_REAL    0   /* 实时钟 -> SIGALRM */
+#define SUKI_ITIMER_VIRTUAL 1   /* 仅用户态节拍 -> SIGVTALRM */
+#define SUKI_ITIMER_PROF    2   /* 用户+内核态节拍 -> SIGPROF */
+
+typedef struct suki_itimerval {
+    suki_timeval_t it_interval;  /* 重载间隔（全 0 = 不重载） */
+    suki_timeval_t it_value;     /* 当前剩余（全 0 = 禁用） */
+} suki_itimerval_t;
+
+typedef struct suki_itimer {
+    int64_t value;     /* 剩余 ns（<=0 表示已禁用） */
+    int64_t interval;  /* 重载间隔 ns（0 = 不重载） */
+} suki_itimer_t;
 
 typedef struct suki_timezone {
     int32_t tz_minuteswest;

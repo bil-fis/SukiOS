@@ -813,7 +813,7 @@ typedef struct suki_objinfo {
  * （作为终端）经此调用取回并渲染进自己的终端窗口；串口恒定输出供 headless 观测。
  *   参数 a1 = 用户态缓冲指针，a2 = 缓冲字节数上限；
  *   返回实际拷贝字节数（0=暂无数据），非法指针返回 (uint64_t)-1。 */
-#define SYS_TTY_READ        210
+#define SYS_TTY_READ        211
 
 /* 内核扩展：Ring3 程序（如 BMP 加载器）请求把一块像素 blit 到帧缓冲，用于显示
  * 诊断（检查画面乱码/错位）。内核拥有帧缓冲内核映射，直接写入。

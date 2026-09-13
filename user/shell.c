@@ -771,18 +771,43 @@ static int run_builtin_raw(char *line)
                 if (*p) *p++ = '\0';
             }
             argv[ac] = NULL;
-            int pid = sys_task_spawn(argv[0], argv, NULL);
-            if (pid < 0) {
-                int has_dot = 0;
-                for (const char *q = argv[0]; *q; q++) if (*q == '.') { has_dot = 1; break; }
-                if (!has_dot) {
-                    char ska[256];
-                    int n = 0;
-                    const char *s = argv[0];
-                    while (*s && n < (int)sizeof(ska) - 6) ska[n++] = *s++;
-                    ska[n] = '.'; ska[n+1] = 's'; ska[n+2] = 'k'; ska[n+3] = 'a'; ska[n+4] = '\0';
+            /* exec 路径解析：磁盘上的独立程序统一放在 /BIN/<NAME>.SKA（FS 大小写不敏感）。
+             * 规则：
+             *  - 无扩展名且不含 '/'（裸名，如 curl）：优先 /BIN/<name>.SKA，其次 <name>.ska
+             *    （当前目录），再次裸 <name>（根目录，legacy）；
+             *  - 无扩展名但含 '/'（如 bin/curl）：按原样补 .SKA（bin/curl.SKA，大小写不敏感
+             *    命中 /BIN/CURL.SKA），避免先去探测不存在的裸路径 bin/curl；
+             *  - 已带扩展名：按给定路径直接装载（如 /BIN/CURL.SKA、/home/x/app.ska）。
+             * 这样 exec bin/curl 与 exec curl 都能一次性命中，不再产生 [fs] read_at open FAIL。 */
+            int pid = -1;
+            const char *name = argv[0];
+            int has_dot = 0, has_slash = 0;
+            for (const char *q = name; *q; q++) {
+                if (*q == '.')  has_dot = 1;
+                if (*q == '/')  has_slash = 1;
+            }
+            if (!has_dot) {
+                char probe[256]; int n = 0; const char *pp = name;
+                if (!has_slash) {
+                    probe[n++] = '/'; probe[n++] = 'B'; probe[n++] = 'I';
+                    probe[n++] = 'N'; probe[n++] = '/';
+                }
+                while (*pp && n < (int)sizeof(probe) - 6) probe[n++] = *pp++;
+                probe[n++] = '.'; probe[n++] = 'S'; probe[n++] = 'K'; probe[n++] = 'A';
+                probe[n] = '\0';
+                pid = sys_task_spawn(probe, argv, NULL);
+                if (pid < 0) {
+                    char ska[256]; int m = 0; const char *t = name;
+                    while (*t && m < (int)sizeof(ska) - 6) ska[m++] = *t++;
+                    ska[m++] = '.'; ska[m++] = 's'; ska[m++] = 'k'; ska[m++] = 'a';
+                    ska[m] = '\0';
                     pid = sys_task_spawn(ska, argv, NULL);
                 }
+                if (pid < 0 && !has_slash) {
+                    pid = sys_task_spawn(name, argv, NULL);   /* 根目录裸名（legacy） */
+                }
+            } else {
+                pid = sys_task_spawn(name, argv, NULL);
             }
             if (pid < 0) {
                 shell_out("exec failed: file not found or invalid ELF\n");

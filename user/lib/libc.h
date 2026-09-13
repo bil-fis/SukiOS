@@ -123,9 +123,15 @@ int uname(struct utsname *buf);
 #define O_NONBLOCK SUKI_O_NONBLOCK
 #define O_DIRECTORY SUKI_O_DIRECTORY
 
+#ifndef SEEK_SET
 #define SEEK_SET   SUKI_SEEK_SET
+#endif
+#ifndef SEEK_CUR
 #define SEEK_CUR   SUKI_SEEK_CUR
+#endif
+#ifndef SEEK_END
 #define SEEK_END   SUKI_SEEK_END
+#endif
 
 #define F_OK  SUKI_F_OK
 #define R_OK  SUKI_R_OK

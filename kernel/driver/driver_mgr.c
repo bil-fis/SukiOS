@@ -18,6 +18,7 @@
 #include <kernel/spinlock.h>
 #include <mm/kmalloc.h>
 #include <sukios/kdr.h>
+#include <kernel/ksym.h>   /* EXPORT_SYMBOL() */
 
 static driver_t *g_drivers = NULL;
 static spinlock_t g_dlock;

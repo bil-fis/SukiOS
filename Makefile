@@ -103,7 +103,7 @@ CONFIG_H   := $(BUILD)/config.h
 # 故改用 -mcmodel=large（支持任意 64 位地址）。
 # -MMD -MP：为每个 .o 生成 .d 头依赖文件并在末尾 include，保证修改 .h 后
 # 所有包含它的 .c/.S 自动重编（曾因缺依赖跟踪导致 percpu_t 布局新旧混用崩溃）。
-CFLAGS := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
+CFLAGS := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 -Wa,--noexecstack \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
           -mcmodel=large -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
           -fno-asynchronous-unwind-tables -fno-omit-frame-pointer \
@@ -118,7 +118,7 @@ ASFLAGS := -ffreestanding -mcmodel=large -fno-pic -fno-pie -MMD -MP -I include \
 # 装载器遇到带重定位节的 ELF 会直接拒绝：
 #   "error: ELF files with relocs are not supported yet."
 LDFLAGS := -nostdlib -static -no-pie -z max-page-size=0x1000 \
-           -Wl,--build-id=none -T boot/linker.ld
+           -Wl,--build-id=none -Wl,--no-warn-execstack -T boot/linker.ld
 
 # ---- 源文件 ----
 # 注意：kernel/abilities/ 下是用户态能力库（如 miniz 压缩库，依赖 libc），
@@ -134,7 +134,7 @@ endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
 USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello
-USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
+USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 -Wa,--noexecstack \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
                 -fno-asynchronous-unwind-tables -MMD -MP -I user -I include \
@@ -144,6 +144,10 @@ USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 \
 # NO_SYS=1 下编译的核心/接口源文件（关闭 altcp/ipv6/igmp/autoip/socket）。
 LWIP_DIR   := lib/lwip-2.2.1
 LWIP_INC   := -I $(LWIP_DIR)/src/include -I user/lib
+# 抑制 lwIP 子模块上游代码的两个无害告警（不改动 submodule 内部文件）：
+# -Wunused-value：lwIP 内部宏（如 inet_chksum）展开为逗号表达式产生的左值无效；
+# -Wattributes：头文件 __attribute__((packed)) 打在已对齐字段上被 gcc 忽略（布局不变）。
+LWIP_CFLAGS := -Wno-unused-value -Wno-attributes
 LWIP_SRCS  := $(LWIP_DIR)/src/core/def.c \
               $(LWIP_DIR)/src/core/inet_chksum.c \
               $(LWIP_DIR)/src/core/init.c \
@@ -271,7 +275,7 @@ $(BUILD)/user/gui.c.o: user/lib/gui.c
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 $(BUILD)/user/winhello.elf: $(BUILD)/user/winhello.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/user/winhello.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
@@ -280,7 +284,7 @@ $(BUILD)/user/winhello.elf: $(BUILD)/user/winhello.c.o $(BUILD)/user/gui.c.o $(U
 # 运行期 argc>0（shell exec 传入路径）即进入「常驻手动模式」（见 winhello.c）。
 $(BUILD)/apps/winhello.elf: $(BUILD)/apps/winhello.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/apps/winhello.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
 	@echo "==> standalone GUI self-test $@ ($$(stat -c%s $@) bytes)"
 
@@ -295,8 +299,8 @@ FT_SRC_DIRS  := base sfnt truetype smooth raster autofit psaux pshinter psnames
 FT_SRCS      := $(foreach d,$(FT_SRC_DIRS),$(wildcard $(FT_DIR)/src/$(d)/*.c))
 FT_OBJS      := $(patsubst $(FT_DIR)/%,$(BUILD)/ft/%,$(FT_SRCS:.c=.c.o))
 FT_LIB       := $(BUILD)/libfreetype.a
-FT_CFLAGS    := -ffreestanding -nostdlib -std=gnu11 -O2 -fno-asynchronous-unwind-tables -fcommon \
-                -DFT2_BUILD_LIBRARY -DFT_CONFIG_OPTION_USE_ZLIB=0 \
+FT_CFLAGS    := -ffreestanding -nostdlib -std=gnu11 -O2 -fno-asynchronous-unwind-tables -fcommon -Wa,--noexecstack \
+                -DFT2_BUILD_LIBRARY \
                 -DFT_CONFIG_STANDARD_LIBRARY_H='"user/lib/freetype_shim.h"' \
                 -DFT_CONFIG_MODULES_H='"user/lib/ftmodule_min.h"' \
                 -I $(CURDIR) -I $(FT_DIR)/include -I user/lib/shims -I user/lib -I include
@@ -418,7 +422,7 @@ curltool-objs: $(CURLTOOL_OBJS)
 # 链接 curl 命令行工具（CLI）：curl 工具目标 + 用户库 + libcurl + zlib + mbedTLS
 $(BUILD)/apps/curl.elf: $(CURLTOOL_OBJS) $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(CURLTOOL_OBJS) $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) -lgcc
 	@echo "==> curl CLI app $@ ($$(stat -c%s $@) bytes)"
 
@@ -626,12 +630,12 @@ rust-build:
 	@export PATH="$$HOME/.cargo/bin:$$PATH"; cd $(RUST_DIR) && cargo build
 
 # ---- 用户程序编译规则（必须先于内核通配规则） ----
-$(BUILD)/user/%.S.o: user/%.S
+$(BUILD)/user/%.S.o: user/%.S | $(CONFIG_H)
 	@mkdir -p $(dir $@)
 	$(USER_CC) $(USER_CFLAGS) -c $< -o $@
 
 # L5：用户态栈金丝雀提供文件必须以 -fno-stack-protector 编译（理由同内核）。
-$(BUILD)/user/lib/stack_canary.c.o: user/lib/stack_canary.c
+$(BUILD)/user/lib/stack_canary.c.o: user/lib/stack_canary.c | $(CONFIG_H)
 	@mkdir -p $(dir $@)
 	$(USER_CC) $(USER_CFLAGS) -fno-stack-protector -c $< -o $@
 
@@ -656,7 +660,7 @@ $(BUILD)/user/%.c.o: user/%.c
 # fs_server 额外链接 FatFs 核心（ff.o + ffunicode.o）。
 $(BUILD)/user/%.elf: $(BUILD)/user/%.c.o $(USER_LIB_OBJS) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
@@ -664,14 +668,14 @@ $(BUILD)/user/%.elf: $(BUILD)/user/%.c.o $(USER_LIB_OBJS) user/user.ld
 # （shell 的 libc_selftest 内做 zlib 压缩/解压往返自检）。
 $(BUILD)/user/shell.elf: $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(ZLIB_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/user/shell.c.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) $(ZLIB_LIB) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
 # fs_server 专用：追加 FatFs 核心对象
 $(BUILD)/user/fs_server.elf: $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATFS_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
@@ -679,19 +683,19 @@ $(BUILD)/user/fs_server.elf: $(BUILD)/user/fs_server.c.o $(USER_LIB_OBJS) $(FATF
 # lwIP 源文件：独立规则，带 lwIP 头路径（arch/cc.h、lwipopts.h 位于 user/lib）。
 $(BUILD)/lwip/%.c.o: $(LWIP_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(USER_CC) $(USER_CFLAGS) $(LWIP_INC) -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) $(LWIP_CFLAGS) $(LWIP_INC) -c $< -o $@
 
 # net_server 需要 lwIP 头路径（arch/cc.h / lwipopts.h）。
 $(BUILD)/user/net_server.c.o: user/net_server.c
 	@mkdir -p $(dir $@)
-	$(USER_CC) $(USER_CFLAGS) $(LWIP_INC) -c $< -o $@
+	$(USER_CC) $(USER_CFLAGS) $(LWIP_CFLAGS) $(LWIP_INC) -c $< -o $@
 
 # net_server 专用：链接 lwIP 对象 + 用户库。
 # --allow-multiple-definition：lwIP 与用户库个别符号（如 htons/memset 内建）可能
 # 重复，容忍之，与 FreeType 库的处理方式一致。
 $(BUILD)/user/net_server.elf: $(BUILD)/user/net_server.c.o $(USER_LIB_OBJS) $(LWIP_OBJS) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/user/net_server.c.o $(USER_LIB_OBJS) $(LWIP_OBJS) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
@@ -711,7 +715,7 @@ $(BUILD)/user/curl_test.c.o: user/apps/curl_test.c
 	$(USER_CC) $(USER_CFLAGS) -I $(CURL_DIR)/include -c $< -o $@
 $(BUILD)/user/curl_test.elf: $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--allow-multiple-definition -Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL_LIB) $(ZLIB_LIB) $(MBEDTLS_LIB) -lgcc
 	@echo "==> user program $@ ($$(stat -c%s $@) bytes)"
 
@@ -764,7 +768,7 @@ $(BUILD)/apps/%.o: user/apps/%.c
 
 $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(USER_LIB_OBJS) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> standalone app $@ ($$(stat -c%s $@) bytes)"
 
@@ -777,7 +781,7 @@ $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(USER_LIB_OBJS) user/user.ld
 # execve 时完成加载/重定位，故必须去掉 PT_INTERP（否则 elf_validate 拒绝 ET_EXEC）。
 $(BUILD)/apps/dltest.elf: $(BUILD)/apps/dltest.o $(USER_LIB_OBJS) user/user.ld $(LIBTEST_SL)
 	$(USER_CC) -nostdlib -no-pie -fno-pic -Wl,--build-id=none \
-		-Wl,--no-warn-rwx-segments -Wl,--no-dynamic-linker \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -Wl,--no-dynamic-linker \
 		-Wl,-Bdynamic -L$(dir $(LIBTEST_SL)) -l:libtest.sl \
 		-T user/user.ld -o $@ $< $(USER_LIB_OBJS) -lgcc
 	@echo "==> dynamic-link test $@ ($$(stat -c%s $@) bytes)"
@@ -785,13 +789,13 @@ $(BUILD)/apps/dltest.elf: $(BUILD)/apps/dltest.o $(USER_LIB_OBJS) user/user.ld $
 # 字体程序（fontsrv/pchfnt）额外链接 FreeType 静态库。
 $(BUILD)/apps/fontsrv.elf: $(BUILD)/apps/fontsrv.o $(USER_LIB_OBJS) $(FT_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $< $(USER_LIB_OBJS) $(FT_LIB) -lgcc
 	@echo "==> font service $@ ($$(stat -c%s $@) bytes)"
 
 $(BUILD)/apps/pchfnt.elf: $(BUILD)/apps/pchfnt.o $(USER_LIB_OBJS) $(FT_LIB) user/user.ld
 	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
-		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -T user/user.ld \
+		-Wl,--gc-sections -Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $< $(USER_LIB_OBJS) $(FT_LIB) -lgcc
 	@echo "==> font tool $@ ($$(stat -c%s $@) bytes)"
 

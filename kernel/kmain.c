@@ -12,6 +12,7 @@
 #include <kernel/serial.h>
 #include <sukios/kdr.h>
 #include <kernel/console.h>
+#include <kernel/ksym.h>    /* ksym_dump_count() */
 #include <kernel/multiboot2.h>
 #include <kernel/framebuffer.h>
 #include <kernel/gdt.h>

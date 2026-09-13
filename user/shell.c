@@ -35,6 +35,9 @@
 #include "lib/font8x8.h"
 #include <zlib.h>           /* miniz zlib 兼容层（user/lib/shims/zlib.h）验证用 */
 
+/* 前向声明：把用户 TTY 环形管道中累计的文本渲染进终端窗口（定义在文件后方） */
+static void DrainTtyPipe(void);
+
 #define MSG_ID_KEYCHAR 100   /* 与 input_server 一致；避开 FS_MSG_* */
 #define LINE_MAX 256
 #define HIST_MAX 100   /* 内存历史最大条数（环形 FIFO，超出丢旧；不落盘） */
@@ -785,7 +788,7 @@ static int run_builtin_raw(char *line)
                 shell_out("exec failed: file not found or invalid ELF\n");
             } else {
                 uint64_t rc = sys_wait((uint64_t)pid);
-                drain_tty_pipe();   /* 先把子进程 stdout/stderr 渲染进终端窗口 */
+                DrainTtyPipe();   /* 先把子进程 stdout/stderr 渲染进终端窗口 */
                 shell_out("  [shell] child pid=");
                 char db[24];
                 shell_out(u_utoa_s((uint64_t)pid, db, sizeof(db)));
@@ -1171,7 +1174,7 @@ static void shell_outn(const char *s, size_t n)
  * （shell 作为终端：普通程序写 fd 1/2 经内核 TTY 后端捕获进该管道，详见
  * kernel/console.c / include/kernel/console.h）。仅渲染到网格（不额外写串口，
  * 避免与 tty_write 的串口镜像重复刷屏）。无数据时立即返回。 */
-static void drain_tty_pipe(void)
+static void DrainTtyPipe(void)
 {
     char buf[256];
     for (;;) {
@@ -1327,7 +1330,7 @@ int main(int argc, char **argv)
             }
         }
         if (g_term_dirty) { term_render(); g_term_dirty = false; }
-        drain_tty_pipe();   /* 持续取回后台/子进程经 TTY 写出的文本并渲染 */
+        DrainTtyPipe();   /* 持续取回后台/子进程经 TTY 写出的文本并渲染 */
         sys_yield();
     }
     return 0;

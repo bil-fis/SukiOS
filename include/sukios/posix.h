@@ -305,6 +305,11 @@ typedef int32_t  suki_key_t;
 /* 信号集：本实现以 64 位位掩码表示（bit (sig-1) 置位） */
 typedef uint64_t suki_sigset_t;
 
+/* 前向声明：sa_sigaction 的函数指针参数引用二者，避免在参数列表内就地声明导致
+ * “declared inside parameter list will not be visible” 告警（完整定义见文件后续） */
+struct suki_siginfo;
+struct suki_ucontext;
+
 /* struct sigaction（简化但可移植；sa_handler 与 sa_sigaction 共用首字段） */
 struct suki_sigaction {
     union {
@@ -808,7 +813,7 @@ typedef struct suki_objinfo {
  * （作为终端）经此调用取回并渲染进自己的终端窗口；串口恒定输出供 headless 观测。
  *   参数 a1 = 用户态缓冲指针，a2 = 缓冲字节数上限；
  *   返回实际拷贝字节数（0=暂无数据），非法指针返回 (uint64_t)-1。 */
-#define SYS_TTY_READ        204
+#define SYS_TTY_READ        210
 
 /* 内核扩展：Ring3 程序（如 BMP 加载器）请求把一块像素 blit 到帧缓冲，用于显示
  * 诊断（检查画面乱码/错位）。内核拥有帧缓冲内核映射，直接写入。

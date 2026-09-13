@@ -10,6 +10,7 @@
  */
 #include <kernel/multiboot2.h>
 #include <kernel/serial.h>
+#include <kernel/console.h>   /* kprintf() */
 
 /* 前向声明：PVH 引导信息解析（GRUB 不可用时 QEMU -kernel 走此路径） */
 void pvh_parse(uint64_t hvm_phys, boot_info_t *out);

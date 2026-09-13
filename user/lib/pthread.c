@@ -70,7 +70,7 @@ static inline int futex_wait_u32(uint32_t *uaddr, uint32_t val)
 {
     return futex(uaddr, 0 /* FUTEX_WAIT */, val, NULL, NULL, 0);
 }
-static inline int futex_wake_u32(uint32_t *uaddr, int n)
+static inline int futex_wake_u32(uint32_t *uaddr)
 {
     return futex(uaddr, 1 /* FUTEX_WAKE */, 0, NULL, NULL, 0);
 }
@@ -147,7 +147,7 @@ int pthread_join(pthread_t thread, void **retval)
     thread->joined = 1;
 
     /* 等待目标线程退出：其 pthread_exit 会把 join_futex 置为 tid 并 futex_wake */
-    while (__atomic_load_n(&thread->join_futex, __ATOMIC_ACQUIRE) != thread->tid)
+    while (__atomic_load_n(&thread->join_futex, __ATOMIC_ACQUIRE) != (uint32_t)thread->tid)
         futex_wait_u32(&thread->join_futex, 0);
 
     if (retval)
@@ -165,7 +165,7 @@ void pthread_exit(void *retval)
     t->exit_flag = 1;
     /* 通知 joiner：把 join_futex 置为 tid，并唤醒一个等待者 */
     __atomic_store_n(&t->join_futex, (uint32_t)t->tid, __ATOMIC_RELEASE);
-    futex_wake_u32(&t->join_futex, 1);
+    futex_wake_u32(&t->join_futex);
     /* 退出当前线程（内核 clear_child_tid 会清零 clear_tid 并唤醒；地址空间由
      * 最后退出的线程负责释放） */
     suki_syscall1(SYS_TASK_EXIT, 0);
@@ -237,7 +237,7 @@ int pthread_mutex_unlock(pthread_mutex_t *mutex)
 {
     if (!mutex) return EINVAL;
     *mutex = 0;
-    futex_wake_u32((uint32_t *)mutex, 1);
+    futex_wake_u32((uint32_t *)mutex);
     return 0;
 }
 
@@ -270,14 +270,14 @@ int pthread_cond_signal(pthread_cond_t *cond)
 {
     if (!cond) return EINVAL;
     (*cond)++;                              /* 自增序列号，标记「状态已变」 */
-    futex_wake_u32((uint32_t *)cond, 1);
+    futex_wake_u32((uint32_t *)cond);
     return 0;
 }
 int pthread_cond_broadcast(pthread_cond_t *cond)
 {
     if (!cond) return EINVAL;
     (*cond)++;
-    futex_wake_u32((uint32_t *)cond, 0x7fffffff);  /* 唤醒全部等待者 */
+    futex_wake_u32((uint32_t *)cond);  /* 唤醒全部等待者 */
     return 0;
 }
 

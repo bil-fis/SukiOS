@@ -19,11 +19,21 @@
 #include <mm/kmalloc.h>
 #include <kernel/abilities/kminiz.h>
 
-/* ---- miniz 配置（必须与 miniz.c 编译宏一致） ---- */
+/* ---- miniz 配置（必须与 miniz.c 编译宏一致） ----
+ * 用 #ifndef 守卫：Makefile 的 KMINIZ_CFLAGS 已通过 -D 传入这些宏，
+ * 此处再定义会触发 -Wmacro-redefined；守卫后两者不冲突，本文件仍提供兜底。 */
+#ifndef MINIZ_NO_STDIO
 #define MINIZ_NO_STDIO
+#endif
+#ifndef MINIZ_NO_TIME
 #define MINIZ_NO_TIME
+#endif
+#ifndef MINIZ_NO_ARCHIVE_APIS
 #define MINIZ_NO_ARCHIVE_APIS
+#endif
+#ifndef MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#endif
 
 #include <kernel/abilities/miniz/miniz.h>
 #include <stdlib.h>      /* miniz 垫片：仅声明 malloc/calloc/realloc/free */

@@ -35,6 +35,7 @@ static inline uint8_t *net_resp_buf(void) { return g_net_resp[cpu_index()]; }
  */
 static int net_rpc(uint32_t op, const void *payload, uint32_t req_size)
 {
+    (void)op;
     (void)payload;
     task_t *self = sched_current();
     uint32_t rp = port_allocate(self);
@@ -217,7 +218,7 @@ static int do_listen(struct task *t, int fd, int backlog)
     if (!e) {
         return -SUKI_ENOTSOCK;
     }
-    sock_req_t *r = net_req_prep(SOCK_MSG_LISTEN, (uint32_t)e->backend);
+    net_req_prep(SOCK_MSG_LISTEN, (uint32_t)e->backend);
     if (net_rpc(SOCK_MSG_LISTEN, NULL,
                 (uint32_t)(sizeof(mach_msg_header_t) + sizeof(sock_req_t))) != 0) {
         return -SUKI_EIO;
@@ -231,7 +232,7 @@ static int do_accept(struct task *t, int fd, void *addr, uint32_t *addrlen)
     if (!e) {
         return -SUKI_ENOTSOCK;
     }
-    sock_req_t *r = net_req_prep(SOCK_MSG_ACCEPT, (uint32_t)e->backend);
+    net_req_prep(SOCK_MSG_ACCEPT, (uint32_t)e->backend);
     if (net_rpc(SOCK_MSG_ACCEPT, NULL,
                 (uint32_t)(sizeof(mach_msg_header_t) + sizeof(sock_req_t))) != 0) {
         return -SUKI_EIO;
@@ -350,7 +351,7 @@ static int do_shutdown(struct task *t, int fd, int how)
     if (!e) {
         return -SUKI_ENOTSOCK;
     }
-    sock_req_t *r = net_req_prep(SOCK_MSG_SHUTDOWN, (uint32_t)e->backend);
+    net_req_prep(SOCK_MSG_SHUTDOWN, (uint32_t)e->backend);
     if (net_rpc(SOCK_MSG_SHUTDOWN, NULL,
                 (uint32_t)(sizeof(mach_msg_header_t) + sizeof(sock_req_t))) != 0) {
         return -SUKI_EIO;
@@ -418,7 +419,7 @@ static int do_getpeername(struct task *t, int fd, void *addr, uint32_t *addrlen)
     if (!e) {
         return -SUKI_ENOTSOCK;
     }
-    sock_req_t *r = net_req_prep(SOCK_MSG_GETPEERNAME, (uint32_t)e->backend);
+    net_req_prep(SOCK_MSG_GETPEERNAME, (uint32_t)e->backend);
     if (net_rpc(SOCK_MSG_GETPEERNAME, NULL,
                 (uint32_t)(sizeof(mach_msg_header_t) + sizeof(sock_req_t))) != 0) {
         return -SUKI_EIO;
@@ -437,7 +438,7 @@ static int do_getsockname(struct task *t, int fd, void *addr, uint32_t *addrlen)
     if (!e) {
         return -SUKI_ENOTSOCK;
     }
-    sock_req_t *r = net_req_prep(SOCK_MSG_GETSOCKNAME, (uint32_t)e->backend);
+    net_req_prep(SOCK_MSG_GETSOCKNAME, (uint32_t)e->backend);
     if (net_rpc(SOCK_MSG_GETSOCKNAME, NULL,
                 (uint32_t)(sizeof(mach_msg_header_t) + sizeof(sock_req_t))) != 0) {
         return -SUKI_EIO;
@@ -463,7 +464,7 @@ void net_close_backend(fd_entry_t *e)
     if (!e || e->backend < 0) {
         return;
     }
-    sock_req_t *r = net_req_prep(SOCK_MSG_CLOSE, (uint32_t)e->backend);
+    net_req_prep(SOCK_MSG_CLOSE, (uint32_t)e->backend);
     (void)net_rpc(SOCK_MSG_CLOSE, NULL,
                   (uint32_t)(sizeof(mach_msg_header_t) + sizeof(sock_req_t)));
     e->backend = -1;

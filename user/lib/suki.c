@@ -215,7 +215,6 @@ void *ff_memalloc(unsigned int msize)
 {
     heap_init();
     uint32_t need = heap_align_up((uint32_t)msize);
-    heap_node_t *prev = NULL;
     heap_node_t *cur = g_heap_free;
     while (cur) {
         if (!cur->used && cur->size >= need) {
@@ -233,7 +232,6 @@ void *ff_memalloc(unsigned int msize)
             cur->used = 1;
             return (void *)((uint8_t *)cur + sizeof(heap_node_t));
         }
-        prev = cur;
         cur = cur->next;
     }
     return NULL;   /* 池耗尽 */

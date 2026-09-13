@@ -48,7 +48,7 @@ static int dev_null_write(void *ctx, char *buf, uint32_t len, uint64_t off)
 }
 static int dev_null_read(void *ctx, char *buf, uint32_t len, uint64_t off)
 {
-    (void)ctx; (void)buf; (void)off;
+    (void)ctx; (void)buf; (void)off; (void)len;
     return 0;   /* EOF */
 }
 
@@ -97,7 +97,7 @@ static int dev_console_write(void *ctx, char *buf, uint32_t len, uint64_t off)
 }
 static int dev_console_read(void *ctx, char *buf, uint32_t len, uint64_t off)
 {
-    (void)ctx; (void)buf; (void)off;
+    (void)ctx; (void)buf; (void)off; (void)len;
     return 0;   /* 控制台输入走键盘服务，这里不回显 */
 }
 

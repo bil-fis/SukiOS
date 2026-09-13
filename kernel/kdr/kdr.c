@@ -161,6 +161,7 @@ static uint64_t find_exported(struct dyninfo *di, const char *target, uint64_t b
 
 static int kdr_load(const uint8_t *img, size_t sz, const char *name)
 {
+    (void)sz;
     const elf64_hdr_t *eh = (const elf64_hdr_t *)img;
     if (!(eh->e_ident[0] == 0x7f && eh->e_ident[1] == 'E' &&
           eh->e_ident[2] == 'L' && eh->e_ident[3] == 'F') ||

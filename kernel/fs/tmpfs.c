@@ -258,6 +258,7 @@ int tmpfs_init(void)
 
 int tmpfs_open(const char *rel, int32_t flags, uint32_t mode, uint32_t *out_handle)
 {
+    (void)mode;
     bool create = (flags & SUKI_O_CREAT) ? true : false;
     bool excl   = (flags & SUKI_O_EXCL) ? true : false;
 
@@ -416,6 +417,7 @@ static int tmpfs_stat_node(tmpfs_node_t *node, fs_stat_t *st)
 
 int tmpfs_mkdir(const char *rel, uint32_t mode)
 {
+    (void)mode;
     tmpfs_node_t *node = tmpfs_resolve_path(rel, true, false);
     if (!node) {
         return -SUKI_ENOMEM;   /* 创建失败（内存或路径非法） */

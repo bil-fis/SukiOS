@@ -18,6 +18,7 @@
 #include <kernel/spinlock.h>
 #include <kernel/string.h>
 #include <kernel/console.h>
+#include <kernel/clock.h>       /* clock_monotonic_ns：为 net RPC 提供有界等待时钟 */
 #include <ipc/port.h>
 #include <kernel/percpu.h>
 #include <mm/kmalloc.h>
@@ -29,9 +30,17 @@ static uint8_t g_net_resp[MAX_CPUS][NET_RPC_MAX];
 static inline uint8_t *net_req_buf(void)  { return g_net_req[cpu_index()]; }
 static inline uint8_t *net_resp_buf(void) { return g_net_resp[cpu_index()]; }
 
+/* net RPC 有界等待上限：SukiWait 的 timeout_ms 尚未实现，若用 ipc_recv_kernel(...,
+ * true) 无限阻塞，socket 的 recv/connect 在等不到 net_server 回送（对端无数据 /
+ * 连接实际未通）时会永久挂起，连带冻结调用它的用户任务（如 exec 中的 curl）与
+ * shell。故此处改以非阻塞轮询 + task_yield 实现有界等待，超时上抛 -SUKI_ETIMEDOUT。 */
+#ifndef NET_RPC_TIMEOUT_NS
+#define NET_RPC_TIMEOUT_NS (30ULL * 1000000000ULL)   /* 30 秒 */
+#endif
+
 /*
  * 向 NS_PORT 发一条 socket 请求并同步等待应答。返回 0 成功（应答在 net_resp_buf），
- * 否则负 errno。会阻塞（等待 net_server 应答时让出 CPU）。
+ * 否则负 errno。等待有界（见 NET_RPC_TIMEOUT_NS），避免无限阻塞（详见上方说明）。
  */
 static int net_rpc(uint32_t op, const void *payload, uint32_t req_size)
 {
@@ -51,13 +60,24 @@ static int net_rpc(uint32_t op, const void *payload, uint32_t req_size)
         return -SUKI_EIO;
     }
 
-    uint32_t got = 0;
-    if (ipc_recv_kernel(rp, net_resp_buf(), (uint32_t)NET_RPC_MAX, &got, true)
-            != MACH_MSG_SUCCESS) {
-        port_free(rp);
-        return -SUKI_EIO;
+    /* 有界等待：非阻塞轮询 + 让出 CPU，直到收到应答或超时。 */
+    uint64_t deadline = clock_monotonic_ns() + NET_RPC_TIMEOUT_NS;
+    int rc = -SUKI_ETIMEDOUT;
+    for (;;) {
+        uint32_t got = 0;
+        if (ipc_recv_kernel(rp, net_resp_buf(), (uint32_t)NET_RPC_MAX, &got, false)
+                == MACH_MSG_SUCCESS) {
+            rc = 0;
+            break;
+        }
+        if ((int64_t)(deadline - clock_monotonic_ns()) <= 0)
+            break;
+        task_yield();
     }
     port_free(rp);
+
+    if (rc != 0)
+        return rc;
 
     /* 服务下线占位应答（net_server 已死，理论上不会发生，做防御） */
     mach_msg_header_t *rh = (mach_msg_header_t *)net_resp_buf();

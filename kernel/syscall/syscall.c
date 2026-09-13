@@ -946,6 +946,45 @@ static uint64_t sys_console_read(uint64_t a1, uint64_t a2)
 }
 
 /*
+ * sys_tty_read —— SYS_TTY_READ 实现。
+ * ---------------------------------------------------------------------------
+ * 读取「用户 TTY 环形管道」（详见 kernel/console.c、console.h）中累积的 Ring3
+ * 程序 stdout/stderr 输出。显示服务接管帧缓冲后，普通程序写 fd 1/2 不再直接写
+ * 屏（避免覆盖合成桌面），而是被捕获进该环形管道；本调用让 shell（作为终端）
+ * 取回这些文本渲染进自己的终端窗口（类似 Unix 把子进程输出显示到终端）。
+ *
+ *   参数 a1 = 用户态缓冲指针，a2 = 缓冲字节数上限；
+ *   返回实际拷贝字节数（0=暂无数据），非法指针返回 (uint64_t)-1。
+ *
+ * 安全性：用户指针 a1 经 user_access_ok 校验（写权限、不越界、页存在），
+ * 绝不直解引用。管道读取本身由 g_utty_lock 自旋锁保护（见 console.c）。
+ */
+static uint64_t sys_tty_read(uint64_t a1, uint64_t a2)
+{
+    void *ubuf = (void *)a1;
+    size_t max = (size_t)a2;
+    if (max == 0) {
+        return 0;
+    }
+    if (!user_access_ok(ubuf, max, true)) {
+        return (uint64_t)-1;
+    }
+    char *kbuf = kmalloc(max);
+    if (!kbuf) {
+        return (uint64_t)-1;
+    }
+    size_t n = user_tty_pipe_read(kbuf, max);
+    if (n > 0) {
+        if (!copy_to_user(ubuf, kbuf, n)) {
+            kfree(kbuf);
+            return (uint64_t)-1;
+        }
+    }
+    kfree(kbuf);
+    return (uint64_t)n;
+}
+
+/*
  * sys_display_blit —— SYS_DISPLAY_BLIT 实现。
  * ---------------------------------------------------------------------------
  * 供 Ring3 显示诊断程序（如 BMP 加载器）把一块像素（xRGB32）写入帧缓冲。内核
@@ -1076,6 +1115,7 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_FRAMEBUFFER_MAP: return sys_framebuffer_map(a1);
     case SYS_DISPLAY_READY:   display_set_active(); return 0;
     case SYS_CONSOLE_READ:    return sys_console_read(a1, a2);
+    case SYS_TTY_READ:        return sys_tty_read(a1, a2);
     case SYS_DISPLAY_BLIT:    return sys_display_blit(a1, a2, a3, a4, a5);
     case SYS_OOL_UNMAP:       return ipc_ool_unmap_user(a1);
     case SYS_PORT_ALLOC:      return sys_port_alloc();

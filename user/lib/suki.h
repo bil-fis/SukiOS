@@ -143,6 +143,15 @@ static inline void sys_debug_write(const char *s, uint64_t len)
     suki_syscall5(SYS_DEBUG_WRITE, (uint64_t)s, len, 0, 0, 0);
 }
 
+/* 读取「用户 TTY 环形管道」中累积的 Ring3 程序 stdout/stderr 输出
+ * （普通程序写 fd 1/2 经内核 TTY 后端捕获进该管道）。shell 作为终端调用，
+ * 取回后渲染进自己的终端窗口。成功返回实际读取字节数（0=暂无数据），
+ * 失败（非法指针）返回 -1。buf 为用户态缓冲，max 为上限。 */
+static inline long sys_tty_read(char *buf, uint64_t max)
+{
+    return (long)suki_syscall5(SYS_TTY_READ, (uint64_t)buf, max, 0, 0, 0);
+}
+
 static inline void sys_yield(void)
 {
     suki_syscall5(SYS_YIELD, 0, 0, 0, 0, 0);

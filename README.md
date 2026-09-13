@@ -170,7 +170,8 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **构建**：`build/apps/curl.elf`（约 1.63 MiB），链接 `USER_LIB_OBJS + libcurl.a + libz.a + libmbedtls.a`；安装到 FAT32 磁盘 `::BIN/CURL.SKA`（与其他独立程序一致，`exec BIN/curl` 装载）。
 - **内核配套**：原 `EXEC_ELF_MAX` 为 1 MiB，放不下 1.6 MiB 的 curl CLI，已上调至 **4 MiB**（exec 读盘本就是 `FS_MSG_READ_AT` 分块读，不受 OOL 16 页限制）。
 - **libc 补齐**：为工具新增 `isatty`（返回 0，走非终端分支）、`ftruncate`、`freopen`、`rand/srand`；`fcntl` 改为标准可变参数；`<sys/stat.h>` 补 `st_atime/st_mtime/st_ctime` 成员别名。
-- **验证**：开机自检 `curl_app_test`（`user/apps/curl_app_test.c`）以真实命令行参数 **execve 磁盘上的 `::BIN/CURL.SKA`**（与 shell 同路径），日志显示任务名变为 `CURL.SKA` 且 **exit code 0**（请求成功完成）。其 stdout 走控制台设备，无头串口日志不捕获文本（见 §3 说明）。
+- **验证**：开机自检 `curl_app_test`（`user/apps/curl_app_test.c`）以真实命令行参数 **execve 磁盘上的 `::BIN/CURL.SKA`**（与 shell 同路径），日志显示任务名变为 `CURL.SKA` 且 **exit code 0**（请求成功完成，响应体 `Hello from SukiOS host HTTP server!` 经用户 TTY 环形管道回显到 shell 终端窗口）。
+- **构建坑（已修）**：`lib/curl/src` 内含独立工具 `curlinfo.c`（自带 `int main()`，仅打印功能清单），若一并编入 `curl.elf`，链接器会选用它的 `main` 而非 `tool_main.c` 的 `main`，导致运行 `curl` 时只打印功能列表、不做任何请求。已在 `Makefile` 的 `CURLTOOL_SRCS` 中 `$(filter-out .../curlinfo.c, ...)` 显式排除（详见 `results/step86.md`）。
 
 ### 2.14 内核内嵌压缩能力（miniz）
 - **形态**：`kernel/abilities/miniz/`（miniz，zlib 风格）**编入 Ring0 内核**，对外提供内核 API（`include/kernel/abilities/kminiz.h`：`kminiz_compress/uncompress/compress_bound/adler32/crc32`），实现在 `kernel/abilities/miniz/kminiz.c`。
@@ -194,7 +195,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **`.kdr` 内核模块加载器（未实现）**：**用户态共享库动态链接已实现**（`.sl` + 内核 `ld.suki` + syscall 126–129 + `dltest` 自检，见 §2.11）；但 **`.kdr` 内核模块 / 用户态驱动的动态装载机制尚未实现**，当前鼠标驱动以内嵌 spawn 形式运行，待加载器就绪后改为动态装载（内核侧无需改动）。
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
-- **curl CLI 输出在无头串口日志中不可见**：`::BIN/CURL.SKA` 经开机包装器 execve 后**执行成功（exit code 0，即请求完成）**，但其 stdout 指向控制台设备（CGA/图形会话），无头模式下不进串口，故回归日志里看不到响应体文本。在图形 shell 中 `exec BIN/curl` 可正常看到输出。这是「输出通道」而非 curl 本身的问题。
+- **curl CLI 输出在图形窗口中可见（已实现）**：早期 `curl` 等命令行程序的 stdout/stderr 写内核 `TTY` 后端，而 `user_puts` 在显示服务接管帧缓冲后**只写串口、不写帧缓冲**，故窗口里看不到。已在内核新增「用户 TTY 环形管道」（`kernel/console.c` 的 `g_user_tty_pipe` + `SYS_TTY_READ=204`），`tty_write` 在显示激活时把输出捕获进该管道；shell（`user/shell.c`）在事件循环与 `exec` 等待后 `drain_tty_pipe()` 取回并渲染进自己的终端窗口。串口仍恒定输出（headless 可观测）。因此 `exec BIN/curl <url>` 的响应体现在图形 shell 窗口中可见。`curlinfo.c` 误编入导致 CLI 只打印功能列表的坑已修（见 §2.13）。
 - **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
 
 ---

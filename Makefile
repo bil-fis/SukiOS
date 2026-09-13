@@ -394,7 +394,11 @@ $(CURL_LIB): $(CURL_OBJS)
 
 # ---- curl 命令行工具（lib/curl/src，与 Linux curl 同源的 CLI）----
 CURLTOOL_DIR    := lib/curl/src
-CURLTOOL_SRCS   := $(wildcard $(CURLTOOL_DIR)/*.c) $(wildcard $(CURLTOOL_DIR)/toolx/*.c)
+# 注意：lib/curl/src 内含独立工具 curlinfo.c（自带 int main()，仅打印功能清单），
+# 它不是 curl 命令行前端的一部分。若一并编译进 curl.elf，链接器会选用它的 main
+# 而非 tool_main.c 的 main，导致运行 curl 时只打印功能列表、不做任何请求。
+# 因此显式排除 curlinfo.c（其余源只有 tool_main.c 含 main）。
+CURLTOOL_SRCS   := $(filter-out $(CURLTOOL_DIR)/curlinfo.c,$(wildcard $(CURLTOOL_DIR)/*.c) $(wildcard $(CURLTOOL_DIR)/toolx/*.c))
 CURLTOOL_OBJS   := $(patsubst $(CURLTOOL_DIR)/%.c,$(BUILD)/curltool/%.c.o,$(CURLTOOL_SRCS))
 CURLTOOL_CFLAGS := -ffreestanding -nostdlib -std=gnu11 -O2 -fcommon \
                    -fno-asynchronous-unwind-tables -fno-pic -fno-pie -mcmodel=small \

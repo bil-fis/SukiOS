@@ -431,7 +431,7 @@ static int tty_write(const void *buf, size_t n)
         }
         memcpy(tmp, p + done, chunk);
         tmp[chunk] = '\0';
-        user_puts(tmp);
+        user_tty_out(tmp);
         done += chunk;
     }
     return (int)n;

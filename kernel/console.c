@@ -144,6 +144,61 @@ size_t console_pipe_avail(void)
     return avail;
 }
 
+/* ========================================================================== */
+/*  用户 TTY 环形管道（user TTY ring pipe）                                    */
+/* ========================================================================== */
+/* 与内核日志管道（g_console_pipe）相互独立：本管道只装「Ring3 程序经 fd 1/2
+ * 写 TTY」的输出，供 shell 作为终端渲染到自己的窗口；不混入内核诊断日志。 */
+static char     g_user_tty_pipe[USER_TTY_PIPE_SIZE];
+static volatile size_t g_utty_head = 0;
+static volatile size_t g_utty_tail = 0;
+static spinlock_t g_utty_lock = SPINLOCK_INIT("uttypipe");
+
+/* 生产者：tty_write() -> user_tty_out() 调用。写满覆盖最旧字符，绝不阻塞。 */
+static void user_tty_pipe_write(const char *s)
+{
+    uint64_t pl = spin_lock_irqsave(&g_utty_lock);
+    while (*s) {
+        size_t next = (g_utty_head + 1) % USER_TTY_PIPE_SIZE;
+        if (next != g_utty_tail) {
+            g_user_tty_pipe[g_utty_head] = *s++;
+            g_utty_head = next;
+        } else {
+            /* 环形满：丢弃最旧字符（覆盖式），保证最新文本不丢 */
+            g_utty_tail = (g_utty_tail + 1) % USER_TTY_PIPE_SIZE;
+            g_user_tty_pipe[g_utty_head] = *s++;
+            g_utty_head = next;
+        }
+    }
+    spin_unlock_irqrestore(&g_utty_lock, pl);
+}
+
+size_t user_tty_pipe_read(char *dst, size_t max)
+{
+    if (max == 0) return 0;
+    uint64_t pl = spin_lock_irqsave(&g_utty_lock);
+    size_t avail = (g_utty_head >= g_utty_tail)
+                       ? (g_utty_head - g_utty_tail)
+                       : (USER_TTY_PIPE_SIZE - g_utty_tail + g_utty_head);
+    size_t n = (avail < max) ? avail : max;
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = g_user_tty_pipe[g_utty_tail];
+        g_utty_tail = (g_utty_tail + 1) % USER_TTY_PIPE_SIZE;
+    }
+    spin_unlock_irqrestore(&g_utty_lock, pl);
+    return n;
+}
+
+size_t user_tty_pipe_avail(void)
+{
+    uint64_t pl = spin_lock_irqsave(&g_utty_lock);
+    size_t avail = (g_utty_head >= g_utty_tail)
+                       ? (g_utty_head - g_utty_tail)
+                       : (USER_TTY_PIPE_SIZE - g_utty_tail + g_utty_head);
+    spin_unlock_irqrestore(&g_utty_lock, pl);
+    return avail;
+}
+
 /* 受限字符串输出：防御 fmt 指向无 NULL 终止的损坏内存时陷入无限循环
  * （会永久持有 g_kp_lock / 端口锁导致系统冻结）。超限即截断并告警。 */
 void kputs(const char *s)
@@ -220,6 +275,26 @@ void user_puts(const char *s)
         vga_write(s);
     }
     serial_writestr(s);
+}
+
+/* 用户态 TTY 输出（fd 0/1/2 写 TTY 后端经 tty_write 调用）。
+ * 策略（窗口化纯合成器架构，与 user_puts 互补）：
+ *   - 显示服务已接管帧缓冲（g_display_active）：不写帧缓冲（避免覆盖合成桌面），
+ *     而是捕获进「用户 TTY 环形管道」g_user_tty_pipe，由 shell 经 SYS_TTY_READ
+ *     读回并渲染进自己的终端窗口（shell 作为终端）。
+ *   - 显示未激活且帧缓冲可用（启动早期/纯文本回退）：直接 fbcon 写屏 + 串口。
+ *   - 完全无图形（g_use_fb=false）：回退 VGA 文本 + 串口。
+ *   - 任何情况串口恒定输出（headless 可观测、与历史行为一致）。 */
+void user_tty_out(const char *s)
+{
+    if (g_display_active) {
+        user_tty_pipe_write(s);          /* 交给 shell 终端渲染 */
+    } else if (g_use_fb) {
+        fbcon_write(s);                  /* 启动期/纯文本回退：直接写屏 */
+    } else {
+        vga_write(s);
+    }
+    serial_writestr(s);                  /* 串口恒定 */
 }
 
 /* 进入用户态服务前由 kmain 调用：关闭后内核运行期诊断只走串口，

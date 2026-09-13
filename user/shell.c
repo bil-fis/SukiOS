@@ -785,6 +785,7 @@ static int run_builtin_raw(char *line)
                 shell_out("exec failed: file not found or invalid ELF\n");
             } else {
                 uint64_t rc = sys_wait((uint64_t)pid);
+                drain_tty_pipe();   /* 先把子进程 stdout/stderr 渲染进终端窗口 */
                 shell_out("  [shell] child pid=");
                 char db[24];
                 shell_out(u_utoa_s((uint64_t)pid, db, sizeof(db)));
@@ -1166,6 +1167,21 @@ static void shell_outn(const char *s, size_t n)
     u_printn(s, n);
 }
 
+/* 把内核「用户 TTY 环形管道」中累积的子进程 stdout/stderr 取回并渲染进本终端窗口
+ * （shell 作为终端：普通程序写 fd 1/2 经内核 TTY 后端捕获进该管道，详见
+ * kernel/console.c / include/kernel/console.h）。仅渲染到网格（不额外写串口，
+ * 避免与 tty_write 的串口镜像重复刷屏）。无数据时立即返回。 */
+static void drain_tty_pipe(void)
+{
+    char buf[256];
+    for (;;) {
+        long n = sys_tty_read(buf, sizeof(buf) - 1);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        term_puts(buf);          /* 渲染到终端网格（g_term_dirty 置位） */
+    }
+}
+
 static void term_render(void)
 {
     if (!g_win) return;
@@ -1311,6 +1327,7 @@ int main(int argc, char **argv)
             }
         }
         if (g_term_dirty) { term_render(); g_term_dirty = false; }
+        drain_tty_pipe();   /* 持续取回后台/子进程经 TTY 写出的文本并渲染 */
         sys_yield();
     }
     return 0;

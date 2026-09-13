@@ -802,6 +802,14 @@ typedef struct suki_objinfo {
  *   返回实际拷贝字节数（0=暂无数据），非法指针返回 (uint64_t)-1。 */
 #define SYS_CONSOLE_READ    202
 
+/* 内核扩展：读取「用户 TTY 环形管道」累积的 Ring3 程序 stdout/stderr 输出
+ * （普通程序写 fd 1/2 经内核 TTY 后端 tty_write 捕获进该管道，详见 kernel/console.c）。
+ * 显示服务接管帧缓冲后，这类输出不再直接写屏（避免覆盖合成桌面），而是由 shell
+ * （作为终端）经此调用取回并渲染进自己的终端窗口；串口恒定输出供 headless 观测。
+ *   参数 a1 = 用户态缓冲指针，a2 = 缓冲字节数上限；
+ *   返回实际拷贝字节数（0=暂无数据），非法指针返回 (uint64_t)-1。 */
+#define SYS_TTY_READ        204
+
 /* 内核扩展：Ring3 程序（如 BMP 加载器）请求把一块像素 blit 到帧缓冲，用于显示
  * 诊断（检查画面乱码/错位）。内核拥有帧缓冲内核映射，直接写入。
  *   参数 a1 = 用户态像素缓冲（uint32_t*，xRGB32 格式：(r<<16)|(g<<8)|b）；

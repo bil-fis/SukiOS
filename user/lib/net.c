@@ -292,8 +292,6 @@ static int dns_resolve_a(const char *name, uint8_t out_ip[4]) {
     srv.sin_family = AF_INET;
     srv.sin_port   = (in_port_t)DNS_PORT; /* 主机序 */
     memcpy(srv.sin_addr.s_addr, srv_ip.s_addr, 4);
-    /* UDP connect 仅设定默认对端，失败忽略 */
-    connect(fd, (struct sockaddr *)&srv, sizeof(srv));
 
     static uint16_t dns_id = 0x1234;
     dns_id++;
@@ -326,32 +324,40 @@ static int dns_resolve_a(const char *name, uint8_t out_ip[4]) {
     query[off++] = 0x00; query[off++] = 0x01; /* QCLASS IN */
     size_t qlen = off;
 
-    if (send(fd, query, qlen, 0) < 0) { close(fd); return -1; }
-
     uint8_t resp[1024];
     struct pollfd pfd;
     pfd.fd = fd;
     pfd.events = POLLIN;
     int got = -1;
-    for (int tries = 0; tries < 25; tries++) {
-        if (poll(&pfd, 1, 200) > 0) {
+    /* UDP 无链路层重传，查询或响应任一丢包都会导致仅发一次的解析永久挂起
+     * （recv 无数据时会挂起 30s 等 net_server 回包，25 次即 750s）。
+     * 故每轮重试都重发查询：服务器对相同查询幂等响应，可自愈丢包。 */
+    for (int tries = 0; tries < 12; tries++) {
+        long sw = sendto(fd, query, qlen, 0, (struct sockaddr *)&srv, sizeof(srv));
+        if (sw < 0) { close(fd); return -1; }
+        int pr = poll(&pfd, 1, 400);
+        if (pr > 0) {
             got = recv(fd, resp, sizeof(resp), 0);
             if (got >= 12) break;
         }
     }
     close(fd);
     if (got < 12) return -1;
-    if (resp[0] != query[0] || resp[1] != query[1]) return -1; /* id 不匹配 */
+    if (resp[0] != query[0] || resp[1] != query[1]) return -1;
 
-    /* 跳过问段 */
+    /* 跳过问段（Question）。问段名可能是完整 label 序列，也可能是压缩指针
+     * （0xC0 0x0C，指向 offset 12 处原始查询名）。两种情形下都须让 ro 精确停在
+     * 「名结束之后、QTYPE 之前」，否则后续 Answer 段游标整体错位 1 字节会导致解析失败。
+     * 关键：压缩指针结尾没有尾随的 0x00 根 label，故不能额外 ro++；只有完整序列才
+     * 在退出循环时正好停在表示根 label 的 0x00 上，需 ro++ 跳过它。 */
     size_t ro = 12;
-    while (ro < (size_t)got && resp[ro] != 0) {
+    while (ro < (size_t)got) {
         uint8_t l = resp[ro];
-        if (l & 0xC0) { ro += 2; break; }   /* 压缩指针 */
-        ro += l + 1;
+        if (l == 0)      { ro++; break; }    /* 根 label：名结束 */
+        if (l & 0xC0)    { ro += 2; break; } /* 压缩指针：名结束 */
+        ro += l + 1;                          /* 普通 label */
     }
-    if (ro >= (size_t)got) return -1;
-    ro++;                                    /* 根 label */
+    if (ro + 4 > (size_t)got) return -1;
     ro += 4;                                 /* QTYPE + QCLASS */
 
     uint16_t ancount = (uint16_t)((resp[6] << 8) | resp[7]);
@@ -368,8 +374,9 @@ static int dns_resolve_a(const char *name, uint8_t out_ip[4]) {
         }
         if (ro + 10 > (size_t)got) break;
         uint16_t type = (uint16_t)((resp[ro] << 8) | resp[ro + 1]);
-        ro += 2;                              /* class 跳过 */
-        ro += 4;                              /* TTL */
+        ro += 2;                              /* 跳过 TYPE */
+        ro += 2;                              /* 跳过 CLASS */
+        ro += 4;                              /* 跳过 TTL */
         uint16_t rdlen = (uint16_t)((resp[ro] << 8) | resp[ro + 1]);
         ro += 2;
         if (type == 0x0001 && rdlen == 4) {  /* A 记录 */

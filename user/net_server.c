@@ -476,7 +476,9 @@ static void sock_handle(sock_req_t *req, uint32_t reply_port)
     sock_t *s = NULL;
     if (req->op != SOCK_MSG_CREATE) {
         s = sock_by_handle(req->sock);
-        if (!s) { sock_reply(reply_port, (uint32_t)-SUKI_ENOTSOCK, 0, 0, NULL, 0, NULL); return; }
+        if (!s) {
+            sock_reply(reply_port, (uint32_t)-SUKI_ENOTSOCK, 0, 0, NULL, 0, NULL); return;
+        }
     }
     switch (req->op) {
     case SOCK_MSG_CREATE: {
@@ -566,13 +568,29 @@ static void sock_handle(sock_req_t *req, uint32_t reply_port)
         break;
     }
     case SOCK_MSG_SEND: {
-        u16_t avail = tcp_sndbuf(s->pcb.tcp);
-        uint32_t n = req->len < avail ? req->len : avail;
-        if (n == 0) { sock_reply(reply_port, (uint32_t)-SUKI_EAGAIN, 0, 0, NULL, 0, NULL); break; }
-        err_t e = tcp_write(s->pcb.tcp, req->data, n, TCP_WRITE_FLAG_COPY);
-        if (e == ERR_OK) tcp_output(s->pcb.tcp);
-        sock_reply(reply_port, e == ERR_OK ? 0 : (uint32_t)-SUKI_EIO,
-                   e == ERR_OK ? n : 0, 0, NULL, 0, NULL);
+        if (s->type == SUKI_SOCK_DGRAM) {
+            /* 已 connect 的 UDP socket 上的 send()：发给已连接对端。
+             * 未 connect 的 UDP 用 send() 应返回 ENOTCONN（POSIX 语义）。 */
+            if (s->state != S_CONNECTED) {
+                sock_reply(reply_port, (uint32_t)-SUKI_ENOTCONN, 0, 0, NULL, 0, NULL);
+                break;
+            }
+            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)req->len, PBUF_RAM);
+            if (!p) { sock_reply(reply_port, (uint32_t)-SUKI_ENOMEM, 0, 0, NULL, 0, NULL); break; }
+            memcpy(p->payload, req->data, req->len);
+            err_t e = udp_send(s->pcb.udp, p);   /* 已 connect 的对端 */
+            pbuf_free(p);
+            sock_reply(reply_port, e == ERR_OK ? 0 : (uint32_t)-SUKI_EIO,
+                       e == ERR_OK ? req->len : 0, 0, NULL, 0, NULL);
+        } else {
+            u16_t avail = tcp_sndbuf(s->pcb.tcp);
+            uint32_t n = req->len < avail ? req->len : avail;
+            if (n == 0) { sock_reply(reply_port, (uint32_t)-SUKI_EAGAIN, 0, 0, NULL, 0, NULL); break; }
+            err_t e = tcp_write(s->pcb.tcp, req->data, n, TCP_WRITE_FLAG_COPY);
+            if (e == ERR_OK) tcp_output(s->pcb.tcp);
+            sock_reply(reply_port, e == ERR_OK ? 0 : (uint32_t)-SUKI_EIO,
+                       e == ERR_OK ? n : 0, 0, NULL, 0, NULL);
+        }
         break;
     }
     case SOCK_MSG_RECVFROM:

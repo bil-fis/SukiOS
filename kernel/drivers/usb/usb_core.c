@@ -17,6 +17,7 @@
 #include <kernel/uhci.h>
 #include <kernel/usb_hid.h>
 #include <kernel/usb_hub.h>
+#include <kernel/input_pref.h>   /* USB 优先 / PS/2 回退 */
 #include <kernel/io.h>
 #include <kernel/console.h>
 #include <kernel/string.h>
@@ -402,11 +403,32 @@ void usb_poll(void)
             continue;
         }
         if (d->kind == USB_KIND_HID_KBD || d->kind == USB_KIND_HID_MOUSE) {
-            usb_hid_poll(i);
+            if (usb_hid_poll(i) < 0) {
+                kprintf("[usb-hid] endpoint error, device removed (addr=%u)\n",
+                        (unsigned)d->address);
+                usb_core_free(i);       /* 释放 -> 输入优先级自动回退 PS/2 */
+            }
         } else if (d->kind == USB_KIND_HUB) {
             usb_hub_poll(i);
         }
     }
+
+    /* 输入源优先级仲裁：存在“已枚举且中断端点有效”的 USB 键/鼠则优先 USB，
+     * 否则（缺失/枚举失败/已被释放）清零标志 -> PS/2 IRQ 分发自动回退。 */
+    bool kbd = false, mouse = false;
+    for (int i = 0; i < USB_MAX_DEVICES; i++) {
+        usb_device_t *d = &g_dev[i];
+        if (d->state != USB_STATE_ENUMERATED || d->int_slot == USB_SLOT_INVALID) {
+            continue;
+        }
+        if (d->kind == USB_KIND_HID_KBD) {
+            kbd = true;
+        } else if (d->kind == USB_KIND_HID_MOUSE) {
+            mouse = true;
+        }
+    }
+    input_pref_set_usb_kbd(kbd);
+    input_pref_set_usb_mouse(mouse);
 }
 
 /* USB 主机服务内核任务：周期性轮询（在进程上下文，可安全延时）。 */

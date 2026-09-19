@@ -536,10 +536,13 @@ QEMU_SMP    ?= 4
 else
 QEMU_SMP    ?= 1
 endif
+# 输入设备优先：默认启动即挂 USB 键盘 + 鼠标（内核 USB HID 优先，PS/2 作回退）。
+# 如某次运行不需要 USB，可 make run QEMU_INPUT= 覆盖为空。
+QEMU_INPUT  ?= -usb -device usb-kbd -device usb-mouse
 ifeq ($(QEMU_ACCEL),kvm)
-QEMU_FLAGS  := -machine pc,accel=kvm -cpu host -smp $(QEMU_SMP) -m 2G -no-shutdown
+QEMU_FLAGS  := -machine pc,accel=kvm -cpu host -smp $(QEMU_SMP) -m 2G -no-shutdown $(QEMU_INPUT)
 else
-QEMU_FLAGS  := -machine pc -cpu qemu64 -smp $(QEMU_SMP) -m 2G -no-shutdown
+QEMU_FLAGS  := -machine pc -cpu qemu64 -smp $(QEMU_SMP) -m 2G -no-shutdown $(QEMU_INPUT)
 endif
 QEMU_DISK   := -drive file=$(DISK),format=raw,index=0,media=disk
 # P0-7 AHCI：盘挂 AHCI 控制器（DMA+中断路径）而非 i440FX 传统 IDE。

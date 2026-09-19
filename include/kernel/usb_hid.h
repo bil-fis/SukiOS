@@ -16,7 +16,8 @@
  * max_packet0/int_ep/int_mps/hid_protocol。成功返回 true。 */
 bool usb_hid_start(int dev_idx, uint8_t interface_num);
 
-/* 轮询该 HID 设备的中断端点，解析报告并注入 PS/2 键盘/鼠标事件。 */
-void usb_hid_poll(int dev_idx);
+/* 轮询该 HID 设备的中断端点，解析报告并注入 PS/2 键盘/鼠标事件。
+ * 返回 >0=本次收到字节数，0=无数据，-1=端点致命错误（调用方应释放设备）。 */
+int usb_hid_poll(int dev_idx);
 
 #endif /* _SUKI_KERNEL_USB_HID_H */

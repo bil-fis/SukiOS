@@ -197,15 +197,18 @@ bool usb_hid_start(int dev_idx, uint8_t interface_num)
     return true;
 }
 
-void usb_hid_poll(int dev_idx)
+int usb_hid_poll(int dev_idx)
 {
     usb_device_t *d = usb_core_get(dev_idx);
     if (!d || d->int_slot == 0xFF) {
-        return;
+        return -1;
     }
     int n = uhci_int_poll(d->int_slot);
-    if (n <= 0) {
-        return;
+    if (n < 0) {
+        return -1;                  /* 端点致命错误：交由 usb_core 释放设备 */
+    }
+    if (n == 0) {
+        return 0;
     }
     const uint8_t *rep = g_report[dev_idx];
     if (d->kind == USB_KIND_HID_MOUSE) {
@@ -213,4 +216,5 @@ void usb_hid_poll(int dev_idx)
     } else {
         hid_kbd_process(dev_idx, rep, n);
     }
+    return n;
 }

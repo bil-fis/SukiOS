@@ -129,6 +129,8 @@ void kbd_feed_byte(uint8_t sc)
  * 声明在此处以避免头文件循环依赖；实现位于 mouse.c。 */
 extern void mouse_feed_byte(uint8_t b);
 
+#include <kernel/input_pref.h>   /* USB 优先 / PS/2 回退 仲裁 */
+
 /*
  * IRQ1 处理程序（键盘 + 鼠标统一入口）。
  * 设计：把 PS/2 鼠标(GSI12)也路由到本向量（见 mouse_init 的 ioapic_route(12, IRQ1)），
@@ -147,10 +149,16 @@ static void kbd_irq_handler(registers_t *r)
         return;                 /* 无数据（spurious，忽略） */
     }
     uint8_t sc = inb(KBD_DATA);
+    /* 输入源优先级：USB HID 键鼠优先，就绪时丢弃 PS/2 字节（避免双份输入）；
+     * USB 缺失 / 枚举失败 / 传输异常 / 拔出时标志清零，此处自动回退 PS/2。 */
     if (st & STS_AUX) {
-        mouse_feed_byte(sc);    /* 鼠标 */
+        if (!input_pref_usb_mouse_active()) {
+            mouse_feed_byte(sc);    /* PS/2 鼠标（USB 鼠标未接管时） */
+        }
     } else {
-        kbd_feed_byte(sc);      /* 键盘 */
+        if (!input_pref_usb_kbd_active()) {
+            kbd_feed_byte(sc);      /* PS/2 键盘（USB 键盘未接管时） */
+        }
     }
 }
 

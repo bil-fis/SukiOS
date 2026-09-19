@@ -53,6 +53,7 @@ struct task;
 #define FD_BACKEND_DISK  0   /* FS_PORT 的 Ring3 FS_SERVER(FatFs) —— 默认 */
 #define FD_BACKEND_TMPFS 1   /* 内核态 tmpfs（/tmp、/run） */
 #define FD_BACKEND_DEVFS 2   /* 内核态 devfs（/dev） */
+#define FD_BACKEND_ISO   3   /* 内核态 ISO9660（仅光盘启动、脱离硬盘时接管 '/'） */
 
 /* 前端 fd 表项（全局槽池中的一个槽） */
 typedef struct fd_entry {

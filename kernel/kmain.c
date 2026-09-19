@@ -27,6 +27,8 @@
 #include <kernel/display_cfg.h> /* g_display：显示配置（内置默认值；运行时可被 registry 覆盖） */
 #include <kernel/registry.h>   /* SukiRegistry Hive 解析（/sys/configs） */
 #include <kernel/vfs.h>        /* kern_fs_read_file：内核态同步读文件 */
+#include <kernel/cdrom.h>       /* CdromInit：ATAPI 光驱探测 */
+#include <kernel/iso9660.h>     /* IsoMount/IsoIsMounted/IsoReadFile：内核 ISO9660 */
 #include <kernel/posix.h>       /* posix_init()：完整 POSIX 系统调用层 */
 #include <kernel/rtc.h>         /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
 #include <kernel/smp.h>
@@ -200,6 +202,16 @@ static void BootPlayAnimation(void)
 
 /* 第三步：读取 registry 配置（/sys/configs/system.reg）并按配置门控 kdr。
  * 文件缺失/CRC 失败则回退默认，绝不阻塞启动。 */
+/* 读取 registry 配置：优先内核 ISO9660（仅光盘启动、'/' 已挂 ISO 时），
+ * 否则走 FS_PORT（FatFs/Ring3 FS_SERVER）。两者语义一致：成功填 buf/n，失败返回非 0。 */
+static int Stage3ReadConfig(const char *path, uint8_t *buf, uint32_t cap, uint32_t *out_n)
+{
+    if (IsoIsMounted()) {
+        return IsoReadFile(path, buf, cap, out_n);
+    }
+    return kern_fs_read_file(path, buf, cap, out_n);
+}
+
 static void Stage3LoadConfigAndKdr(void)
 {
     uint8_t *buf = kmalloc(65536);
@@ -208,7 +220,7 @@ static void Stage3LoadConfigAndKdr(void)
         return;
     }
     uint32_t n = 0;
-    int rc = kern_fs_read_file("/sys/configs/system.reg", buf, 65536, &n);
+    int rc = Stage3ReadConfig("/sys/configs/system.reg", buf, 65536, &n);
     if (rc != 0 || n == 0) {
         kprintf("[boot] config: cannot read /sys/configs/system.reg (rc=%d), using defaults\n", rc);
         kfree(buf);
@@ -521,8 +533,28 @@ static void boot_late_init(void *arg)
     }
     else
     {
-        kprintf("[boot] no disk: FS_SERVER not started (POSIX file syscalls "
-                "will return -EIO)\n");
+        kprintf("[boot] no disk detected: FS_SERVER not started.\n");
+        /* 仅光盘启动（脱离硬盘）：探测 ATAPI 光驱并挂载内核 ISO9660，
+         * 使 '/' 由内核直接服务（含全部系统文件），Ring3 服务改从光盘读取。 */
+        if (CdromInit() && IsoMount()) {
+            kprintf("[boot] booting from ISO9660 on CD-ROM (read-only).\n");
+        } else {
+            kprintf("[boot] no CD-ROM/ISO either: POSIX file syscalls will "
+                    "return -EIO.\n");
+        }
+        extern void vfs_init(void);
+        vfs_init();
+        extern void vfs_selftest(void);
+        vfs_selftest();
+
+        /* 第三步：从 ISO 读取 registry 配置并按配置门控 kdr（无盘也需读配置） */
+        Stage3LoadConfigAndKdr();
+        if (g_kdr_enabled) {
+            kdr_load_all();
+        } else {
+            kprintf("[boot] kdr loading disabled by registry config\n");
+        }
+        BootPlayAnimation();   /* 预留：启动动画（本期未实现） */
     }
 
     /* ---- 网络：启动 NET_PORT 内核服务（e1000 原始帧收发）----

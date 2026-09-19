@@ -226,6 +226,15 @@ void fd_close_backend(fd_entry_t *e)
         e->backend = -1;
         return;
     }
+    if (e->vfs_backend == FD_BACKEND_ISO) {
+        if (e->type == FD_TYPE_DIR) {
+            iso_closedir((uint32_t)e->backend);
+        } else {
+            iso_close((uint32_t)e->backend);
+        }
+        e->backend = -1;
+        return;
+    }
     if (e->vfs_backend == FD_BACKEND_DEVFS) {
         /* devfs 设备无状态，无需关闭（句柄即表索引，下次 open 复用） */
         e->backend = -1;
@@ -592,7 +601,8 @@ int fd_open(struct task *t, const char *path, int flags, uint32_t mode)
     if (vfs_ready()) {
         vfs_resolved_t vr;
         vfs_resolve(path, &vr);
-        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS
+            || vr.backend == VFS_BACKEND_ISO) {
             uint32_t vh = 0;
             int brc = vfs_builtin_open(vr.rel, (int32_t)flags, mode, &vh,
                                        vr.backend);
@@ -605,8 +615,9 @@ int fd_open(struct task *t, const char *path, int flags, uint32_t mode)
             if (fdnum >= 0) {
                 fd_entry_t *e = &g_fd_slots[t->fds[fdnum]];
                 e->backend = (int)vh;                 /* VFS 内部句柄 */
-                e->vfs_backend = (vr.backend == VFS_BACKEND_TMPFS)
-                                 ? FD_BACKEND_TMPFS : FD_BACKEND_DEVFS;
+                e->vfs_backend = (vr.backend == VFS_BACKEND_ISO) ? FD_BACKEND_ISO
+                                 : (vr.backend == VFS_BACKEND_TMPFS)
+                                   ? FD_BACKEND_TMPFS : FD_BACKEND_DEVFS;
                 e->path = (char *)kmalloc(plen + 1);
                 if (e->path) {
                     memcpy(e->path, path, plen + 1);
@@ -615,7 +626,9 @@ int fd_open(struct task *t, const char *path, int flags, uint32_t mode)
             spin_unlock_irqrestore(&g_fd_lock, f);
             if (fdnum < 0) {
                 /* 本地槽耗尽：关闭内建句柄 */
-                if (vr.backend == VFS_BACKEND_TMPFS) {
+                if (vr.backend == VFS_BACKEND_ISO) {
+                    iso_close((uint32_t)vh);
+                } else if (vr.backend == VFS_BACKEND_TMPFS) {
                     tmpfs_close((int)vh);
                 }
                 return fdnum;
@@ -799,6 +812,29 @@ suki_ssize_t fd_read(struct task *t, int fd, void *ubuf, size_t count)
         kfree(kbuf);
         return (suki_ssize_t)nread;
     }
+    if (e->vfs_backend == FD_BACKEND_ISO) {
+        /* 内建 ISO9660 文件读：镜像 tmpfs 流程（ISO 内部句柄维护游标） */
+        uint8_t *kbuf = kmalloc(count ? count : 1);
+        if (!kbuf) {
+            return -SUKI_ENOMEM;
+        }
+        uint64_t nread = 0;
+        int rc = iso_read((uint32_t)e->backend, kbuf, (uint32_t)count, &nread);
+        if (rc < 0) {
+            kfree(kbuf);
+            return rc;
+        }
+        e->offset += nread;
+        if (nread > 0) {
+            rc = copy_to_user(ubuf, kbuf, (size_t)nread);
+            if (rc < 0) {
+                kfree(kbuf);
+                return rc;
+            }
+        }
+        kfree(kbuf);
+        return (suki_ssize_t)nread;
+    }
     if (e->backend < 0) {
         return -SUKI_EBADF;
     }
@@ -898,6 +934,15 @@ suki_ssize_t fd_read_kern(struct task *t, int fd, void *kbuf, size_t count)
         uint64_t nread = 0;
         int rc = devfs_read((uint32_t)e->backend, (uint8_t *)kbuf,
                             (uint32_t)count, e->offset, &nread);
+        if (rc < 0) {
+            return rc;
+        }
+        e->offset += nread;
+        return (suki_ssize_t)nread;
+    }
+    if (e->vfs_backend == FD_BACKEND_ISO) {
+        uint64_t nread = 0;
+        int rc = iso_read((uint32_t)e->backend, (uint8_t *)kbuf, (uint32_t)count, &nread);
         if (rc < 0) {
             return rc;
         }
@@ -1160,6 +1205,9 @@ suki_ssize_t fd_write(struct task *t, int fd, const void *ubuf, size_t count)
         kfree(kbuf);
         return (suki_ssize_t)total;
     }
+    if (e->vfs_backend == FD_BACKEND_ISO) {
+        return -SUKI_EROFS;     /* 只读光盘 */
+    }
     if (e->backend < 0) {
         return -SUKI_EBADF;
     }
@@ -1239,6 +1287,15 @@ suki_off_t fd_lseek(struct task *t, int fd, suki_off_t off, int whence)
     }
     if (e->vfs_backend == FD_BACKEND_DEVFS) {
         return -SUKI_ESPIPE;   /* 字符设备不支持 seek */
+    }
+    if (e->vfs_backend == FD_BACKEND_ISO) {
+        uint64_t pos = 0;
+        int rc = iso_lseek((uint32_t)e->backend, off, whence, &pos);
+        if (rc < 0) {
+            return (suki_off_t)rc;
+        }
+        e->offset = pos;
+        return (suki_off_t)pos;
     }
     if (e->backend < 0) {
         return -SUKI_EBADF;
@@ -1390,6 +1447,15 @@ int fd_fstat(struct task *t, int fd, suki_stat_t *out)
         fd_stat_copy(out, &st);
         return 0;
     }
+    if (e->vfs_backend == FD_BACKEND_ISO) {
+        fs_stat_t st;
+        int rc = iso_stat(e->path ? e->path : "/", &st);
+        if (rc < 0) {
+            return rc;
+        }
+        fd_stat_copy(out, &st);
+        return 0;
+    }
     if (e->backend < 0) {
         return -SUKI_EBADF;
     }
@@ -1405,7 +1471,8 @@ int fd_stat(const char *path, suki_stat_t *out)
     if (vfs_ready()) {
         vfs_resolved_t vr;
         vfs_resolve(path, &vr);
-        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS
+            || vr.backend == VFS_BACKEND_ISO) {
             fs_stat_t st;
             int rc = vfs_builtin_stat(vr.rel, &st, vr.backend);
             if (rc < 0) {
@@ -1432,7 +1499,8 @@ int fd_opendir(struct task *t, const char *path)
     if (vfs_ready()) {
         vfs_resolved_t vr;
         vfs_resolve(path, &vr);
-        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
+        if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS
+            || vr.backend == VFS_BACKEND_ISO) {
             int dd = vfs_builtin_opendir(vr.rel, vr.backend);
             if (dd < 0) {
                 return dd;
@@ -1443,8 +1511,9 @@ int fd_opendir(struct task *t, const char *path)
             if (fdnum >= 0) {
                 fd_entry_t *e = &g_fd_slots[t->fds[fdnum]];
                 e->backend = dd;     /* 内建目录句柄 */
-                e->vfs_backend = (vr.backend == VFS_BACKEND_TMPFS)
-                                 ? FD_BACKEND_TMPFS : FD_BACKEND_DEVFS;
+                e->vfs_backend = (vr.backend == VFS_BACKEND_ISO) ? FD_BACKEND_ISO
+                                 : (vr.backend == VFS_BACKEND_TMPFS)
+                                   ? FD_BACKEND_TMPFS : FD_BACKEND_DEVFS;
                 e->path = (char *)kmalloc(plen + 1);
                 if (e->path) {
                     memcpy(e->path, path, plen + 1);
@@ -1521,10 +1590,17 @@ int fd_readdir(struct task *t, int fd, suki_dirent_t *out)
         return -SUKI_EBADF;
     }
 
-    /* 内建后端目录读：直接调 vfs_builtin_readdir */
-    if (e->vfs_backend == FD_BACKEND_TMPFS || e->vfs_backend == FD_BACKEND_DEVFS) {
+    /* 内建后端目录读：直接调 vfs_builtin_readdir。
+     * 注意：fd 层用 FD_BACKEND_* 标记目录句柄，而 vfs_builtin_readdir 期望
+     * VFS_BACKEND_*（两套枚举数值不同：FD 层 TMPFS/DEVFS/ISO=1/2/3，VFS 层=2/3/4），
+     * 必须先映射，否则比较永不相等、readdir 直接返回 -EINVAL（历史 bug）。 */
+    if (e->vfs_backend == FD_BACKEND_TMPFS || e->vfs_backend == FD_BACKEND_DEVFS
+        || e->vfs_backend == FD_BACKEND_ISO) {
         fs_dirent_t de;
-        int rc = vfs_builtin_readdir(e->backend, &de, e->vfs_backend);
+        vfs_backend_t vb = (e->vfs_backend == FD_BACKEND_ISO)   ? VFS_BACKEND_ISO
+                          : (e->vfs_backend == FD_BACKEND_TMPFS) ? VFS_BACKEND_TMPFS
+                                                                : VFS_BACKEND_DEVFS;
+        int rc = vfs_builtin_readdir(e->backend, &de, vb);
         if (rc < 0) {
             return rc;
         }
@@ -1602,6 +1678,13 @@ static int fd_path_op(uint32_t msg_id, const char *path, int32_t mode)
     if (vfs_ready()) {
         vfs_resolved_t vr;
         vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_ISO) {
+            /* 只读光盘：写类操作一律拒绝；access 走存在性判定 */
+            if (msg_id == FS_MSG_ACCESS) {
+                return vfs_builtin_access(vr.rel, mode, vr.backend);
+            }
+            return -SUKI_EROFS;
+        }
         if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
             if (msg_id == FS_MSG_UNLINK2) {
                 return vfs_builtin_unlink(vr.rel, mode ? true : false, vr.backend);
@@ -1673,6 +1756,9 @@ int fd_rename(const char *oldp, const char *newp)
         vfs_resolved_t vo, vn;
         vfs_resolve(oldp, &vo);
         vfs_resolve(newp, &vn);
+        if (vo.backend == VFS_BACKEND_ISO || vn.backend == VFS_BACKEND_ISO) {
+            return -SUKI_EROFS;       /* 只读光盘 */
+        }
         if ((vo.backend == VFS_BACKEND_TMPFS || vo.backend == VFS_BACKEND_DEVFS)
             && vo.backend == vn.backend) {
             return vfs_builtin_rename(vo.rel, vn.rel, vo.backend);
@@ -1715,6 +1801,13 @@ int fd_truncate(const char *path, suki_off_t len)
     if (!path || path[0] == '\0' || len < 0) {
         return -SUKI_EINVAL;
     }
+    if (vfs_ready()) {
+        vfs_resolved_t vr;
+        vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_ISO) {
+            return -SUKI_EROFS;
+        }
+    }
     size_t plen = strlen(path);
     if (plen >= FS_PATH_MAX) {
         return -SUKI_ENAMETOOLONG;
@@ -1756,6 +1849,9 @@ int fd_ftruncate(struct task *t, int fd, suki_off_t len)
     }
     if (e->type != FD_TYPE_FILE || e->backend < 0 || len < 0) {
         return -SUKI_EINVAL;
+    }
+    if (e->vfs_backend == FD_BACKEND_ISO) {
+        return -SUKI_EROFS;
     }
     uint8_t *req = rpc_req_buf();
     uint32_t reqsz = (uint32_t)(sizeof(mach_msg_header_t)
@@ -2020,6 +2116,9 @@ int fd_chmod(const char *path, uint32_t mode)
     if (vfs_ready()) {
         vfs_resolved_t vr;
         vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_ISO) {
+            return -SUKI_EROFS;
+        }
         if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
             return vfs_builtin_chmod(vr.rel, mode, vr.backend);
         }
@@ -2065,6 +2164,9 @@ int fd_utimes(const char *path, int64_t atime, int64_t mtime)
     if (vfs_ready()) {
         vfs_resolved_t vr;
         vfs_resolve(path, &vr);
+        if (vr.backend == VFS_BACKEND_ISO) {
+            return -SUKI_EROFS;
+        }
         if (vr.backend == VFS_BACKEND_TMPFS || vr.backend == VFS_BACKEND_DEVFS) {
             return vfs_builtin_utime(vr.rel, atime, mtime, vr.backend);
         }

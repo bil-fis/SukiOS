@@ -37,6 +37,7 @@ typedef enum vfs_backend {
     VFS_BACKEND_DISK = 1,   /* FS_PORT 的 FatFs 服务（Ring3 FS_SERVER） */
     VFS_BACKEND_TMPFS = 2,  /* 内核态内存文件系统（/tmp、/run） */
     VFS_BACKEND_DEVFS = 3,  /* 内核态字符设备文件系统（/dev） */
+    VFS_BACKEND_ISO = 4,    /* 内核态 ISO9660（仅光盘启动、脱离硬盘时接管 '/'） */
 } vfs_backend_t;
 
 #define VFS_MAX_MOUNTS   16
@@ -190,5 +191,15 @@ typedef int (*devfs_io_fn)(void *dev_ctx, char *buf, uint32_t len, uint64_t offs
  * 返回 0 成功。read/write 任一可为 NULL（只读/只写）。 */
 int devfs_register(const char *name, devfs_io_fn read_fn, devfs_io_fn write_fn,
                    void *ctx, uint32_t mode, uint64_t size);
+
+/* --- ISO9660 内核内嵌只读文件系统操作（供 VFS 核心与 fd.c 调用，不经 IPC） --- */
+int iso_open(const char *rel, int32_t flags, uint32_t mode, uint32_t *out_handle);
+int iso_read(uint32_t h, void *buf, uint32_t len, uint64_t *out_nread);
+int iso_lseek(uint32_t h, int64_t offset, int whence, uint64_t *out_pos);
+int iso_close(uint32_t h);
+int iso_stat(const char *rel, fs_stat_t *st);
+int iso_opendir(const char *rel);
+int iso_readdir(int dd, fs_dirent_t *de);
+int iso_closedir(int dd);
 
 #endif /* _SUKI_KERNEL_VFS_H */

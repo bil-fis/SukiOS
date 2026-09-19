@@ -25,6 +25,7 @@
 #include <mm/kmalloc.h>
 #include <sukios/posix.h>      /* SUKI_E* 错误码 */
 #include <ipc/fs_proto.h>
+#include <kernel/iso9660.h>     /* 内核内嵌 ISO9660（仅光盘启动接管 '/'） */
 
 /* ========================================================================== */
 /*  挂载表                                                                     */
@@ -158,9 +159,18 @@ void vfs_init(void)
         kprintf("[vfs] WARNING: devfs_init failed\n");
     }
 
-    /* 2) 注册默认挂载点 */
-    if (vfs_mount("/", VFS_BACKEND_DISK, NULL) != 0) {
-        kprintf("[vfs] FATAL: cannot mount '/' as DISK\n");
+    /* 2) 注册默认挂载点。仅光盘启动（脱离硬盘）时，'/' 由内核 ISO9660 接管；
+     *    否则仍走 DISK 后端（FS_PORT/Ring3 FS_SERVER/FatFs），保证 make run 不变。 */
+    {
+        vfs_backend_t root_backend = VFS_BACKEND_DISK;
+        if (IsoIsMounted()) {
+            root_backend = VFS_BACKEND_ISO;
+            kprintf("[vfs] '/' mounted as ISO9660 (CD-ROM, read-only)\n");
+        }
+        if (vfs_mount("/", root_backend, NULL) != 0) {
+            kprintf("[vfs] FATAL: cannot mount '/' as %s\n",
+                    root_backend == VFS_BACKEND_ISO ? "ISO" : "DISK");
+        }
     }
     if (vfs_mount("/tmp", VFS_BACKEND_TMPFS, NULL) != 0) {
         kprintf("[vfs] WARNING: mount /tmp tmpfs failed\n");
@@ -185,6 +195,9 @@ void vfs_init(void)
 int vfs_builtin_open(const char *rel, int32_t flags, uint32_t mode,
                      uint32_t *out_handle, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return iso_open(rel, flags, mode, out_handle);
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_open(rel, flags, mode, out_handle);
     }
@@ -196,6 +209,9 @@ int vfs_builtin_open(const char *rel, int32_t flags, uint32_t mode,
 
 int vfs_builtin_stat(const char *rel, fs_stat_t *st, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return iso_stat(rel, st);
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_stat(rel, st);
     }
@@ -207,6 +223,9 @@ int vfs_builtin_stat(const char *rel, fs_stat_t *st, vfs_backend_t backend)
 
 int vfs_builtin_mkdir(const char *rel, uint32_t mode, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return -SUKI_EROFS;     /* 只读光盘 */
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_mkdir(rel, mode);
     }
@@ -216,6 +235,9 @@ int vfs_builtin_mkdir(const char *rel, uint32_t mode, vfs_backend_t backend)
 
 int vfs_builtin_unlink(const char *rel, bool is_dir, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return -SUKI_EROFS;     /* 只读光盘 */
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_unlink(rel, is_dir);
     }
@@ -226,6 +248,9 @@ int vfs_builtin_unlink(const char *rel, bool is_dir, vfs_backend_t backend)
 int vfs_builtin_rename(const char *old_rel, const char *new_rel,
                        vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return -SUKI_EROFS;     /* 只读光盘 */
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_rename(old_rel, new_rel);
     }
@@ -234,6 +259,10 @@ int vfs_builtin_rename(const char *old_rel, const char *new_rel,
 
 int vfs_builtin_access(const char *rel, int32_t mode, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        fs_stat_t st;
+        return iso_stat(rel, &st);     /* 存在返回 0，否则 -ENOENT */
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_access(rel, mode);
     }
@@ -245,6 +274,9 @@ int vfs_builtin_access(const char *rel, int32_t mode, vfs_backend_t backend)
 
 int vfs_builtin_chmod(const char *rel, uint32_t mode, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return -SUKI_EROFS;     /* 只读光盘 */
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_chmod(rel, mode);
     }
@@ -254,6 +286,9 @@ int vfs_builtin_chmod(const char *rel, uint32_t mode, vfs_backend_t backend)
 int vfs_builtin_utime(const char *rel, int64_t atime, int64_t mtime,
                       vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return -SUKI_EROFS;     /* 只读光盘 */
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_utime(rel, atime, mtime);
     }
@@ -262,6 +297,9 @@ int vfs_builtin_utime(const char *rel, int64_t atime, int64_t mtime,
 
 int vfs_builtin_opendir(const char *rel, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return iso_opendir(rel);
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_opendir(rel);
     }
@@ -273,6 +311,9 @@ int vfs_builtin_opendir(const char *rel, vfs_backend_t backend)
 
 int vfs_builtin_readdir(int dd, fs_dirent_t *de, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return iso_readdir(dd, de);
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_readdir(dd, de);
     }
@@ -372,11 +413,19 @@ void vfs_selftest(void)
         }
     }
 
+    /* 5) ISO9660 只读驱动（仅光盘启动、'/' 挂为 ISO 时） */
+    if (IsoIsMounted()) {
+        IsoSelfTest();
+    }
+
     kprintf("[vfs] selftest end\n");
 }
 
 int vfs_builtin_closedir(int dd, vfs_backend_t backend)
 {
+    if (backend == VFS_BACKEND_ISO) {
+        return iso_closedir(dd);
+    }
     if (backend == VFS_BACKEND_TMPFS) {
         return tmpfs_closedir(dd);
     }

@@ -53,6 +53,10 @@ BUILD  := build
 ISODIR := $(BUILD)/isodir
 KERNEL := $(BUILD)/kernel.ski
 ISO    := $(BUILD)/SukiOS.iso
+# 仅光盘启动用的「完整系统 ISO」：把硬盘里的全部运行文件塞进 ISO，
+# 内核经内置 ISO9660 驱动 + ATAPI 光驱直接读取，脱离硬盘运行。
+ISODIR_SINGLE := $(BUILD)/isodir-single
+ISO_SINGLE    := $(BUILD)/SukiOS-single.iso
 
 # =============================================================================
 # 内核编译期配置（include/kernel/config.h）
@@ -874,6 +878,52 @@ $(ISO): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB)
 	grub-mkrescue -o $(ISO) $(ISODIR) 2>/dev/null
 	@echo "==> Built $(ISO)"
 
+# ---- 仅光盘启动 ISO：完整系统镜像（内核 + 全部运行文件） ----
+# 逻辑布局与 FAT 盘一致（顶层 SYS/BIN/FONTS/IMAGES/LIB + MOONHALO.MP3 + README.TXT），
+# 以便内核 VFS 把 '/' 直接映射到光盘而无需改动任何运行时路径字符串。
+# 生成时启用 Rock Ridge(-r) 与 Joliet(-J)，内核驱动两者均支持。
+iso-single: $(ISO_SINGLE)
+$(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
+                $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) \
+                others_tests/moonhalo.mp3 $(RUST_BIN)
+	@mkdir -p $(ISODIR_SINGLE)/boot/grub
+	cp $(KERNEL) $(ISODIR_SINGLE)/boot/kernel.ski
+	cp grub/grub.cfg $(ISODIR_SINGLE)/boot/grub/grub.cfg
+	cp $(KDR_OBJS) $(ISODIR_SINGLE)/boot/
+	@mkdir -p $(ISODIR_SINGLE)/SYS/CONFIGS $(ISODIR_SINGLE)/BIN \
+	         $(ISODIR_SINGLE)/FONTS $(ISODIR_SINGLE)/IMAGES $(ISODIR_SINGLE)/LIB
+	printf 'SukiOS single-ISO boot: kernel ISO9660 driver + Rock Ridge/Joliet.\n' > $(ISODIR_SINGLE)/README.TXT
+	cp configs/default/system.reg $(ISODIR_SINGLE)/SYS/CONFIGS/system.reg
+	cp configs/default/user.reg   $(ISODIR_SINGLE)/SYS/CONFIGS/user.reg
+	cp configs/default/services.reg $(ISODIR_SINGLE)/SYS/CONFIGS/services.reg
+	-cp images/*.bmp $(ISODIR_SINGLE)/IMAGES/ 2>/dev/null || true
+	@for p in $(APP_PROGS); do \
+		up=$$(echo $$p | tr a-z A-Z); \
+		echo "  iso-single: BIN/$$up.SKA <= $(BUILD)/apps/$$p.elf"; \
+		cp $(BUILD)/apps/$$p.elf $(ISODIR_SINGLE)/BIN/$$up.SKA; \
+	done
+	cp $(LIBTEST_SL) $(ISODIR_SINGLE)/LIB/libtest.sl
+	cp $(LIBSUKI_GUI_SL) $(ISODIR_SINGLE)/LIB/libsuki_gui.sl
+	cp $(LIBTEST_SL) $(ISODIR_SINGLE)/LIB/libtest2.sl
+	cp others_tests/moonhalo.mp3 $(ISODIR_SINGLE)/MOONHALO.MP3
+	@for f in resources/*.ttf; do \
+		[ -e "$$f" ] || continue; \
+		bn=$$(basename $$f | tr a-z A-Z); \
+		echo "  iso-single: FONTS/$$bn <= $$f"; \
+		cp $$f $(ISODIR_SINGLE)/FONTS/$$bn; \
+	done
+	@for p in $(FONT_PROGS); do \
+		up=$$(echo $$p | tr a-z A-Z); \
+		echo "  iso-single: BIN/$$up.SKA <= $(BUILD)/apps/$$p.elf"; \
+		cp $(BUILD)/apps/$$p.elf $(ISODIR_SINGLE)/BIN/$$up.SKA; \
+	done
+	@if [ -f $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello ]; then \
+		cp $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello $(ISODIR_SINGLE)/BIN/RUSTHELLO.SKA; \
+	fi
+	grub-mkrescue -o $(ISO_SINGLE) $(ISODIR_SINGLE) -r -J 2>/dev/null || \
+		grub-mkrescue -o $(ISO_SINGLE) $(ISODIR_SINGLE) 2>/dev/null
+	@echo "==> Built $(ISO_SINGLE)"
+
 # ---- FAT32 磁盘镜像（演示文本 + 独立程序 + MP3 音乐） ----
 # 独立程序放入 ::BIN/，文件名一律大写且【无 .elf 后缀】（如 ::BIN/PLAYAUDIO）。
 # PLAYAUDIO 超过 8.3 短名 → mtools 自动创建长文件名(LFN)，FS_SERVER 已支持
@@ -948,6 +998,16 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/m
 # 这样 `make run` 即可直接拉起一个完整可启动的 SukiOS 模拟环境。
 run: $(ISO) $(DISK)
 	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO) $(QEMU_DISK)
+
+# ---- 仅光盘启动：把完整系统塞进 ISO，内核用内置 ISO9660 驱动脱离硬盘运行 ----
+# 仅挂 -cdrom（不挂 -drive），内核检测到无硬盘后自动从 CD-ROM 挂载 ISO 接管 '/'。
+# 用户程序仍以内嵌 blob 启动；其运行期打开的文件（注册表/应用/字体/图片/MP3/库）
+# 全部来自该 ISO（经内核 ISO9660 驱动，支持 Rock Ridge + Joliet 扩展）。
+run-single-iso: $(ISO_SINGLE)
+	$(QEMU_RUN) $(QEMU_FLAGS) $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO_SINGLE)
+
+run-single-iso-headless: $(ISO_SINGLE)
+	$(QEMU_RUN) $(QEMU_FLAGS) -display none $(QEMU_SERIAL) $(QEMU_AUDIO) $(QEMU_NET) -boot d -cdrom $(ISO_SINGLE)
 
 # ---- 无头运行 (仅串口，用于自动化验证) ----
 run-headless: $(ISO) $(DISK)

@@ -200,7 +200,7 @@ static void BootPlayAnimation(void)
     kprintf("[boot] stage3: boot animation reserved (not implemented yet)\n");
 }
 
-/* 第三步：读取 registry 配置（/sys/configs/system.reg）并按配置门控 kdr。
+/* 第三步：读取 registry 配置（/sys/configs/system.sre）并按配置门控 kdr。
  * 文件缺失/CRC 失败则回退默认，绝不阻塞启动。 */
 /* 读取 registry 配置：优先内核 ISO9660（仅光盘启动、'/' 已挂 ISO 时），
  * 否则走 FS_PORT（FatFs/Ring3 FS_SERVER）。两者语义一致：成功填 buf/n，失败返回非 0。 */
@@ -220,9 +220,9 @@ static void Stage3LoadConfigAndKdr(void)
         return;
     }
     uint32_t n = 0;
-    int rc = Stage3ReadConfig("/sys/configs/system.reg", buf, 65536, &n);
+    int rc = Stage3ReadConfig("/sys/configs/system.sre", buf, 65536, &n);
     if (rc != 0 || n == 0) {
-        kprintf("[boot] config: cannot read /sys/configs/system.reg (rc=%d), using defaults\n", rc);
+        kprintf("[boot] config: cannot read /sys/configs/system.sre (rc=%d), using defaults\n", rc);
         kfree(buf);
         return;
     }
@@ -233,7 +233,7 @@ static void Stage3LoadConfigAndKdr(void)
         kfree(buf);
         return;
     }
-    kprintf("[boot] config: loaded system.reg (generation=%llu)\n",
+    kprintf("[boot] config: loaded system.sre (generation=%llu)\n",
             (unsigned long long)h->generation);
     if (cfg.have_display) {
         g_display.width  = cfg.display_width;
@@ -285,7 +285,7 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
 
     /* 解析 GRUB 内核命令行（-v/--verbose 等）。第三步系统初始化默认仅串口输出，
      * 仅当 -v/--verbose 时才镜像到屏幕。显示配置不再经 GRUB 模块传递，改由第三步
-     * 从 registry（/sys/configs/system.reg）读取，并以内置默认值兜底。 */
+     * 从 registry（/sys/configs/system.sre）读取，并以内置默认值兜底。 */
     ParseBootCmdline();
 
     fb_init(&g_boot);
@@ -521,7 +521,7 @@ static void boot_late_init(void *arg)
         extern void vfs_selftest(void);
         vfs_selftest();
 
-        /* 第三步：读取 registry 配置（/sys/configs/system.reg）并按配置门控 kdr。
+        /* 第三步：读取 registry 配置（/sys/configs/system.sre）并按配置门控 kdr。
          * 文件缺失/CRC 失败则回退默认，绝不阻塞启动。 */
         Stage3LoadConfigAndKdr();
         if (g_kdr_enabled) {

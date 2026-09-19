@@ -7,18 +7,23 @@
  * + generation(在线防回滚) + 审计。离线篡改在无签名下不可防，CRC32 仅用于
  * 检测意外损坏，不宣称防篡改（详见「SukiOS 安全配置存储系统设计（无签名版）」）。
  *
- * 磁盘布局与 Python 工具完全一致：
+ * 磁盘布局与 Python 工具（tools/registry_editor.py）完全一致。v2 为层级键树：
  *   [0..8)   magic  "SUKREG\0\0"
- *   [8..12)  version u32
+ *   [8..12)  version u32        (=2)
  *   [12..16) flags u32
- *   [16..24) root_offset u64
- *   [24..32) entry_count u64
+ *   [16..24) root_offset u64    (根键节点在文件中的偏移，恒为 64)
+ *   [24..32) entry_count u64    (v2 未使用，置 0)
  *   [32..40) generation u64
  *   [40..48) timestamp u64
- *   [48..52) crc32 u32        (覆盖 [0..48) + body 的 CRC32)
- *   [52..64) reserved(补齐到 64)
- *   [64..)   body：扁平条目数组，每项为
- *            <type u32><flags u32><name_len u32><name><data_len u64><data>
+ *   [48..52) crc32 u32          (覆盖 [0..48) + body 的 CRC32)
+ *   [52..60) body_size u64      (v2：body 字节数，用于 CRC/解析边界)
+ *   [60..64) reserved(补齐到 64)
+ *   [64..)   body：根键节点（前序递归序列化的键树）。每个键节点：
+ *            <name_len u32><name><flags u32><value_count u32>
+ *            [值表] 每个值：<vname_len u32><vname><vtype u32><vdata_len u64><vdata>
+ *            <subkey_count u32>
+ *            [子键表] 每个子键：内嵌一个键节点（前序递归）
+ *   查值路径形如 "System/Display/Width"：首段为根键名，中间段为子键名，末段为值名。
  */
 #ifndef _SUKI_KERNEL_REGISTRY_H
 #define _SUKI_KERNEL_REGISTRY_H
@@ -28,7 +33,7 @@
 #include <stddef.h>
 
 #define SUKREG_MAGIC        0x53554B52   /* "SUKR" */
-#define SUKREG_VERSION      1
+#define SUKREG_VERSION      2
 #define SUKREG_HEADER_SIZE  64
 
 typedef struct __attribute__((packed)) {
@@ -40,7 +45,8 @@ typedef struct __attribute__((packed)) {
     uint64_t generation;
     uint64_t timestamp;
     uint32_t crc32;         /* 覆盖 [0..48) + body */
-    uint32_t reserved[3];   /* 补齐到 64 字节 */
+    uint64_t body_size;     /* v2：body 字节数（CRC 与解析边界用真实长度，避免被 FS 读回的尾部填充影响） */
+    uint32_t reserved;      /* 补齐到 64 字节 */
 } sukreg_header_t;
 
 #define SUKREG_TYPE_INT64   1

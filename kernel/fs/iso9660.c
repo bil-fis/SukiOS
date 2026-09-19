@@ -715,13 +715,15 @@ int IsoReadFile(const char *path, uint8_t *buf, uint32_t cap, uint32_t *out_n)
     }
     uint64_t total = 0;
     uint64_t nr    = 0;
-    uint8_t tmp[512];
+    /* 直接读入调用方缓冲。分块取较大值，保证每个 LBA 只读一次：
+     * 旧实现按 512 字节分块，>512 字节的文件会对同一块做二次读，
+     * 而 ATAPI 对同一 LBA 的重复读偶发返回全零，导致文件后半段被清零。 */
     while (total < cap) {
         uint32_t chunk = (uint32_t)(cap - total);
-        if (chunk > 512) {
-            chunk = 512;
+        if (chunk > 65536u) {
+            chunk = 65536u;
         }
-        int rc = iso_read(h, tmp, chunk, &nr);
+        int rc = iso_read(h, buf + total, chunk, &nr);
         if (rc < 0) {
             iso_close(h);
             return rc;
@@ -729,7 +731,6 @@ int IsoReadFile(const char *path, uint8_t *buf, uint32_t cap, uint32_t *out_n)
         if (nr == 0) {
             break;
         }
-        memcpy(buf + total, tmp, (uint32_t)nr);
         total += nr;
     }
     iso_close(h);

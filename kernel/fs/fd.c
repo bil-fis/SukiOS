@@ -998,7 +998,7 @@ suki_ssize_t fd_read_kern(struct task *t, int fd, void *kbuf, size_t count)
 /*
  * kern_fs_read_file —— 内核态同步读整个文件（仅 DISK 后端，经 FS_PORT 同步 RPC）。
  *
- * 用途：启动期由内核直接读取 /sys/configs 下的 *.reg 等小配置文件，不依赖用户态任务，
+ * 用途：启动期由内核直接读取 /sys/configs 下的 *.sre 等小配置文件，不依赖用户态任务，
  *       也不绑定当前任务的 fd 表（避免内核任务 fd 表未初始化导致的槽分配异常）。
  * 失败返回负 errno；成功返回 0 且 *out_n 为读取字节数。buffer 由调用方提供。
  */

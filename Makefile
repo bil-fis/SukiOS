@@ -893,9 +893,9 @@ $(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
 	@mkdir -p $(ISODIR_SINGLE)/SYS/CONFIGS $(ISODIR_SINGLE)/BIN \
 	         $(ISODIR_SINGLE)/FONTS $(ISODIR_SINGLE)/IMAGES $(ISODIR_SINGLE)/LIB
 	printf 'SukiOS single-ISO boot: kernel ISO9660 driver + Rock Ridge/Joliet.\n' > $(ISODIR_SINGLE)/README.TXT
-	cp configs/default/system.reg $(ISODIR_SINGLE)/SYS/CONFIGS/system.reg
-	cp configs/default/user.reg   $(ISODIR_SINGLE)/SYS/CONFIGS/user.reg
-	cp configs/default/services.reg $(ISODIR_SINGLE)/SYS/CONFIGS/services.reg
+	cp configs/default/system.sre $(ISODIR_SINGLE)/SYS/CONFIGS/system.sre
+	cp configs/default/user.sre   $(ISODIR_SINGLE)/SYS/CONFIGS/user.sre
+	cp configs/default/services.sre $(ISODIR_SINGLE)/SYS/CONFIGS/services.sre
 	-cp images/*.bmp $(ISODIR_SINGLE)/IMAGES/ 2>/dev/null || true
 	@for p in $(APP_PROGS); do \
 		up=$$(echo $$p | tr a-z A-Z); \
@@ -940,11 +940,11 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/m
 	mcopy -i $@ $(BUILD)/HELLO.TXT ::HELLO.TXT
 	mcopy -i $@ $(BUILD)/ROADMAP.TXT ::ROADMAP.TXT
 	mmd -i $@ ::SYS
-	# 系统配置（registry hive）：configs/default/*.reg -> ::SYS/CONFIGS/
+	# 系统配置（registry hive）：configs/default/*.sre -> ::SYS/CONFIGS/
 	mmd -i $@ ::SYS/CONFIGS 2>/dev/null || true
-	mcopy -i $@ configs/default/system.reg ::SYS/CONFIGS/system.reg
-	mcopy -i $@ configs/default/user.reg ::SYS/CONFIGS/user.reg
-	mcopy -i $@ configs/default/services.reg ::SYS/CONFIGS/services.reg
+	mcopy -i $@ configs/default/system.sre ::SYS/CONFIGS/system.sre
+	mcopy -i $@ configs/default/user.sre ::SYS/CONFIGS/user.sre
+	mcopy -i $@ configs/default/services.sre ::SYS/CONFIGS/services.sre
 	mmd -i $@ ::BIN
 	# 图片资源目录：把 images/ 下【全部】.bmp 放入 ::IMAGES/，供 BMP 加载器
 	# 诊断显示用。注意 .gitignore 排除了 CG*.bmp（避免误提交大二进制资源），

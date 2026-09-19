@@ -101,6 +101,20 @@ RUN_TIMEOUT         ?= 0
 # 重编，绝不会出现「一半单核对象 + 一半多核对象」的混链。
 CONFIG_H   := $(BUILD)/config.h
 
+# 构建配置器（Python，tools/kbuild_config.py）产物：
+#   build_config.h  -> 内核信息/版本 + CONFIG_* 能力/驱动开关（经 -include 注入）
+#   build_config.mk -> Make 变量（驱动开关 = y/n，用于按配置裁剪源文件）
+# 默认全量（所有开关 = y）；因此现有 make 指令仍然全量编译，行为不变。
+BUILDCFG_DIR  := $(BUILD)/config
+BUILDCFG_CONF := configs/build/kconfig.conf
+BUILDCFG_MK   := $(BUILDCFG_DIR)/build_config.mk
+BUILDCFG_H    := $(BUILDCFG_DIR)/build_config.h
+# 解析期即按最新 conf 生成 .h/.mk（生成器内容不变则不触碰时间戳）。必须发生在
+# C_SRCS 裁剪与本回合 CFLAGS 展开之前，否则 -include 只解析一次会读到旧配置。
+$(shell mkdir -p $(BUILDCFG_DIR))
+$(shell (command -v python3 >/dev/null 2>&1 && python3 tools/kbuild_config.py genconfig --quiet) >/dev/null 2>&1 || true)
+-include $(BUILDCFG_MK)
+
 # ---- 编译/链接选项 ----
 # 说明：手册 CFLAGS 原写 -mcmodel=kernel，但该模型要求内核位于顶部 2GB
 # (0xFFFFFFFF80000000+)，与红线 KERNEL_BASE=0xFFFF800000000000 冲突，
@@ -112,10 +126,11 @@ CFLAGS := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 -Wa,--noexecstac
           -mcmodel=large -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
           -fno-asynchronous-unwind-tables -fno-omit-frame-pointer \
           -MMD -MP -I include \
-          -include $(CONFIG_H)
+          -include $(CONFIG_H) \
+          -include $(BUILDCFG_H)
 
 ASFLAGS := -ffreestanding -mcmodel=large -fno-pic -fno-pie -MMD -MP -I include \
-           -include $(CONFIG_H)
+           -include $(CONFIG_H) -include $(BUILDCFG_H)
 
 # 注意（P0-8 KASLR）：--emit-relocs 只能用于【预链接】阶段（供 gen_relk.py
 # 抽取 R_X86_64_64）。最终 kernel.elf 绝不能保留 .rela.* 节——GRUB multiboot2
@@ -134,6 +149,15 @@ S_SRCS := boot/boot.S boot/multiboot2_header.S boot/pvh.S $(shell find kernel -n
 # 仅被 smp.c 的 #if CONFIG_SMP 分支引用，两者同步裁剪，链接必然自洽。
 ifneq ($(CONFIG_SMP),1)
 S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
+endif
+
+# 按构建配置裁剪驱动源：仅当某驱动被显式关闭(=n)时剔除其目录。
+# CONFIG_DRIVER_USB 来自 build_config.mk；若该文件缺失（首次构建/无 python），
+# 该变量为空 -> 不裁剪 -> 全量编译，保证现有 make 指令行为不变。
+ifneq ($(CONFIG_DRIVER_USB),y)
+ifneq ($(CONFIG_DRIVER_USB),)
+C_SRCS := $(filter-out $(shell find kernel/drivers/usb -name '*.c' 2>/dev/null),$(C_SRCS))
+endif
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
@@ -819,20 +843,43 @@ $(CONFIG_H): FORCE
 
 FORCE:
 
+# ---- 构建配置头/变量（Python 配置器生成）----
+# 依赖 conf/schema/tool：仅当它们变化时重生成；生成器内容不变则不触碰时间戳，
+# 避免无误全量重编。生成失败（无 python）时写最小兜底头（全量默认）。
+$(BUILDCFG_H): $(BUILDCFG_CONF) configs/build/kconfig.json tools/kbuild_config.py
+	@mkdir -p $(BUILDCFG_DIR)
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 tools/kbuild_config.py genconfig --quiet; \
+	elif command -v python >/dev/null 2>&1; then \
+		python tools/kbuild_config.py genconfig --quiet; \
+	else \
+		echo "  [kbuild_config] 未找到 python，使用兜底默认配置头"; \
+		printf '/* fallback */\n#ifndef _SUKI_BUILD_CONFIG_GEN_H\n#define _SUKI_BUILD_CONFIG_GEN_H\n#define KERNEL_NAME "SukiOS"\n#define KERNEL_VERSION "1.0.0"\n#define KERNEL_CODENAME "Hybrid"\n#define KERNEL_BUILD_INFO "SukiOS hybrid kernel"\n#define CONFIG_DRIVER_USB 1\n#endif\n' > $(BUILDCFG_H); \
+	fi
+
+# ---- 构建配置器目标（新增；不改变任何现有 make 目标）----
+.PHONY: config menuconfig defconfig listconfig
+config menuconfig:
+	@python3 tools/kbuild_config.py menuconfig
+defconfig:
+	@python3 tools/kbuild_config.py defconfig
+listconfig:
+	@python3 tools/kbuild_config.py listconfig
+
 # ---- 内核编译规则 ----
-# `| $(CONFIG_H)` 为 order-only 依赖：保证首次构建与配置变更时配置头先就位。
-$(BUILD)/%.S.o: %.S | $(CONFIG_H)
+# `| $(CONFIG_H) $(BUILDCFG_H)` 为 order-only 依赖：保证首次构建与配置变更时配置头先就位。
+$(BUILD)/%.S.o: %.S | $(CONFIG_H) $(BUILDCFG_H)
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
 # L5：栈金丝雀提供文件（__stack_chk_guard / __stack_chk_fail）必须以
 # -fno-stack-protector 编译——否则 __stack_chk_fail 自身被插桩后递归调用
 # 自己，且 guard 未初始化前插桩函数会误报栈破坏。故此处覆盖全局 CFLAGS。
-$(BUILD)/kernel/stack_canary.c.o: kernel/stack_canary.c | $(CONFIG_H)
+$(BUILD)/kernel/stack_canary.c.o: kernel/stack_canary.c | $(CONFIG_H) $(BUILDCFG_H)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fno-stack-protector -c $< -o $@
 
-$(BUILD)/%.c.o: %.c | $(CONFIG_H)
+$(BUILD)/%.c.o: %.c | $(CONFIG_H) $(BUILDCFG_H)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 

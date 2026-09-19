@@ -1,0 +1,35 @@
+{
+  "title": "SukiOS Kernel Configuration",
+  "note": "由 tools/kbuild_config.py 读取的构建配置 schema（类 Linux Kconfig）。默认全量（所有开关=on），故现有 make 指令仍全量编译。",
+  "sections": [
+    {
+      "name": "内核信息 (Kernel information)",
+      "options": [
+        {"id": "KERNEL_NAME",       "type": "string", "prompt": "内核名称",        "default": "SukiOS"},
+        {"id": "KERNEL_VERSION",    "type": "string", "prompt": "内核版本号",      "default": "1.0.0"},
+        {"id": "KERNEL_CODENAME",   "type": "string", "prompt": "内核代号",        "default": "Hybrid"},
+        {"id": "KERNEL_BUILD_INFO", "type": "string", "prompt": "内核信息串",      "default": "SukiOS hybrid kernel (xnu-like, x86_64)"}
+      ]
+    },
+    {
+      "name": "内核能力 (Kernel capabilities)",
+      "options": [
+        {"id": "CONFIG_CAP_KASLR",    "type": "bool", "prompt": "KASLR 地址空间随机化",     "default": true},
+        {"id": "CONFIG_CAP_PREEMPT",  "type": "bool", "prompt": "抢占式调度 (100Hz tick)",  "default": true},
+        {"id": "CONFIG_CAP_SMEP_SMAP","type": "bool", "prompt": "SMEP/SMAP/NXE 内存保护",   "default": true},
+        {"id": "CONFIG_CAP_DEBUGFS",  "type": "bool", "prompt": "内核调试设施 (gdbstub/diag)","default": true}
+      ]
+    },
+    {
+      "name": "设备驱动 (Device drivers)",
+      "options": [
+        {"id": "CONFIG_DRIVER_USB",   "type": "bool", "prompt": "USB 主机栈 (UHCI + Hub + HID 键鼠)", "default": true, "gate": "kernel/drivers/usb"},
+        {"id": "CONFIG_DRIVER_HDA",   "type": "bool", "prompt": "Intel HDA 音频",     "default": true},
+        {"id": "CONFIG_DRIVER_AHCI",  "type": "bool", "prompt": "AHCI SATA",          "default": true},
+        {"id": "CONFIG_DRIVER_ATA",   "type": "bool", "prompt": "ATA (IDE PIO) 磁盘", "default": true},
+        {"id": "CONFIG_DRIVER_E1000", "type": "bool", "prompt": "Intel E1000 网卡",   "default": true},
+        {"id": "CONFIG_DRIVER_PS2",   "type": "bool", "prompt": "PS/2 键盘 + 鼠标",   "default": true}
+      ]
+    }
+  ]
+}

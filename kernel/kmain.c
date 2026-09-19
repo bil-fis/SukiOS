@@ -30,6 +30,7 @@
 #include <kernel/cdrom.h>       /* CdromInit：ATAPI 光驱探测 */
 #include <kernel/iso9660.h>     /* IsoMount/IsoIsMounted/IsoReadFile：内核 ISO9660 */
 #include <kernel/usb.h>         /* usb_init：USB 主机栈（UHCI + Hub + HID 键鼠） */
+#include <kernel/kbuild_info.h> /* KERNEL_ 与 CONFIG_DRIVER_ 系列宏的兜底默认 */
 #include <kernel/posix.h>       /* posix_init()：完整 POSIX 系统调用层 */
 #include <kernel/rtc.h>         /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
 #include <kernel/smp.h>
@@ -294,6 +295,10 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     console_init();
     draw_boot_logo();
 
+    /* 内核信息/版本（来自构建配置器生成的 build/config/build_config.h） */
+    kprintf("[boot] %s %s '%s' — %s\n", KERNEL_NAME, KERNEL_VERSION,
+            KERNEL_CODENAME, KERNEL_BUILD_INFO);
+
     /* Unicode/中文显示自测：含中文与 U+2713 勾号（3 字节 UTF-8） */
     kprintf("[console] UTF-8 test: 中文显示正常 ✓ 操作系统启动成功\n");
     kprintf("========================================\n");
@@ -386,8 +391,11 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
 
     /* ---- 阶段五·补：USB 主机栈（UHCI 主机控制器 + Hub 类 + HID 键鼠）。
      * 即插即用：创建「USB 主机服务」内核任务周期性轮询（进程上下文，
-     * 可安全使用复位/枚举延时），根端口/Hub 端口变化触发自动枚举。 */
+     * 可安全使用复位/枚举延时），根端口/Hub 端口变化触发自动枚举。
+     * 由构建配置器 CONFIG_DRIVER_USB 门控（默认开，全量编译）。 */
+#if CONFIG_DRIVER_USB
     usb_init();
+#endif
 
     /* ---- 阶段六：syscall + Ring3 ---- */
     syscall_init();

@@ -218,8 +218,10 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 ### 4.2 构建命令
 
 ```bash
-# 0) 首次克隆后拉取第三方子模块（lwip / freetype / mbedtls / curl；缺失会构建失败）
+# 0) 首次克隆后拉取第三方子模块（lwip / freetype / mbedtls / curl 等，缺失会构建失败）
 git submodule update --init --recursive
+#    注意：WPE WebKit 体积 GB 级，建议按需单独浅拉取（见 §5.1）：
+#    git submodule update --init --depth 1 lib/wpewebkit-2.54
 
 # 1) 清理（会删除 build/ 下全部产物，含 disk.img；用 make clean，勿用 rm -rf）
 make clean
@@ -343,7 +345,9 @@ SukiOS/
 │   ├── freetype-2.14.3/   # FreeType 字体光栅化引擎（FTL）@ tag VER-2-14-3，fontsrv 用
 │   ├── mbedtls/           # mbedTLS 3.6.7（LTS，Apache-2.0）@ tag mbedtls-3.6.7，TLS 后端（已接入）
 │   ├── curl/              # libcurl 8.22.0（curl 许可）@ tag curl-8_22_0，HTTP/HTTPS/FTP/TFTP（已集成，见 §2.12）
-│   └── zlib/              # zlib 1.3.1（zlib 许可）@ tag v1.3.1，用户态压缩（libcurl 用）
+│   ├── zlib/              # zlib 1.3.1（zlib 许可）@ tag v1.3.1，用户态压缩（libcurl 用）
+│   ├── lua-5.4.9/         # Lua 5.4.9（MIT）@ tag v5.4.9，脚本语言运行时（submodule）
+│   └── wpewebkit-2.54/    # WPE WebKit（WebKit 官方工程）@ branch webkitglib/2.54（submodule，GB 级体积）
 ├── compapps/              # 第三方【程序/工具】——以 git submodule 引入（程序文件放 compapps/）
 ├── include/               # 内核 / 用户态公共头
 ├── grub/                  # grub.cfg（ISO 引导配置）
@@ -379,6 +383,8 @@ SukiOS 引入外部第三方项目**一律使用 `git submodule`**（不再把�
 | `lib/mbedtls` | `Mbed-TLS/mbedtls` | `mbedtls-3.6.7`（3.6 LTS） | HTTPS/TLS 后端（**已接入** libcurl，见 §2.12） |
 | `lib/curl` | `curl/curl` | `curl-8_22_0` | HTTP/HTTPS 客户端库 libcurl（**已集成**，见 §2.12） |
 | `lib/zlib` | `madler/zlib` | `v1.3.1` | 用户态压缩库（libcurl 的 gzip/deflate Content-Encoding） |
+| `lib/lua-5.4.9` | `lua/lua` | `v5.4.9` | Lua 5.4 脚本语言运行时（MIT） |
+| `lib/wpewebkit-2.54` | `WebKit/WebKit` | `webkitglib/2.54` | WPE WebKit 浏览器引擎（WebKit 官方工程；**体积 GB 级，按需浅拉取**） |
 
 使用方式：
 
@@ -502,6 +508,8 @@ tail -8 /tmp/sukios.log
 | FreeType（submodule） | `lib/freetype-2.14.3/` | FTL 或 GPLv2（双许可，FreeType Project） |
 | mbedTLS（submodule） | `lib/mbedtls/` | Apache-2.0 或 GPL-2.0-or-later（双许可，Arm / TrustedFirmware） |
 | libcurl（submodule） | `lib/curl/` | curl 许可（MIT/X 风格，Daniel Stenberg 等） |
+| Lua（submodule） | `lib/lua-5.4.9/` | MIT（Lua.org / PUC-Rio） |
+| WPE WebKit（submodule） | `lib/wpewebkit-2.54/` | LGPL-2.1-or-later / BSD（WebKit 项目与贡献者） |
 | Rust 工具链（rustup / rustc / cargo） | 本地安装（不随仓库分发） | MIT OR Apache-2.0（Rust Project Developers） |
 
 ---

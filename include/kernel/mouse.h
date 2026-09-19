@@ -41,4 +41,10 @@ bool mouse_init(void);
  * 供 syscall 层 sys_mouse_read 调用。 */
 bool mouse_get_packet(mouse_packet_t *out);
 
+/* 向鼠标包拼装状态机注入一个原始 PS/2 字节（供 USB HID 鼠标合成 3/4 字节包）。 */
+void mouse_feed_byte(uint8_t b);
+
+/* 当前鼠标包长度（3=标准，4=滚轮模式）。USB HID 合成包时须与之匹配。 */
+uint8_t mouse_packet_len(void);
+
 #endif /* _SUKI_KERNEL_MOUSE_H */

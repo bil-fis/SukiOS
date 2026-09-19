@@ -191,6 +191,12 @@ void mouse_feed_byte(uint8_t b)
     }
 }
 
+/* 当前包长度（3=标准，4=滚轮模式）；USB HID 合成 PS/2 包时据此补齐。 */
+uint8_t mouse_packet_len(void)
+{
+    return (uint8_t)g_pkt_len;
+}
+
 /* 键盘与鼠标统一由 kbd_irq_handler(IRQ1 向量) 按 STS_AUX 分流处理，详见 keyboard.c。
  * 鼠标 IRQ(GSI12) 在 mouse_init 中经 ioapic_route(12, IRQ1,...) 路由到同一向量，
  * 故此处不再注册独立 IRQ12 handler，彻底避免两个 handler 争抢读 0x60 导致的字节吞没。 */

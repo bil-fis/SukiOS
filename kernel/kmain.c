@@ -29,6 +29,7 @@
 #include <kernel/vfs.h>        /* kern_fs_read_file：内核态同步读文件 */
 #include <kernel/cdrom.h>       /* CdromInit：ATAPI 光驱探测 */
 #include <kernel/iso9660.h>     /* IsoMount/IsoIsMounted/IsoReadFile：内核 ISO9660 */
+#include <kernel/usb.h>         /* usb_init：USB 主机栈（UHCI + Hub + HID 键鼠） */
 #include <kernel/posix.h>       /* posix_init()：完整 POSIX 系统调用层 */
 #include <kernel/rtc.h>         /* rtc_time_init()：CLOCK_REALTIME 墙上时间基准 */
 #include <kernel/smp.h>
@@ -382,6 +383,11 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     extern bool mouse_init(void);
     mouse_init();    /* 经 I/O APIC GSI12 -> IRQ12 */
     interrupts_enable();
+
+    /* ---- 阶段五·补：USB 主机栈（UHCI 主机控制器 + Hub 类 + HID 键鼠）。
+     * 即插即用：创建「USB 主机服务」内核任务周期性轮询（进程上下文，
+     * 可安全使用复位/枚举延时），根端口/Hub 端口变化触发自动枚举。 */
+    usb_init();
 
     /* ---- 阶段六：syscall + Ring3 ---- */
     syscall_init();

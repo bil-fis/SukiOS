@@ -20,4 +20,7 @@ char keyboard_getchar(void);
 /* 取一个原始扫描码；无数据返回 -1（供 sys_input_read / INPUT_SERVER） */
 int keyboard_get_scancode(void);
 
+/* 向键盘输入环形缓冲注入一个原始 PS/2 set-1 扫描码（供 USB HID 键盘转译注入）。 */
+void kbd_feed_byte(uint8_t sc);
+
 #endif /* _SUKI_KERNEL_KEYBOARD_H */

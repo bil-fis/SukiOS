@@ -132,13 +132,16 @@ def WriteIfChanged(path, content):
     return True
 
 
-def GenConfig(schema, vals, quiet):
-    h = WriteIfChanged(OUT_H, RenderHeader(schema, vals))
-    m = WriteIfChanged(OUT_MK, RenderMk(schema, vals))
+def GenConfig(schema, vals, quiet, out_dir=None):
+    out_dir = out_dir or OUT_DIR
+    out_h = os.path.join(out_dir, "build_config.h")
+    out_mk = os.path.join(out_dir, "build_config.mk")
+    h = WriteIfChanged(out_h, RenderHeader(schema, vals))
+    m = WriteIfChanged(out_mk, RenderMk(schema, vals))
     if not quiet:
         print("已生成 %s%s 与 %s%s" %
-              (OUT_H, " (更新)" if h else " (无变化)",
-               OUT_MK, " (更新)" if m else " (无变化)"))
+              (out_h, " (更新)" if h else " (无变化)",
+               out_mk, " (更新)" if m else " (无变化)"))
     return h or m
 
 
@@ -229,7 +232,9 @@ def Main():
 
     if cmd == "genconfig":
         quiet = "--quiet" in args
-        GenConfig(schema, vals, quiet)
+        outdir = args[args.index("--outdir") + 1] if "--outdir" in args and \
+            args.index("--outdir") + 1 < len(args) else None
+        GenConfig(schema, vals, quiet, outdir)
         return
     if cmd in ("menuconfig", "config"):
         MenuConfig(schema, vals)

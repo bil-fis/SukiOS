@@ -101,18 +101,20 @@ RUN_TIMEOUT         ?= 0
 # 重编，绝不会出现「一半单核对象 + 一半多核对象」的混链。
 CONFIG_H   := $(BUILD)/config.h
 
-# 构建配置器（Python，tools/kbuild_config.py）产物：
-#   build_config.h  -> 内核信息/版本 + CONFIG_* 能力/驱动开关（经 -include 注入）
-#   build_config.mk -> Make 变量（驱动开关 = y/n，用于按配置裁剪源文件）
-# 默认全量（所有开关 = y）；因此现有 make 指令仍然全量编译，行为不变。
+# 构建配置器（Python，tools/kbuild_config.py）：
+#   WITH_CFG=0（默认，所有现有目标）-> 永远【全量】编译，忽略配置文件里的驱动开关。
+#   WITH_CFG=1（仅 *-with-cfg 目标）-> 按 configs/build/kconfig.conf 裁剪驱动/能力。
+# 生成物：build_config.h（内核信息/版本 + CONFIG_*，经 -include 注入每个内核 TU）
+#         与 build_config.mk（Make 变量，用于源裁剪）。
+WITH_CFG      ?= 0
 BUILDCFG_DIR  := $(BUILD)/config
 BUILDCFG_CONF := configs/build/kconfig.conf
 BUILDCFG_MK   := $(BUILDCFG_DIR)/build_config.mk
 BUILDCFG_H    := $(BUILDCFG_DIR)/build_config.h
-# 解析期即按最新 conf 生成 .h/.mk（生成器内容不变则不触碰时间戳）。必须发生在
-# C_SRCS 裁剪与本回合 CFLAGS 展开之前，否则 -include 只解析一次会读到旧配置。
+# 解析期即按最新 conf 生成 .h/.mk（内容不变则不触碰时间戳）。必须在 C_SRCS 裁剪与
+# 本回合 CFLAGS 展开之前，否则 -include 只解析一次会读到旧配置。
 $(shell mkdir -p $(BUILDCFG_DIR))
-$(shell (command -v python3 >/dev/null 2>&1 && python3 tools/kbuild_config.py genconfig --quiet) >/dev/null 2>&1 || true)
+$(shell (command -v python3 >/dev/null 2>&1 && python3 tools/kbuild_config.py genconfig --quiet --outdir $(BUILDCFG_DIR)) >/dev/null 2>&1 || true)
 -include $(BUILDCFG_MK)
 
 # ---- 编译/链接选项 ----
@@ -127,10 +129,12 @@ CFLAGS := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 -Wa,--noexecstac
           -fno-asynchronous-unwind-tables -fno-omit-frame-pointer \
           -MMD -MP -I include \
           -include $(CONFIG_H) \
-          -include $(BUILDCFG_H)
+          -include $(BUILDCFG_H) \
+          -DSUKI_WITH_CFG=$(WITH_CFG)
 
 ASFLAGS := -ffreestanding -mcmodel=large -fno-pic -fno-pie -MMD -MP -I include \
-           -include $(CONFIG_H) -include $(BUILDCFG_H)
+           -include $(CONFIG_H) -include $(BUILDCFG_H) \
+           -DSUKI_WITH_CFG=$(WITH_CFG)
 
 # 注意（P0-8 KASLR）：--emit-relocs 只能用于【预链接】阶段（供 gen_relk.py
 # 抽取 R_X86_64_64）。最终 kernel.elf 绝不能保留 .rela.* 节——GRUB multiboot2
@@ -151,12 +155,14 @@ ifneq ($(CONFIG_SMP),1)
 S_SRCS := $(filter-out kernel/arch/x86_64/ap_boot.S,$(S_SRCS))
 endif
 
-# 按构建配置裁剪驱动源：仅当某驱动被显式关闭(=n)时剔除其目录。
-# CONFIG_DRIVER_USB 来自 build_config.mk；若该文件缺失（首次构建/无 python），
-# 该变量为空 -> 不裁剪 -> 全量编译，保证现有 make 指令行为不变。
+# 按构建配置裁剪驱动源：**仅在 WITH_CFG=1（*-with-cfg 目标）时**生效。
+# 现有目标（iso/disk/run/...，WITH_CFG=0）永不裁剪 -> 永远全量编译。
+# 仅当某驱动被显式关闭(=n)时剔除其目录；变量为空（无 mk/首次构建）也不裁剪。
+ifeq ($(WITH_CFG),1)
 ifneq ($(CONFIG_DRIVER_USB),y)
 ifneq ($(CONFIG_DRIVER_USB),)
 C_SRCS := $(filter-out $(shell find kernel/drivers/usb -name '*.c' 2>/dev/null),$(C_SRCS))
+endif
 endif
 endif
 
@@ -756,10 +762,14 @@ $(BUILD)/user/curl_test.elf: $(BUILD)/user/curl_test.c.o $(USER_LIB_OBJS) $(CURL
 # $(BUILD)/user/fs_server.elf（由通用 %.elf 规则生成）。符号用 $(basename $*)
 # 剥离 .ssvc 后缀，得到 user_fs_server_start / user_fs_server_end，与 kmain.c
 # 中硬编码的引用保持一致。
+# 符号前缀按输入路径动态推导（objcopy -I binary 的符号为
+# _binary_<path，将 / . - 皆替换为 _>_start/end）。这样 BUILD 可被覆盖
+# （例如 *-with-cfg 使用 build-cfg/）而符号名依旧正确。
+_blob_pfx = _binary_$(subst /,_,$(subst .,_,$(subst -,_,$<)))
 $(BUILD)/user/%.ssvc.blob.o: $(BUILD)/user/%.elf
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-		--redefine-sym _binary_build_user_$*_elf_start=user_$(basename $*)_start \
-		--redefine-sym _binary_build_user_$*_elf_end=user_$(basename $*)_end \
+		--redefine-sym $(_blob_pfx)_start=user_$(basename $*)_start \
+		--redefine-sym $(_blob_pfx)_end=user_$(basename $*)_end \
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
 		$< $@
 	# objcopy -I binary 会丢掉 .note.GNU-stack，导致最终内核 ELF 的
@@ -774,9 +784,9 @@ $(RUST_BLOB): $(RUST_BIN)
 	@mkdir -p $(dir $@)
 	cp $(RUST_BIN) $(BUILD)/user/rusthello.bin
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-		--redefine-sym _binary_build_user_rusthello_bin_start=_binary_rusthello_start \
-		--redefine-sym _binary_build_user_rusthello_bin_end=_binary_rusthello_end \
-		--redefine-sym _binary_build_user_rusthello_bin_size=_binary_rusthello_size \
+		--redefine-sym _binary_$(subst /,_,$(subst .,_,$(subst -,_,$(BUILD)/user/rusthello.bin)))_start=_binary_rusthello_start \
+		--redefine-sym _binary_$(subst /,_,$(subst .,_,$(subst -,_,$(BUILD)/user/rusthello.bin)))_end=_binary_rusthello_end \
+		--redefine-sym _binary_$(subst /,_,$(subst .,_,$(subst -,_,$(BUILD)/user/rusthello.bin)))_size=_binary_rusthello_size \
 		$(BUILD)/user/rusthello.bin $@
 	objcopy --add-section .note.GNU-stack=/dev/null $@ $@.nostack && mv $@.nostack $@
 endif
@@ -849,9 +859,9 @@ FORCE:
 $(BUILDCFG_H): $(BUILDCFG_CONF) configs/build/kconfig.json tools/kbuild_config.py
 	@mkdir -p $(BUILDCFG_DIR)
 	@if command -v python3 >/dev/null 2>&1; then \
-		python3 tools/kbuild_config.py genconfig --quiet; \
+		python3 tools/kbuild_config.py genconfig --quiet --outdir $(BUILDCFG_DIR); \
 	elif command -v python >/dev/null 2>&1; then \
-		python tools/kbuild_config.py genconfig --quiet; \
+		python tools/kbuild_config.py genconfig --quiet --outdir $(BUILDCFG_DIR); \
 	else \
 		echo "  [kbuild_config] 未找到 python，使用兜底默认配置头"; \
 		printf '/* fallback */\n#ifndef _SUKI_BUILD_CONFIG_GEN_H\n#define _SUKI_BUILD_CONFIG_GEN_H\n#define KERNEL_NAME "SukiOS"\n#define KERNEL_VERSION "1.0.0"\n#define KERNEL_CODENAME "Hybrid"\n#define KERNEL_BUILD_INFO "SukiOS hybrid kernel"\n#define CONFIG_DRIVER_USB 1\n#endif\n' > $(BUILDCFG_H); \
@@ -865,6 +875,24 @@ defconfig:
 	@python3 tools/kbuild_config.py defconfig
 listconfig:
 	@python3 tools/kbuild_config.py listconfig
+
+# ---- 使用配置文件的构建/运行目标（新增）----
+# 现有目标（iso/disk/run/...）一律【全量】编译、忽略配置文件的驱动开关；
+# 只有下面这些 *-with-cfg 目标会读取 configs/build/kconfig.conf 并据此裁剪。
+# 做法：子 make 传 WITH_CFG=1 + 独立构建目录 build/cfg/（已被 .gitignore 覆盖），
+# 与全量对象互不干扰。
+CFG_BUILD   := build/cfg
+CFG_SUBMAKE := $(MAKE) WITH_CFG=1 BUILD=$(CFG_BUILD)
+
+.PHONY: iso-with-cfg disk-with-cfg run-with-cfg run-with-cfg-headless
+iso-with-cfg:
+	@$(CFG_SUBMAKE) iso-single
+disk-with-cfg:
+	@$(CFG_SUBMAKE) disk
+run-with-cfg:
+	@$(CFG_SUBMAKE) run
+run-with-cfg-headless:
+	@$(CFG_SUBMAKE) run-headless
 
 # ---- 内核编译规则 ----
 # `| $(CONFIG_H) $(BUILDCFG_H)` 为 order-only 依赖：保证首次构建与配置变更时配置头先就位。

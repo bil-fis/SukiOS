@@ -59,4 +59,24 @@
 #define CONFIG_DRIVER_PS2 1
 #endif
 
+/*
+ * 全量构建（默认；SUKI_WITH_CFG != 1）：强制所有驱动为开，忽略配置文件里的
+ * 驱动开关。只有 WITH_CFG=1 的 *-with-cfg 目标才会按生成头里的 CONFIG_DRIVER_*
+ * 裁剪（配合 Makefile 的源目录过滤）。
+ */
+#if !defined(SUKI_WITH_CFG) || (SUKI_WITH_CFG == 0)
+#undef  CONFIG_DRIVER_USB
+#define CONFIG_DRIVER_USB 1
+#undef  CONFIG_DRIVER_HDA
+#define CONFIG_DRIVER_HDA 1
+#undef  CONFIG_DRIVER_AHCI
+#define CONFIG_DRIVER_AHCI 1
+#undef  CONFIG_DRIVER_ATA
+#define CONFIG_DRIVER_ATA 1
+#undef  CONFIG_DRIVER_E1000
+#define CONFIG_DRIVER_E1000 1
+#undef  CONFIG_DRIVER_PS2
+#define CONFIG_DRIVER_PS2 1
+#endif
+
 #endif /* _SUKI_KERNEL_KBUILD_INFO_H */

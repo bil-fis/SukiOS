@@ -113,11 +113,15 @@ void SukiFillRect(suki_window_t *w, int x, int y, uint32_t ww, uint32_t hh, uint
     if (!w) return;
     int x0 = x < 0 ? 0 : x;
     int y0 = y < 0 ? 0 : y;
-    int x1 = (int)(x + ww) > (int)w->w ? (int)w->w : (int)(x + ww);
-    int y1 = (int)(y + hh) > (int)w->h ? (int)w->h : (int)(y + hh);
-    for (int j = y0; j < y1; j++)
-        for (int i = x0; i < x1; i++)
-            ((uint32_t *)w->buffer)[j * w->w + i] = rgb;
+    int x1 = (int)(x + (int)ww) > (int)w->w ? (int)w->w : (int)(x + (int)ww);
+    int y1 = (int)(y + (int)hh) > (int)w->h ? (int)w->h : (int)(y + (int)hh);
+    if (x1 <= x0 || y1 <= y0) return;
+    uint32_t n = (uint32_t)(x1 - x0);
+    /* 逐行紧密填充：边界只夹取一次（原实现每像素判两次边界）。 */
+    for (int j = y0; j < y1; j++) {
+        uint32_t *row = (uint32_t *)w->buffer + (uint64_t)j * w->w + (uint32_t)x0;
+        for (uint32_t i = 0; i < n; i++) row[i] = rgb;
+    }
 }
 
 void SukiDrawLine(suki_window_t *w, int x0, int y0, int x1, int y1, uint32_t rgb)
@@ -142,10 +146,19 @@ void SukiDrawText(suki_window_t *w, int x, int y, const char *text, uint32_t rgb
         unsigned char c = (unsigned char)*p;
         if (c < 0x20 || c > 0x7E) c = '?';
         const uint8_t *g = font8x8_basic[c];
-        for (int row = 0; row < 8; row++)
-            for (int col = 0; col < 8; col++)
-                if (g[row] & (1u << col))
-                    SukiSetPixel(w, cx + col, y + row, rgb);
+        /* 逐行直写离屏缓冲（去 SukiSetPixel 每像素函数调用与边界判断）。 */
+        for (int row = 0; row < 8; row++) {
+            int py = y + row;
+            if (py < 0 || (uint32_t)py >= w->h) continue;
+            uint8_t bits = g[row];
+            if (!bits) continue;
+            uint32_t *line = (uint32_t *)w->buffer + (uint64_t)py * w->w;
+            for (int col = 0; col < 8; col++) {
+                int px = cx + col;
+                if (px < 0 || (uint32_t)px >= w->w) continue;
+                if (bits & (1u << col)) line[px] = rgb;
+            }
+        }
         cx += 8;
     }
 }

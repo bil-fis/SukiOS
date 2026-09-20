@@ -75,20 +75,23 @@ static inline void fb_px(uint32_t x, uint32_t y, uint32_t rgb)
 
 static void fill_rect_fb(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
 {
-    for (uint32_t j = 0; j < h; j++)
-        for (uint32_t i = 0; i < w; i++) {
-            uint32_t px = x + i, py = y + j;
-            if (px >= g_fb_width || py >= g_fb_height) continue;
-            g_canvas[py * g_stride + px] = rgb;
-        }
+    if (x >= g_fb_width) return;
+    if (x + w > g_fb_width) w = g_fb_width - x;
+    for (uint32_t j = 0; j < h; j++) {
+        uint32_t py = y + j;
+        if (py >= g_fb_height) break;
+        uint32_t *row = g_canvas + (uint64_t)py * g_stride + x;
+        for (uint32_t i = 0; i < w; i++) row[i] = rgb;
+    }
 }
 
 /* 仅绘制纯色背景 + 顶部装饰条（不渲染任何字符 / 终端窗口） */
 static void draw_desktop(void)
 {
-    for (uint32_t y = 0; y < g_fb_height; y++)
-        for (uint32_t x = 0; x < g_fb_width; x++)
-            g_desk[y * g_stride + x] = COL_DESKTOP;
+    for (uint32_t y = 0; y < g_fb_height; y++) {
+        uint32_t *row = g_desk + (uint64_t)y * g_stride;
+        for (uint32_t x = 0; x < g_fb_width; x++) row[x] = COL_DESKTOP;
+    }
     fill_rect_fb(0, 0, g_fb_width, TITLE_H, COL_BAR);
 }
 
@@ -293,15 +296,41 @@ static int32_t g_cur_x = 0;
 static int32_t g_cur_y = 0;
 static uint32_t g_cur_buttons = 0;
 
-static void draw_cursor_on_fb(void)
+/* 直写真实帧缓冲的单像素（光标只画到显存，绝不被写入离屏层） */
+static inline void fb_put_px(int32_t x, int32_t y, uint32_t rgb)
+{
+    if (x < 0 || y < 0 || (uint32_t)x >= g_fb_width || (uint32_t)y >= g_fb_height) return;
+    ((uint32_t *)g_fb)[(uint64_t)y * g_stride + (uint32_t)x] = rgb;
+}
+
+/* 在指定位置把光标画到真实帧缓冲 */
+static void draw_cursor_at(int32_t ox, int32_t oy)
+{
+    uint32_t col = (g_cur_buttons & 1) ? 0x00FF3030 : 0x00FFFFFF;
+    for (int32_t j = 0; j < MOUSE_CURSOR_H; j++)
+        for (int32_t i = 0; i < MOUSE_CURSOR_W; i++)
+            if (g_cursor_mask[j][i]) fb_put_px(ox + i, oy + j, col);
+}
+
+/* 从离屏层（始终不含光标）恢复一行到显存——用于擦除旧光标 */
+static void fb_restore_row_from_desk(int32_t y, int32_t x, int32_t wdt)
+{
+    if (y < 0 || (uint32_t)y >= g_fb_height) return;
+    if (x < 0) { wdt += x; x = 0; }
+    if (wdt <= 0 || x >= (int32_t)g_fb_width) return;
+    if (x + wdt > (int32_t)g_fb_width) wdt = (int32_t)g_fb_width - x;
+    uint32_t *d = (uint32_t *)g_fb + (uint64_t)y * g_stride + (uint32_t)x;
+    const uint32_t *s = g_desk + (uint64_t)y * g_stride + (uint32_t)x;
+    memcpy(d, s, (size_t)wdt * 4);
+}
+
+/* 鼠标仅移动：擦旧光标 + 画新光标。只触碰两个 ~12x18 小矩形，
+ * 取代“每次移动全屏重绘 + 3.6MB 整屏拷贝”（响应速度关键）。 */
+static void cursor_move_only(int32_t oldx, int32_t oldy)
 {
     for (int32_t j = 0; j < MOUSE_CURSOR_H; j++)
-        for (int32_t i = 0; i < MOUSE_CURSOR_W; i++) {
-            int32_t x = g_cur_x + i, y = g_cur_y + j;
-            if (x < 0 || y < 0 || (uint32_t)x >= g_fb_width || (uint32_t)y >= g_fb_height) continue;
-            if (g_cursor_mask[j][i])
-                g_canvas[y * g_stride + x] = (g_cur_buttons & 1) ? 0x00FF3030 : 0x00FFFFFF;
-        }
+        fb_restore_row_from_desk(oldy + j, oldx, MOUSE_CURSOR_W);
+    draw_cursor_at(g_cur_x, g_cur_y);
 }
 
 static void composite(void)
@@ -322,9 +351,12 @@ static void composite(void)
         int32_t cy0 = y0 < 0 ? 0 : y0;
         int32_t cx1 = (x0 + (int32_t)ww > (int32_t)g_fb_width) ? (int32_t)g_fb_width : x0 + (int32_t)ww;
         int32_t cy1 = (y0 + (int32_t)hh > (int32_t)g_fb_height) ? (int32_t)g_fb_height : y0 + (int32_t)hh;
-        for (int32_t y = cy0; y < cy1; y++)
-            for (int32_t x = cx0; x < cx1; x++)
-                g_canvas[y * g_stride + x] = w->pixels[(y - y0) * ww + (x - x0)];
+        /* 逐【行】memcpy：源/目标 stride 不同时逐行拷贝（原为逐像素赋值） */
+        for (int32_t y = cy0; y < cy1; y++) {
+            const uint32_t *s = w->pixels + (uint64_t)(y - y0) * ww + (uint32_t)(cx0 - x0);
+            uint32_t *d = g_canvas + (uint64_t)y * g_stride + (uint32_t)cx0;
+            memcpy(d, s, (size_t)(cx1 - cx0) * 4);
+        }
         /* 窗口装饰：边框 + 标题栏（纯几何，无文字）+ 关闭按钮 */
         uint32_t border = 2;
         fill_rect_fb((uint32_t)x0, (uint32_t)y0, ww, border, COL_ACCENT);
@@ -353,10 +385,10 @@ static void composite(void)
             }
         }
     }
-    /* 光标（最上层） */
-    draw_cursor_on_fb();
-    /* 提交完整帧到帧缓冲（单次拷贝，杜绝逐像素写屏撕裂） */
+    /* 提交完整帧到帧缓冲（离屏层 g_desk 始终【不含】光标） */
     memcpy((void *)g_fb, g_desk, (size_t)g_fb_height * g_stride * sizeof(uint32_t));
+    /* 光标（最上层，只画到显存；后续鼠标移动可据此做局部擦除） */
+    draw_cursor_at(g_cur_x, g_cur_y);
 }
 
 int main(void)
@@ -390,6 +422,9 @@ int main(void)
     /* 4) 通知内核：显示服务已接管帧缓冲（纯合成器，不再渲染字符） */
     suki_syscall1(SYS_DISPLAY_READY, 0);
 
+    /* 4b) 立即合成并提交首帧（否则开局显存仍是上一阶段残留） */
+    composite();
+
     /* 5) 消息循环：同时轮询 DISPLAY_PORT（鼠标/键盘）与 WM_PORT（窗口管理） */
     static uint8_t msgbuf[512];
     typedef struct { mach_msg_header_t h; int32_t x; int32_t y; uint8_t buttons; int8_t wheel; uint8_t _pad[3]; } mouse_event_msg_t;
@@ -402,6 +437,7 @@ int main(void)
                 h->msgh_id == MOUSE_MSG_BUTTON ||
                 h->msgh_id == MOUSE_MSG_WHEEL) {
                 mouse_event_msg_t *m = (mouse_event_msg_t *)msgbuf;
+                int32_t oldx = g_cur_x, oldy = g_cur_y;   /* 供 MOVE 脏矩形擦除 */
                 g_cur_x = m->x; g_cur_y = m->y;
                 if (h->msgh_id == MOUSE_MSG_BUTTON) g_cur_buttons = m->buttons;
 
@@ -480,7 +516,11 @@ int main(void)
                         ev.u.mouse.buttons = g_cur_buttons;
                         wm_forward_event(hit, &ev);
                     }
-                    composite();
+                    if (h->msgh_id == MOUSE_MSG_MOVE) {
+                        cursor_move_only(oldx, oldy);   /* 仅重画光标 */
+                    } else {
+                        composite();
+                    }
                 }
             } else if (h->msgh_id == KEY_MSG_DOWN || h->msgh_id == KEY_MSG_UP) {
                 /* 键盘事件：转发给当前焦点窗口（由 WM 统一管束输入焦点） */

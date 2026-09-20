@@ -14,6 +14,7 @@
 #include <kernel/utf8.h>
 #include <kernel/display_cfg.h>   /* g_display.video_mode：配置文件开关 */
 #include <kernel/serial.h>
+#include <kernel/string.h>         /* memcpy：行批量拷贝（滚屏/字形） */
 #include <kernel/pci.h>            /* bga_locate_and_set 使用 PCI 配置访问 */
 
 #define CON_SCALE  2   /* 字形放大倍数：8x8 -> 16x16 */
@@ -159,8 +160,12 @@ void fb_put_pixel(uint32_t x, uint32_t y, uint32_t color)
 
 void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color)
 {
-    if (!g_fb.ready) {
+    if (!g_fb.ready || x >= g_fb.width) {
         return;
+    }
+    /* 边界一次性夹取：行内不再逐像素判断（原实现每像素一次边界比较）。 */
+    if (x + w > g_fb.width) {
+        w = g_fb.width - x;
     }
     for (uint32_t j = 0; j < h; j++) {
         uint32_t yy = y + j;
@@ -168,11 +173,8 @@ void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color
             break;
         }
         volatile uint32_t *row =
-            (volatile uint32_t *)(g_fb.base + (uint64_t)yy * g_fb.pitch + (uint64_t)x * 4);
+            (volatile uint32_t *)(g_fb.base + (uint64_t)yy * g_fb.pitch) + x;
         for (uint32_t i = 0; i < w; i++) {
-            if (x + i >= g_fb.width) {
-                break;
-            }
             row[i] = color;
         }
     }
@@ -190,15 +192,26 @@ void fb_draw_char(uint32_t px, uint32_t py, uint32_t cp, uint32_t fg, uint32_t b
     }
     glyph_t g;
     fb_get_glyph(cp, &g);
-    /* 清除字符单元背景（按字形尺寸 * scale） */
-    fb_fill_rect(px, py, g.w * g.scale, g.h * g.scale, bg);
-    for (int row = 0; row < g.h; row++) {
-        const uint8_t *line = g.bits + row * g.stride;
-        for (int col = 0; col < g.w; col++) {
-            uint8_t b = line[col >> 3];
-            if (b & (1u << (col & 7))) {
-                fb_fill_rect(px + col * g.scale, py + row * g.scale,
-                             g.scale, g.scale, fg);
+    uint32_t cw = (uint32_t)g.w * g.scale;
+    uint32_t ch = (uint32_t)g.h * g.scale;
+    /* 背景一次填充整格 */
+    fb_fill_rect(px, py, cw, ch, bg);
+    if (px >= g_fb.width || py >= g_fb.height) {
+        return;
+    }
+    if (px + cw > g_fb.width)  cw = g_fb.width  - px;
+    if (py + ch > g_fb.height) ch = g_fb.height - py;
+    /* 逐【目标行】直接写像素：原实现对每个亮点各调一次 fb_fill_rect
+     * （最坏每字符 64 次函数调用 + 内层循环），这里改为一次遍历。 */
+    for (uint32_t dy = 0; dy < ch; dy++) {
+        uint32_t srow = dy / (uint32_t)g.scale;
+        const uint8_t *line = g.bits + (uint32_t)srow * g.stride;
+        volatile uint32_t *row =
+            (volatile uint32_t *)(g_fb.base + (uint64_t)(py + dy) * g_fb.pitch) + px;
+        for (uint32_t dx = 0; dx < cw; dx++) {
+            uint32_t scol = dx / (uint32_t)g.scale;
+            if (line[scol >> 3] & (1u << (scol & 7))) {
+                row[dx] = fg;
             }
         }
     }
@@ -231,15 +244,17 @@ void fbcon_set_color(uint32_t fg, uint32_t bg)
 
 static void fbcon_scroll(void)
 {
-    /* 整屏上移一个字符行：逐像素行拷贝，末行清空 */
+    /* 整屏上移一个字符行：逐【行】memcpy（原实现逐字节，为 O(全屏字节) 最慢路径）。 */
     uint32_t line_h = g_con.ch;
     uint32_t top = CON_MARGIN;
     uint32_t used_h = g_con.rows * g_con.ch;
-    for (uint32_t y = 0; y < used_h - line_h; y++) {
-        volatile uint8_t *dst = g_fb.base + (uint64_t)(top + y) * g_fb.pitch;
-        volatile uint8_t *src = g_fb.base + (uint64_t)(top + y + line_h) * g_fb.pitch;
-        for (uint32_t b = 0; b < g_fb.width * 4; b++) {
-            dst[b] = src[b];
+    uint32_t bytes = g_fb.width * 4;
+    uint8_t *base = (uint8_t *)g_fb.base;    /* 批量拷贝，去 volatile 限定 */
+    if (used_h > line_h) {
+        for (uint32_t y = 0; y < used_h - line_h; y++) {
+            uint8_t *dst = base + (uint64_t)(top + y) * g_fb.pitch;
+            const uint8_t *src = base + (uint64_t)(top + y + line_h) * g_fb.pitch;
+            memcpy(dst, src, bytes);
         }
     }
     fb_fill_rect(CON_MARGIN, top + used_h - line_h, g_con.cols * g_con.cw, line_h, g_con.bg);

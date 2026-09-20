@@ -462,6 +462,23 @@ bool usb_init(void)
     }
     g_hc_ready = true;
 
+    /* 【关键修复·驱动先加载】同步完成首次枚举，且发生在创建轮询任务、任何 Ring3
+     * 服务之前。
+     *
+     * 历史问题：此前仅创建轮询任务，靠它在进程上下文里“异步”枚举；而该任务能否
+     * 先于 display/input/shell 服务被调度，取决于 self-IPI 抢占 kmain 的时序（非确定
+     * 性）。某些时序下该任务被推迟到开机自检全部跑完之后才首次运行 → 用户所见
+     * “USB 键鼠长时间无反应、等很久才正常”（PS/2 无此任务故一直正常）。
+     *
+     * 此处直接在驱动优先阶段对根端口/Hub 连做若干轮 usb_poll()：
+     *   - 第 1 轮枚举根端口上的设备（键盘、Hub）；
+     *   - 其后各轮推进 Hub 下行端口枚举（经 Hub 的鼠标）。
+     * 枚举含 UHCI 端口复位等一次性延时（此刻仅 idle0 存在，不影响任何服务/显示），
+     * 完成后 USB 键鼠立即可用；随后创建的轮询任务只做轻量的 HID/Hub 周期轮询。 */
+    for (int i = 0; i < 6; i++) {
+        usb_poll();
+    }
+
     task_t *t = task_create_kernel(usb_service_task, NULL, "SukiUsbHost");
     if (!t) {
         kprintf("[usb] failed to start host service task\n");

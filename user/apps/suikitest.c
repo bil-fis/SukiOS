@@ -37,9 +37,9 @@ int main(int argc, char **argv)
 
     sui_init(NULL);
 
-    /* 注意：内核 OOL 单条上限为 MACH_MSG_OOL_MAX_PAGES(256 页 = 1MiB)，
-     * 窗口离屏缓冲 = w*h*4 必须 ≤ 1MiB。600*400*4 = 960000 字节(234 页)留足余量。 */
-    sui_window_t *w = sui_create_window("iSuki UI Demo", 180, 120, 600, 400, true);
+    /* 注意：内核 OOL 单条上限已提升至 MACH_MSG_OOL_MAX_PAGES(2048 页 = 8MiB)，
+     * 窗口离屏缓冲 w*h*4 可到 8MiB。660*440*4 = 1.16MiB 合法且匹配原布局。 */
+    sui_window_t *w = sui_create_window("iSuki UI Demo", 180, 120, 660, 440, true);
     if (!w) {
         u_print("[suikitest] FAIL: SukiCreateWindow returned NULL\n");
         sys_exit(1);

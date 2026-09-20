@@ -70,7 +70,7 @@ static int  g_prompt_col = 0;   /* 编辑行起点列（提示符之后） */
 /* ---- 窗口化：shell 作为 WM 管理的窗口程序 ----
  * 启动后创建窗口并注册事件端口；键盘经 WM 转发到本窗口（焦点模型），
  * 输出渲染到窗口离屏缓冲（同时镜像 serial，便于无图形/headless 观测）。
- * 窗口尺寸与字符网格已放大（OOL 上限提升至 256 页=2MiB），不再受 128×128 限制。 */
+ * 窗口尺寸与字符网格已放大（OOL 上限提升至 2048 页=8MiB），不再受 128×128 限制。 */
 static suki_window_t *g_win = NULL;
 static uint32_t       g_ep  = 0;
 #define TERM_COLS 80

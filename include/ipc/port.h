@@ -22,7 +22,7 @@
 
 /* ---- 消息头（用户/内核共享 ABI）---- */
 #define MACH_MSG_INLINE_MAX   3968          /* 小消息内联负载上限 (<4KB 含头) */
-#define MACH_MSG_OOL_MAX_PAGES 256          /* 单条 OOL 消息最多页数（2MiB，支持大窗口离屏缓冲） */
+#define MACH_MSG_OOL_MAX_PAGES 2048         /* 单条 OOL 消息最多页数（8MiB，支持大窗口离屏缓冲） */
 
 /* msgh_bits 标志 */
 #define MACH_MSGH_BITS_OOL    (1U << 31)    /* 携带 OOL 页描述符 */

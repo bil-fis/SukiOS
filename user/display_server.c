@@ -60,12 +60,13 @@ static uint32_t g_fb_pitch  = 0;         /* 字节/行 */
 static uint32_t g_stride    = 0;         /* 像素/行 = pitch/4 */
 static uint32_t *g_canvas   = NULL;      /* 合成画布（双缓冲后缓冲，指向 g_desk） */
 
-/* 颜色（xRGB32） */
-#define COL_DESKTOP       0x00000000   /* 帧缓冲背景 = 纯黑（已删除桌面装饰条） */
-#define COL_BAR_INACTIVE  0x003A2A4A   /* 非活动窗口标题栏（窗口装饰，非桌面） */
-#define COL_ACCENT        0x00579BFE
-#define COL_CLOSEBG       0x00C0392B
-#define COL_CLOSEFG       0x00FFFFFF
+/* 颜色（xRGB32；背景纯黑，已删除桌面装饰条/菜单栏/任务栏，仅做窗口管理+合成） */
+#define COL_DESKTOP       0x00000000   /* 帧缓冲背景 = 纯黑 */
+#define COL_BAR_INACTIVE  0x003A2A4A   /* 非活动窗口标题栏（iSuki 中性紫灰） */
+#define COL_ACCENT        0x00579BFE   /* iSuki 活动态强调蓝（accent） */
+#define COL_TL_CLOSE      0x00FF5F57   /* 交通灯：关闭（红） */
+#define COL_TL_MIN        0x00FEBC2E   /* 交通灯：最小化（黄） */
+#define COL_TL_MAX        0x0028C840   /* 交通灯：最大化（绿） */
 
 /* 背景纯黑。显示服务不渲染任何桌面元素（装饰条 / 菜单栏 / 任务栏等），
  * 仅做窗口管理与合成，故此处只填纯黑；未变化的区域完全不重绘。 */
@@ -99,8 +100,9 @@ static wm_window_t g_wins[WM_MAX_WINDOWS];
 static int g_win_count = 0;
 static suki_window_id_t g_win_next_id = 1;
 
-/* 窗口标题栏高度（与 composite 绘制保持一致） */
-#define WIN_TITLE_H 20
+/* 窗口装饰尺寸（与 iSuki 规范 §12.1 对齐：标题栏高 38、圆角 12） */
+#define WIN_TITLE_H 38
+#define WIN_RADIUS  12
 
 /* 焦点窗口与拖拽状态 */
 static wm_window_t *g_focus     = NULL;
@@ -137,7 +139,7 @@ static void wm_handle_create(const wm_create_req_t *req, mach_msg_header_t *hdr)
     wm_create_resp_t resp; memset(&resp, 0, sizeof(resp));
     if (g_win_count >= WM_MAX_WINDOWS) goto fail;
     uint64_t need = (uint64_t)req->w * req->height * 4;
-    if (need == 0 || need > 256 * 4096) goto fail;
+    if (need == 0 || need > 2048 * 4096) goto fail;   /* OOL ≤2048 页(8MiB) */
     uint32_t *px = (uint32_t *)sys_mmap(need, 3);
     if (!px) goto fail;
 
@@ -233,13 +235,17 @@ static void wm_forward_event(wm_window_t *w, suki_event_t *ev)
     mach_msg_send(&m, sizeof(m));
 }
 
-/* 关闭按钮命中（标题栏右上角 16x16 区域） */
-static bool wm_in_close_box(const wm_window_t *w, int32_t sx, int32_t sy)
+/* 交通灯命中：标题栏左侧三色圆点。返回 1=关闭(红) 2=最小化(黄) 3=最大化(绿) 0=无 */
+static int wm_traffic_light_at(const wm_window_t *w, int32_t sx, int32_t sy)
 {
-    if (!(w->style & SUKI_WS_TITLEBAR)) return false;
-    int32_t bx = w->x + (int32_t)w->w - 18;
-    int32_t by = w->y + 2;
-    return (sx >= bx && sx < bx + 16 && sy >= by && sy < by + 16);
+    if (!(w->style & SUKI_WS_TITLEBAR)) return 0;
+    int32_t cy = w->y + (int32_t)(WIN_TITLE_H / 2);   /* 标题栏竖直中心 */
+    int32_t xs[3] = { w->x + 14, w->x + 34, w->x + 54 };
+    for (int i = 0; i < 3; i++) {
+        int32_t dx = sx - xs[i], dy = sy - cy;
+        if (dx*dx + dy*dy <= 7*7) return i + 1;        /* 命中半径 7，便于点击 */
+    }
+    return 0;
 }
 
 /* 设置焦点窗口并向相关窗口广播 SUKI_EVENT_WINDOW_FOCUS（buttons:1=得焦点,0=失焦点） */
@@ -355,6 +361,59 @@ static void fill_clip(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r
     }
 }
 
+/* 在裁剪窗内填充一个实心圆（交通灯用），仅触碰裁剪窗内的像素 */
+static void wm_fill_disc(int32_t cx, int32_t cy, int32_t rad, uint32_t color)
+{
+    int cx0 = g_clx, cy0 = g_cly, cx1 = g_clx + g_clw, cy1 = g_cly + g_clh;
+    int x0 = cx - rad, y0 = cy - rad, x1 = cx + rad, y1 = cy + rad;
+    if (x1 <= cx0 || y1 <= cy0 || x0 >= cx1 || y0 >= cy1) return;
+    int bx = x0 < cx0 ? cx0 : x0;
+    int by = y0 < cy0 ? cy0 : y0;
+    int ex = x1 > cx1 ? cx1 : x1;
+    int ey = y1 > cy1 ? cy1 : y1;
+    if (bx < 0) bx = 0;
+    if (by < 0) by = 0;
+    if (ex > (int)g_fb_width)  ex = (int)g_fb_width;
+    if (ey > (int)g_fb_height) ey = (int)g_fb_height;
+    int r2 = rad * rad;
+    for (int j = by; j < ey; j++)
+        for (int i = bx; i < ex; i++) {
+            int32_t dx = i - cx, dy = j - cy;
+            if (dx*dx + dy*dy <= r2) {
+                if (i >= 0 && j >= 0 && i < (int32_t)g_fb_width && j < (int32_t)g_fb_height)
+                    g_canvas[(uint64_t)j * g_stride + i] = color;
+            }
+        }
+}
+
+/* 圆角窗口：清除四角（背景纯黑，清即圆角）。仅清除位于当前裁剪窗内的像素，
+ * 避免破坏裁剪窗之外、由更低 Z 窗口已合成的内容；更高 Z 窗口随后会覆盖本窗角点。 */
+static void wm_round_corners(const wm_window_t *w, int r)
+{
+    int32_t x0 = w->x, y0 = w->y;
+    int32_t x1 = (int32_t)(w->x + w->w), y1 = (int32_t)(w->y + w->h);
+    int cx0 = g_clx, cy0 = g_cly, cx1 = g_clx + g_clw, cy1 = g_cly + g_clh;
+    int r2 = r * r;
+    int32_t corners[4][2] = { {x0, y0}, {x1, y0}, {x0, y1}, {x1, y1} };
+    for (int k = 0; k < 4; k++) {
+        int32_t vx = corners[k][0], vy = corners[k][1];
+        int xb = vx - r < cx0 ? cx0 : (vx - r < 0 ? 0 : vx - r);
+        int xe = vx + r > cx1 ? cx1 : (vx + r > (int32_t)g_fb_width  ? (int32_t)g_fb_width  : vx + r);
+        int yb = vy - r < cy0 ? cy0 : (vy - r < 0 ? 0 : vy - r);
+        int ye = vy + r > cy1 ? cy1 : (vy + r > (int32_t)g_fb_height ? (int32_t)g_fb_height : vy + r);
+        for (int j = yb; j < ye; j++)
+            for (int i = xb; i < xe; i++) {
+                int32_t dx = i - vx, dy = j - vy;
+                if (dx*dx + dy*dy > r2) {
+                    if (i >= cx0 && i < cx1 && j >= cy0 && j < cy1 &&
+                        i >= 0 && j >= 0 &&
+                        i < (int32_t)g_fb_width && j < (int32_t)g_fb_height)
+                        g_canvas[(uint64_t)j * g_stride + i] = 0;
+                }
+            }
+    }
+}
+
 /* 绘制单个窗口的像素 + 几何装饰，仅输出与裁剪窗相交部分（背景黑由调用方清除） */
 static void wm_paint_window(wm_window_t *w)
 {
@@ -378,8 +437,8 @@ static void wm_paint_window(wm_window_t *w)
         uint32_t *d = g_canvas + (uint64_t)y * g_stride + (uint32_t)bx0;
         memcpy(d, s, (size_t)(bx1 - bx0) * 4);
     }
-    /* 窗口装饰：边框 + 标题栏（纯几何，无文字）+ 关闭按钮 */
-    uint32_t b = 2;
+    /* 窗口装饰（iSuki 新样式，纯几何无文字）：1px 边框 + 38px 标题栏 + 左侧三色交通灯 + 圆角(12) */
+    uint32_t b = 1;
     fill_clip((uint32_t)x0, (uint32_t)y0, ww, b, COL_ACCENT);
     fill_clip((uint32_t)x0, (uint32_t)y0 + hh - b, ww, b, COL_ACCENT);
     fill_clip((uint32_t)x0, (uint32_t)y0, b, hh, COL_ACCENT);
@@ -387,25 +446,18 @@ static void wm_paint_window(wm_window_t *w)
     if (w->style & SUKI_WS_TITLEBAR) {
         uint32_t bar_h = WIN_TITLE_H;
         if (hh >= bar_h) {
+            /* 标题栏底（边框内侧，避免压住 1px 边框） */
             fill_clip((uint32_t)x0 + b, (uint32_t)y0 + b, ww - b * 2, bar_h - b,
                       w->has_focus ? COL_ACCENT : COL_BAR_INACTIVE);
-            int32_t bx = (int32_t)x0 + (int32_t)ww - 18;
-            int32_t by = (int32_t)y0 + 2;
-            if (bx >= 0 && by >= 0) {
-                fill_clip((uint32_t)bx, (uint32_t)by, 16, 16, COL_CLOSEBG);
-                for (int32_t i = 3; i < 13; i++) {
-                    int32_t px = bx + i;
-                    if (px >= g_clx && px < c1x && by + i >= g_cly && by + i < c1y &&
-                        px < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
-                        g_canvas[(uint64_t)(by + i) * g_stride + px] = COL_CLOSEFG;
-                    int32_t px2 = bx + (15 - i);
-                    if (px2 >= g_clx && px2 < c1x && by + i >= g_cly && by + i < c1y &&
-                        px2 < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
-                        g_canvas[(uint64_t)(by + i) * g_stride + px2] = COL_CLOSEFG;
-                }
-            }
+            /* 左侧三色交通灯（macOS 风格：红/黄/绿，间距 8，直径 12） */
+            int32_t cy = (int32_t)y0 + (int32_t)(WIN_TITLE_H / 2);
+            wm_fill_disc((int32_t)x0 + 14, cy, 6, COL_TL_CLOSE);
+            wm_fill_disc((int32_t)x0 + 34, cy, 6, COL_TL_MIN);
+            wm_fill_disc((int32_t)x0 + 54, cy, 6, COL_TL_MAX);
         }
     }
+    /* 圆角窗口：清除四角（背景纯黑即圆角效果） */
+    wm_round_corners(w, WIN_RADIUS);
 }
 
 /* 重绘单个脏矩形：清黑 -> 重绘相交窗口 -> 仅拷贝该区域到帧缓冲 */
@@ -558,10 +610,15 @@ int main(void)
                 if (h->msgh_id == MOUSE_MSG_BUTTON && (m->buttons & 1)) {
                     /* 左键按下：标题栏 -> 关闭按钮 / 拖拽；客户区 -> 聚焦 + 下发 */
                     if (hit && (hit->style & SUKI_WS_TITLEBAR)) {
-                        if (wm_in_close_box(hit, m->x, m->y)) {
+                        int tl = wm_traffic_light_at(hit, m->x, m->y);
+                        if (tl == 1) {   /* 红灯：关闭窗口 */
                             suki_event_t ev; memset(&ev, 0, sizeof(ev));
                             ev.type = SUKI_EVENT_WINDOW_CLOSE;
                             wm_forward_event(hit, &ev);
+                            flush_dirty();
+                            continue;
+                        }
+                        if (tl == 2 || tl == 3) {  /* 黄/绿灯：最小化/最大化协议未实现，仅消费点击 */
                             flush_dirty();
                             continue;
                         }

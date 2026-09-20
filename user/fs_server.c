@@ -41,7 +41,7 @@
 
 /* 应答/整文件缓冲（所有输出写入此处，杜绝外部指针写） */
 #define RESP_DATA_MAX    FS_DATA_MAX            /* 内联应答数据上限 (3500) */
-#define FILEBUF_SIZE     (256u * 4096u)         /* 1 MiB 大文件读缓冲（对应 MACH_MSG_OOL_MAX_PAGES=256 页） */
+#define FILEBUF_SIZE     (256u * 4096u)         /* 1 MiB 大文件读缓冲（OOL 单条上限 MACH_MSG_OOL_MAX_PAGES=2048 页=8MiB） */
 static uint8_t  g_resp[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + RESP_DATA_MAX + 16];
 static uint8_t  g_filebuf[FILEBUF_SIZE] __attribute__((aligned(4096))); /* 整文件读（OOL 内容源） */
 

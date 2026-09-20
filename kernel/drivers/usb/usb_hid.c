@@ -146,6 +146,12 @@ static void hid_kbd_process(int idx, const uint8_t *rep, int len)
     memcpy(g_prev[idx], rep, 8);
 }
 
+/* USB(HID) 鼠标垂直方向相对 PS/2 是否取反。
+ * 用户要求「让 usb 鼠标和 ps2 鼠标的移动方向相反（上下相反）」→ 置 1：
+ * 对 HID 报告的 dy 取反后再合成 PS/2 包，从而 USB 鼠标上下方向与 PS/2 相反。
+ * 若日后要让两者一致，改回 0 即可。 */
+#define USB_MOUSE_INVERT_Y 1
+
 static void hid_mouse_process(int idx, const uint8_t *rep, int len)
 {
     (void)idx;
@@ -156,7 +162,11 @@ static void hid_mouse_process(int idx, const uint8_t *rep, int len)
     int8_t dx = (int8_t)rep[1];
     int8_t dy = (int8_t)rep[2];
 
-    /* 合成 PS/2 包：bit3 恒为 1，低 3 位为按键；dx/dy 原样（均为屏幕坐标） */
+#if USB_MOUSE_INVERT_Y
+    dy = (int8_t)(-dy);            /* 上下取反：与 PS/2 鼠标方向相反 */
+#endif
+
+    /* 合成 PS/2 包：bit3 恒为 1，低 3 位为按键 */
     uint8_t b0 = (uint8_t)(0x08 | buttons);
     uint8_t b1 = (uint8_t)dx;
     uint8_t b2 = (uint8_t)dy;

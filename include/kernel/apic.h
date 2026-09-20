@@ -76,6 +76,7 @@ void lapic_send_init(uint8_t apic_id);
 void lapic_send_startup(uint8_t apic_id, uint8_t vector);
 /* 向单个目标发送固定向量 IPI */
 void lapic_send_ipi(uint8_t apic_id, uint8_t vector);
+void lapic_send_ipi_self(uint8_t vector);
 /* 向除自己外所有 CPU 广播固定向量 IPI（目标简写 11b=all-excluding-self） */
 void lapic_broadcast_ipi(uint8_t vector);
 

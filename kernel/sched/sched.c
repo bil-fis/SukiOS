@@ -81,6 +81,11 @@ static task_t  *g_dead_list = NULL;   /* 待回收的已退出任务 */
 static task_t  *g_all_tasks = NULL;   /* 全局任务表（含 zombie），供 pid 查找 */
 static uint32_t g_rr_counter = 0;     /* 新任务 RR 绑定 CPU 的轮转计数器 */
 
+/* 系统节拍计数（100Hz，由 sched_tick 在 BSP 上每拍 +1）。内核 msleep 以此为
+ * 时钟源计算唤醒截止节拍，避免轮询任务 busy-wait 空耗 CPU（如 usb_service_task
+ * 原本每轮忙等 8ms，单核下白占 ~80% CPU 致整机卡顿、鼠标延迟）。 */
+static uint64_t g_jiffies = 0;
+
 uint64_t sched_next_pid(void)
 {
     /* 多核并发创建任务时 PID 必须原子分配（P0-R1） */
@@ -185,6 +190,25 @@ static void rq_unlink_cpu(task_t *t, uint32_t cpu)
         g_percpu[cpu].rq_count--;
         t->in_rq = false;
     }
+}
+
+/* P0-R4：把任务移动到本 CPU 运行队列【队首】（唤醒抢占加速）。
+ * 同一 CPU 上被唤醒的任务（如 IPC 接收方）若排在队列尾部，要等其它就绪任务
+ * 轮转完（每个时间片 ~10ms）才能被 schedule() 选中，导致紧耦合的「发送方↔接收方」
+ * 回合延迟高达数十毫秒（如 FS_SERVER 读盘喂 disk-srv）。提升到队首后，IPI 触发的
+ * schedule() 会立即选中它，把回合延迟降到微秒级。 */
+static void rq_move_head_cpu(task_t *t, uint32_t cpu)
+{
+    if (t->in_rq) {
+        rq_unlink_cpu(t, cpu);
+    }
+    t->next = g_percpu[cpu].rq_head;
+    g_percpu[cpu].rq_head = t;
+    if (!g_percpu[cpu].rq_tail) {
+        g_percpu[cpu].rq_tail = t;
+    }
+    g_percpu[cpu].rq_count++;
+    t->in_rq = true;
 }
 
 /* 在本 CPU 运行队列中选下一个可运行任务（排除当前任务自身）。
@@ -769,9 +793,13 @@ void sched_wake(task_t *t)
     }
     uint64_t f = spin_lock_irqsave(&g_sched_lock);
     t->state = READY;
-    if (!t->in_rq) {
-        rq_push_cpu(t, t->cpu);
-    }
+    t->wake_jiffies = 0;   /* 取消任何挂起的按时唤醒（msleep 截止不再生效） */
+    /* P0-R4 唤醒抢占加速：被唤醒任务一律提到运行队列【队首】。
+     * 若它此前因阻塞被 schedule() 摘离（in_rq=false），则直接入队首；
+     * 若仍在队列（如已被唤醒一次但再次被唤醒），则先摘链再移到队首。
+     * 这样 self-IPI 触发的 schedule() 会立即选中它，把紧耦合 IPC 回合
+     * （如 FS_SERVER 读盘喂 disk-srv）的延迟从数十毫秒降到微秒级。 */
+    rq_move_head_cpu(t, t->cpu);
     uint32_t wcpu = t->cpu;
     bool same = (wcpu == cpu_index());
     spin_unlock_irqrestore(&g_sched_lock, f);
@@ -779,7 +807,7 @@ void sched_wake(task_t *t)
     /* IPI 在完全解锁后发送：waiter 所在核（可能即本核）需立即发生一次调度。
      * 同核 self-IPI 在解锁后才触发，保证当前任务不会在仍持任何锁时被切走。 */
     if (same) {
-        lapic_send_ipi((uint8_t)g_percpu[wcpu].lapic_id, IPI_RESCHED);
+        lapic_send_ipi_self(IPI_RESCHED);
     } else {
         lapic_send_ipi((uint8_t)g_percpu[wcpu].lapic_id, IPI_RESCHED);
     }
@@ -801,6 +829,29 @@ void sched_balance_report(void)
 void sched_tick(registers_t *r)
 {
     (void)r;
+    /* 推进系统节拍时钟（仅在 BSP 上累加，单核构建即本核；SMP 下各 AP 的
+     * 轮询任务极少见，且 usb_service 等固定绑 cpu0，故以 cpu0 节拍为准）。
+     * 同时扫描“按时睡眠”（msleep 登记的 wake_jiffies）到期任务并唤醒。 */
+    if (cpu_index() == 0) {
+        g_jiffies++;
+        /* 扫描到期睡眠者：持锁仅做“收集指针”，释放后再 sched_wake（sched_wake
+         * 内部再次取 g_sched_lock，自旋锁非递归，必须避免在持锁态调用以免死锁）。 */
+        static task_t *s_wake[MAX_TASKS];
+        uint32_t nw = 0;
+        uint64_t f = spin_lock_irqsave(&g_sched_lock);
+        for (task_t *t = g_all_tasks; t; t = t->all_next) {
+            if (t->wake_jiffies != 0 && t->wake_jiffies <= g_jiffies) {
+                t->wake_jiffies = 0;
+                if (t->state == BLOCKED && nw < MAX_TASKS) {
+                    s_wake[nw++] = t;
+                }
+            }
+        }
+        spin_unlock_irqrestore(&g_sched_lock, f);
+        for (uint32_t i = 0; i < nw; i++) {
+            sched_wake(s_wake[i]);   /* 置 READY + 提队首 + 必要 IPI */
+        }
+    }
     /* P0-R3：BSP 每 tick（10ms）探测 COM2 是否有 GDB 数据到达；有则触发
      * int3 陷入 gdbstub 会话（函数内部自限 cpu0 + 未附着时才触发）。 */
     gdbstub_poll();
@@ -868,6 +919,29 @@ void task_yield(void)
     interrupts_disable();
     schedule();
     interrupts_enable();
+}
+
+/* 内核任务阻塞睡眠：将当前任务置 BLOCKED 并登记 wake_jiffies 截止节拍，让出
+ * CPU 直到 sched_tick 到达该节拍后被唤醒（sched_wake 清零 wake_jiffies 并提至
+ * 队首）。与 busy-wait（如原 usb_ms：纯 inb 空转 8ms）相比，睡眠期间 CPU 可被
+ * FS_SERVER/disk-srv/shell 等任务充分利用，消除单核整机卡顿与鼠标延迟。
+ * 调用方须处于进程上下文（非持锁态），否则阻塞会把持锁任务切走造成死锁。 */
+void msleep(uint32_t ms)
+{
+    if (ms == 0) {
+        task_yield();
+        return;
+    }
+    uint64_t ticks = (ms + 9) / 10;          /* 100Hz：向上取整到节拍数 */
+    if (ticks == 0) {
+        ticks = 1;
+    }
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    task_t *cur = g_percpu[cpu_index()].current_task;
+    cur->state = BLOCKED;
+    cur->wake_jiffies = g_jiffies + ticks;
+    spin_unlock_irqrestore(&g_sched_lock, f);
+    schedule();                              /* 让出：pick_next 跳过 BLOCKED 任务 */
 }
 
 /* 回收所有已退出任务的 task 结构与内核栈（在 schedule() 切换后、新栈上调用） */

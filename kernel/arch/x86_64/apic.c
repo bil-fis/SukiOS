@@ -204,6 +204,15 @@ void lapic_send_ipi(uint8_t apic_id, uint8_t vector)
     lapic_icr_send(apic_id, 0x00004000u | vector);
 }
 
+void lapic_send_ipi_self(uint8_t vector)
+{
+    /* 目标简写 01b（bit18）= self；固定投递、边沿触发、assert。
+     * 显式把 apic_id 写入 ICR_HIGH 再投 self 在部分 LAPIC（含 QEMU）实现下
+     * 不投递，改用 shorthand 最稳健。 */
+    lapic_write(LAPIC_ICR_LOW, 0x00040000u | (uint32_t)vector);
+    lapic_icr_wait();
+}
+
 void lapic_broadcast_ipi(uint8_t vector)
 {
     /* 目标简写 11b（bit19:18）= all excluding self，无需写 ICR_HIGH */

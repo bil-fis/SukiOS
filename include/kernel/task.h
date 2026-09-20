@@ -76,6 +76,9 @@ typedef struct task {
 
     struct task *next;              /* 就绪队列（循环链表） */
     bool     in_rq;                  /* 是否已在某 CPU 运行队列中（sched_wake 判断是否需重新入队） */
+    /* 内核 msleep() 用的“按时唤醒”截止节拍：0 表示非按时睡眠（普通阻塞）。
+     * sched_tick 每过一拍扫描 wake_jiffies!=0 且 <= 当前节拍的任务并唤醒之。 */
+    uint64_t wake_jiffies;
 
     /* --- POSIX 进程属性（完整系统调用层，见 kernel/syscall/sys_posix.c） --- */
     int      fds[SUKI_FD_MAX];       /* 文件描述符表：值为全局 fd 槽号，-1 = 空 */
@@ -173,6 +176,7 @@ task_t *sched_create_idle(uint32_t cpu);  /* 为某 CPU 建 idle 任务（P0-R1�
  * 返回 0 成功（*rc_out=退出码）；-1 pid 无效或非当前任务子进程。 */
 int64_t task_wait_child(uint64_t child_pid, uint64_t *rc_out);
 void   task_yield(void);            /* 主动让出 CPU（sys_yield 底层） */
+void   msleep(uint32_t ms);          /* 内核任务阻塞睡眠 ms 毫秒（基于 100Hz 节拍，不忙等） */
 __attribute__((noreturn)) void task_exit_current(uint64_t code);
 
 /* 按 PID 在全局任务表中查找任务（含尚未被回收的 zombie）；找不到返回 NULL */

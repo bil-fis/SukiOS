@@ -431,13 +431,16 @@ void usb_poll(void)
     input_pref_set_usb_mouse(mouse);
 }
 
-/* USB 主机服务内核任务：周期性轮询（在进程上下文，可安全延时）。 */
+/* USB 主机服务内核任务：周期性轮询（在进程上下文，可安全延时）。
+ * 注意：原实现用 usb_ms(8) 做忙等（纯 inb 空转 8ms），单核下白占 ~80% CPU，
+ * 导致整机卡顿、鼠标延迟。改为内核 msleep(8) 真正睡眠，让 CPU 在轮询间隔
+ * 内被 FS_SERVER/disk-srv/shell 等任务充分利用。 */
 static void usb_service_task(void *arg)
 {
     (void)arg;
     for (;;) {
         usb_poll();
-        usb_ms(8);
+        msleep(8);
     }
 }
 

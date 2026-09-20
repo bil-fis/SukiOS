@@ -111,7 +111,6 @@ static void ipi_resched_handler(registers_t *r)
      * 此处 schedule() 是安全的——中断返回(iretq)会落到被选中任务上下文。
      * IPI handler 不持 g_sched_lock，无重入死锁风险。 */
     cpu_local()->ticks++;
-    ipi_trace("[smp] ipi_resched_handler on cpu=%u\n", (unsigned)cpu_index());
     schedule();
 }
 

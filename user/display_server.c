@@ -195,7 +195,7 @@ fail:
 static void wm_handle_flush(wm_flush_req_t *f)
 {
     wm_window_t *w = wm_find(f->id);
-    if (!w) return;
+    if (!w) { u_print("[display] FLUSH: unknown id\n"); return; }
     uint32_t *src = (uint32_t *)(uintptr_t)f->ool.address;
     uint64_t cp = (uint64_t)w->w * w->h * 4;
     if (f->ool.size < cp) cp = f->ool.size;

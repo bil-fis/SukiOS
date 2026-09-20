@@ -550,7 +550,13 @@ int uhci_int_poll(int slot)
     return actual;
 }
 
-/* 根端口轮询：处理连接变化（即插即用入口）。 */
+/* 根端口轮询：处理连接变化（即插即用入口）。
+ * 关键修复：除响应 CSC（连接变化）位外，对【已连接(CCS)但尚未枚举】的根端口也
+ * 主动复位+枚举。否则设备若在内核 USB 轮询启动前就已连接（CSC 在控制器复位时
+ * 已被清），将永远不被枚举 —— 表现为 USB 键鼠插上却完全无响应。每端口记录枚举
+ * 状态，支持可靠的即插即用与热插拔（断开清状态、重连再枚举）。 */
+static bool g_root_enumed[8];   /* 每根端口是否已枚举（避免重复枚举风暴） */
+
 void uhci_poll(void)
 {
     if (!g_ready) {
@@ -565,19 +571,25 @@ void uhci_poll(void)
     for (int p = 1; p <= g_ports; p++) {
         uint16_t reg = (uint16_t)(UHCI_PORTSC1 + 2 * (p - 1));
         uint16_t ps = ur16(reg);
-        if (!(ps & UHCI_PORT_CSC)) {
-            continue;
+        bool csc  = (ps & UHCI_PORT_CSC) ? true : false;
+        bool ccs  = (ps & UHCI_PORT_CCS) ? true : false;
+        if (csc) {
+            uw16(reg, UHCI_PORT_CSC);                 /* 写 1 清变化位 */
         }
-        uw16(reg, UHCI_PORT_CSC);                     /* 写 1 清变化位 */
-        ps = ur16(reg);
-        if (ps & UHCI_PORT_CCS) {
+        if (ccs && !g_root_enumed[p]) {
             bool ls = false;
             if (uhci_root_port_reset(p, &ls)) {
                 g_port_ls[p] = ls ? 1 : 0;
-                usb_core_root_connect(p, ls);
+                int idx = usb_core_root_connect(p, ls);
+                g_root_enumed[p] = (idx >= 0) ? true : false;
+                if (idx < 0) {
+                    /* 枚举失败：保持未枚举，下次轮询重试；断开后由下方分支清状态 */
+                    kprintf("[uhci] port %d enum failed, will retry\n", p);
+                }
             }
-        } else {
+        } else if (!ccs && g_root_enumed[p]) {
             usb_core_root_disconnect(p);
+            g_root_enumed[p] = false;
         }
     }
 }

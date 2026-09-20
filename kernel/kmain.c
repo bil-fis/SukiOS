@@ -645,7 +645,7 @@ static void boot_late_init(void *arg)
      * ========================================================== */
     bool display_ready = false;
     uint32_t waited = 0;
-    for (uint32_t i = 0; i < 20000; i++)
+    for (uint32_t i = 0; i < 2000; i++)
     {
         if (g_display_active)
         {
@@ -653,7 +653,10 @@ static void boot_late_init(void *arg)
             break;
         }
         waited = i;
-        task_yield();   /* 让出 CPU（配合调度器 RR 轮转），使 display-server 运行到 SYS_DISPLAY_READY */
+        /* 用内核 msleep 让出（wall-clock 有界，约 10ms/轮，上限约 20s），而非快速
+         * 空转 yield：优先级抢占调度下 display-server 需经调度器“防饥饿老化”升到
+         * 交互优先级才被选中，快速 yield 会在其升到交互级之前就耗尽循环。 */
+        msleep(1);
     }
     if (display_ready)
         kprintf("[boot] display-server ready (g_display_active=1, waited=%u yield rounds); "

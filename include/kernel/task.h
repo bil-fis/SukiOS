@@ -151,6 +151,14 @@ void fpu_init(void);
 
 #define TIME_SLICE_TICKS  2         /* 每个时间片 = 2 个节拍（20ms @100Hz） */
 
+/* 优先级（0-255，数值越小越高；与 POSIX setpriority 共用尺度，128=普通）。
+ *   PRI_BOOST : 唤醒/交互任务的提升目标（高于普通，保证 IPC 收发方与输入服务优先响应）；
+ *   PRI_NORMAL: 默认优先级；
+ *   PRI_MAX   : 最低。 */
+#define PRI_BOOST   64
+#define PRI_NORMAL  128
+#define PRI_MAX     255
+
 void   sched_init(void);
 task_t *task_create_kernel(void (*entry)(void *), void *arg, const char *name);
 

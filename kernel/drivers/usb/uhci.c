@@ -22,6 +22,7 @@
 #include <kernel/pci.h>
 #include <kernel/console.h>
 #include <kernel/string.h>
+#include <kernel/task.h>      /* msleep：长延时可让出 CPU（非忙等） */
 #include <mm/pmm.h>
 
 /* ---- QH / TD 硬件结构（16/32 字节，必须 16 字节对齐） ---- */
@@ -81,6 +82,26 @@ static void usb_udelay(uint32_t us)
 {
     for (uint32_t i = 0; i < us; i++) {
         (void)inb(0x80);
+    }
+}
+
+/* 长延时可让出 CPU（用户要求：“USB 不要忙等，尽快让出 CPU”）。
+ * 轮询任务上下文（USB 主机服务任务运行后）用内核 msleep 真睡眠；引导早期
+ * （kmain 里 uhci_init 复位控制器时）尚无“可睡眠的任务上下文”，退化为微延迟忙等。
+ * 由 usb_core 在轮询任务启动时调用 uhci_set_can_sleep(true) 打开。 */
+static bool g_can_sleep = false;
+
+void uhci_set_can_sleep(bool on)
+{
+    g_can_sleep = on;
+}
+
+static void usb_delay_ms(uint32_t ms)
+{
+    if (g_can_sleep) {
+        msleep(ms);
+    } else {
+        usb_udelay(ms * 1000u);
     }
 }
 
@@ -283,12 +304,13 @@ bool uhci_root_port_reset(int port, bool *low_speed)
     if (!(ps & UHCI_PORT_CCS)) {
         return false;
     }
-    /* SetReset -> 100ms -> ClearReset -> 50ms -> SetPED（OSDev 时序） */
+    /* SetReset -> 100ms -> ClearReset -> 50ms -> SetPED（OSDev 时序）。
+     * 这 100/50/30ms 用 usb_delay_ms：任务上下文走 msleep 让出 CPU（不再忙等）。 */
     uw16(reg, UHCI_PORT_RESET);
-    usb_udelay(100000);
+    usb_delay_ms(100);
     uint16_t cur = ur16(reg);
     uw16(reg, (uint16_t)(cur & ~UHCI_PORT_RESET));
-    usb_udelay(50000);
+    usb_delay_ms(50);
 
     ps = ur16(reg);
     if (!(ps & UHCI_PORT_PED)) {
@@ -304,7 +326,7 @@ bool uhci_root_port_reset(int port, bool *low_speed)
     if (!(ps & UHCI_PORT_PED)) {
         return false;
     }
-    usb_udelay(30000);          /* 使能后稳定 30ms，再开始控制传输 */
+    usb_delay_ms(30);           /* 使能后稳定 30ms，再开始控制传输（可睡眠让出 CPU） */
     if (low_speed) {
         *low_speed = (ps & UHCI_PORT_LSDA) ? true : false;
     }

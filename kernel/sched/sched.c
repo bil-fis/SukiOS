@@ -216,28 +216,40 @@ static void rq_move_head_cpu(task_t *t, uint32_t cpu)
     t->in_rq = true;
 }
 
-/* 在本 CPU 运行队列中选下一个可运行任务（排除当前任务自身）。
- * 调用方须持 g_sched_lock，且处于本 CPU 上下文。 */
+/* 选【最高优先级（priority 数值最小）】的可运行任务（排除当前任务自身）。
+ * 同优先级按队列顺序（先到先得）以保留 RR 公平性（仅严格更小时替换，故队列中最先
+ * 出现的最高优先级任务胜出）。调用方须持 g_sched_lock，且处于本 CPU 上下文。 */
 static void reap_dead(void);
 static task_t *pick_next(void)
 {
-    task_t *cur = g_percpu[cpu_index()].current_task;
-    task_t *t = g_percpu[cpu_index()].rq_head;
-    for (uint32_t i = 0; i < g_percpu[cpu_index()].rq_count; i++) {
-        if (t && t != cur && !t->is_idle && t->alive &&
-            (t->state == READY || t->state == RUNNING)) {
-            return t;
-        }
-        if (!t) {
-            break;
+    uint32_t cpu = cpu_index();
+    task_t *cur = g_percpu[cpu].current_task;
+    task_t *best = NULL;
+    uint64_t best_pri = (uint64_t)PRI_MAX + 1;
+    task_t *t = g_percpu[cpu].rq_head;
+    for (uint32_t i = 0; i < g_percpu[cpu].rq_count && t; i++) {
+        if (t != cur && !t->is_idle && t->alive &&
+            (t->state == READY || t->state == RUNNING) && t->priority < best_pri) {
+            best = t;
+            best_pri = t->priority;
         }
         t = t->next;
+    }
+    if (best) {
+        /* 严格优先级：若当前任务优先级严格高于所有其它就绪任务，则继续运行它，
+         * 不被低优先级任务抢占；优先级相同时用返回 best 实现 RR 轮转。 */
+        if (cur && !cur->is_idle && cur->alive &&
+            (cur->state == READY || cur->state == RUNNING) &&
+            cur->priority < best_pri) {
+            return cur;
+        }
+        return best;
     }
     /* 回退：无其它可运行非 idle 任务。决不能回退到 cur —— cur 可能刚被标记
      * dead（如本任务正在 task_exit_current 中退出），其内核栈返回地址槽可能已被
      * 退出路径破坏，context_switch 切回时会 ret 到非法地址触发 #UD（vector 6）。
      * 改回退到本 CPU 的 idle 任务（idle_task 栈完整、帧合法），保证系统稳定空转。 */
-    return g_percpu[cpu_index()].idle_task;
+    return g_percpu[cpu].idle_task;
 }
 
 /* BSP idle 循环（独立内核栈上运行，与 BSP 引导栈彻底解耦）。
@@ -823,11 +835,12 @@ void sched_wake(task_t *t)
     uint64_t f = spin_lock_irqsave(&g_sched_lock);
     t->state = READY;
     t->wake_jiffies = 0;   /* 取消任何挂起的按时唤醒（msleep 截止不再生效） */
-    /* P0-R4 唤醒抢占加速：被唤醒任务一律提到运行队列【队首】。
-     * 若它此前因阻塞被 schedule() 摘离（in_rq=false），则直接入队首；
-     * 若仍在队列（如已被唤醒一次但再次被唤醒），则先摘链再移到队首。
-     * 这样 self-IPI 触发的 schedule() 会立即选中它，把紧耦合 IPC 回合
-     * （如 FS_SERVER 读盘喂 disk-srv）的延迟从数十毫秒降到微秒级。 */
+    /* P0-R4 唤醒抢占加速：被唤醒任务一律提到运行队列【队首】。若它此前因阻塞被
+     * schedule() 摘离（in_rq=false），则直接入队首；若仍在队列（如已被唤醒一次但
+     * 再次被唤醒），则先摘链再移到队首。这样 self-IPI 触发的 schedule() 会立即选中
+     * 它，把紧耦合 IPC 回合（如 FS_SERVER 读盘喂 disk-srv）的延迟从数十毫秒降到
+     * 微秒级。该 head-move 配合 self-IPI 即实现「立即抢占」——不额外做严格优先级的
+     * 硬提升（实测硬提升会饿死未阻塞的 display/shell 等任务，故不采用）。 */
     rq_move_head_cpu(t, t->cpu);
     uint32_t wcpu = t->cpu;
     bool same = (wcpu == cpu_index());

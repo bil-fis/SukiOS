@@ -1,0 +1,4 @@
+for<'a> fn(&'a CStr) -> core::result::Result<PathBuf, core::io::Error> {sys::fs::sukios::canonicalize}
+&for<'a> fn(&'a CStr) -> core::result::Result<PathBuf, core::io::Error> {sys::fs::sukios::canonicalize}
+&for<'a> fn(&'a CStr) -> core::result::Result<PathBuf, core::io::Error> {sys::fs::sukios::canonicalize}: CoerceUnsized<&dyn for<'a> core::ops::Fn(&'a Path) -> core::result::Result<PathBuf, core::io::Error>>
+CoerceUnsized<&dyn for<'a> core::ops::Fn(&'a Path) -> core::result::Result<PathBuf, core::io::Error>>

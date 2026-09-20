@@ -24,6 +24,9 @@
 #include <mm/vma.h>
 #include <mm/vmm.h>
 #include <kernel/serial.h>
+#include <kernel/clock.h>      /* clock_monotonic_ns()：Phase 3 原生时间 */
+#include <kernel/rtc.h>        /* rtc_posix_now_ns()：Phase 3 真实时间 */
+#include <kernel/futex.h>      /* futex_wait/futex_wake：Phase 3 原生 futex */
 #include <stdbool.h>
 #include <sukios/posix.h>
 
@@ -322,6 +325,98 @@ static int suki_wait_objects(suki_object_t **objs, int n, uint32_t flags, size_t
     }
 }
 
+/* ===================== Phase 3：原生 OS 能力（214..249） =====================
+ * 面向「不经 POSIX 层」的调用者（典型为 Rust std 的 sukios 后端）：
+ * 时间/休眠/随机等。全部复用内核既有实现，不含 POSIX 语义转换。 */
+
+/* 单调时间（自启动，纳秒）。 */
+static uint64_t sys_suki_time_monotonic(void)
+{
+    return clock_monotonic_ns();
+}
+
+/* 真实时间（Unix Epoch，纳秒；由 RTC 基准 + 单调时钟推算）。 */
+static uint64_t sys_suki_time_realtime(void)
+{
+    return rtc_posix_now_ns();
+}
+
+/* 睡眠至少 ns 纳秒（让出 CPU，不忙等）。实现与 sys_nanosleep 同构：
+ * 目标时刻 = 单调时间 + 时长，循环 task_yield 直到到达。 */
+static uint64_t sys_suki_sleep_ns(uint64_t ns)
+{
+    if (ns == 0) {
+        task_yield();
+        return 0;
+    }
+    uint64_t target = clock_monotonic_ns() + ns;
+    while ((int64_t)(target - clock_monotonic_ns()) > 0) {
+        task_yield();
+    }
+    return 0;
+}
+
+/*
+ * SYS_SUKI_RANDOM —— 填充**非密码学**随机字节（a1=用户缓冲, a2=字节数）。
+ * 内核无熵池：用 TSC + 单调时钟播种，xorshift64* 生成，足够 std 的
+ * HashMap RandomState 等一般用途；密码学用途需后续接入真实熵源（见 §遗留）。
+ * 生成在 g_suki_lock 内完成，copy_to_user 在锁外执行（不持锁做可能缺页的拷贝）。
+ */
+#define SUKI_RAND_CHUNK 256u
+static uint64_t sys_suki_random(uint64_t ubuf, uint64_t len)
+{
+    if (!ubuf || len == 0)
+        return (uint64_t)-SUKI_EINVAL;
+    static uint64_t s_seed = 0;
+    uint8_t kbuf[SUKI_RAND_CHUNK];
+    uint64_t done = 0;
+    while (done < len) {
+        uint32_t chunk = (uint32_t)(len - done);
+        if (chunk > SUKI_RAND_CHUNK)
+            chunk = SUKI_RAND_CHUNK;
+        uint64_t f = spin_lock_irqsave(&g_suki_lock);
+        for (uint32_t i = 0; i < chunk; i++) {
+            if (s_seed == 0) {
+                uint32_t lo, hi;
+                __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+                s_seed  = ((uint64_t)hi << 32) | lo;
+                s_seed ^= clock_monotonic_ns();
+                if (s_seed == 0)
+                    s_seed = 0x9E3779B97F4A7C15ULL;
+            }
+            s_seed ^= s_seed << 13;
+            s_seed ^= s_seed >> 7;
+            s_seed ^= s_seed << 17;
+            kbuf[i] = (uint8_t)(s_seed >> 24);
+        }
+        spin_unlock_irqrestore(&g_suki_lock, f);
+        if (copy_to_user((void *)(ubuf + done), kbuf, chunk) != chunk)
+            return (uint64_t)-SUKI_EFAULT;
+        done += chunk;
+    }
+    return done;
+}
+
+/* futex 原语：直接复用内核 futex 实现（kernel/sched/futex.c，按 (cr3,uaddr) 分桶）。
+ * 注意 futex_wait 内部会在持锁下读 *uaddr，故这里传用户地址（与 POSIX 层的
+ * SYS_FUTEX 处理方式一致；SMAP 由内核既有访问路径处理）。 */
+static uint64_t sys_suki_futex_wait(uint64_t uaddr, uint64_t val,
+                                    uint64_t timeout_ns)
+{
+    if (!uaddr)
+        return (uint64_t)-SUKI_EFAULT;
+    int r = futex_wait((uint32_t *)uaddr, (uint32_t)val, timeout_ns);
+    return (uint64_t)(int64_t)r;
+}
+
+static uint64_t sys_suki_futex_wake(uint64_t uaddr, uint64_t n)
+{
+    if (!uaddr)
+        return (uint64_t)-SUKI_EFAULT;
+    int r = futex_wake((uint32_t *)uaddr, (int)n);
+    return (uint64_t)(int64_t)r;
+}
+
 /* ===================== 分发 ===================== */
 
 /* Phase 2 新增 handler 前向声明（定义见文件末尾） */
@@ -541,6 +636,14 @@ uint64_t sys_suki_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     case SYS_SUKI_FILE_CLOSE:  return sys_suki_file_close(sched_current(), a1);
     case SYS_SUKI_PROC_CREATE: return sys_suki_proc_create(sched_current(), a1, a2, a3, (suki_handle_t*)a4);
     case SYS_SUKI_MEM_ALLOC:   return sys_suki_mem_alloc(sched_current(), a1, (suki_handle_t*)a2);
+
+    /* ---- Phase 3：原生 OS 能力（214..249） ---- */
+    case SYS_SUKI_TIME_MONOTONIC: return sys_suki_time_monotonic();
+    case SYS_SUKI_TIME_REALTIME:  return sys_suki_time_realtime();
+    case SYS_SUKI_SLEEP_NS:       return sys_suki_sleep_ns(a1);
+    case SYS_SUKI_RANDOM:         return sys_suki_random(a1, a2);
+    case SYS_SUKI_FUTEX_WAIT:     return sys_suki_futex_wait(a1, a2, a3);
+    case SYS_SUKI_FUTEX_WAKE:     return sys_suki_futex_wake(a1, a2);
 
     default:
         return (uint64_t)-SUKI_ENOSYS;

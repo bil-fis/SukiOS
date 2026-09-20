@@ -167,7 +167,7 @@ endif
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello suikitest
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 -Wa,--noexecstack \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -321,6 +321,26 @@ $(BUILD)/apps/winhello.elf: $(BUILD)/apps/winhello.o $(BUILD)/user/gui.c.o $(USE
 		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/apps/winhello.o $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
 	@echo "==> standalone GUI self-test $@ ($$(stat -c%s $@) bytes)"
+
+# ===========================================================================
+# iSuki UI 控件库（libsui，依据 iSuki UI 界面库设计规范.md）
+# ========================================================================
+# 库源（按规范 16：每个源文件独立编译，最终静态链入使用方 ELF）
+SUI_SRCS := user/libsui/src/sui_core.c user/libsui/src/sui_widgets.c
+SUI_OBJS := $(patsubst %.c,$(BUILD)/%.c.o,$(SUI_SRCS))
+$(BUILD)/user/libsui/src/%.c.o: user/libsui/src/%.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -I user/libsui/include -c $< -o $@
+
+# suikitest（内嵌自检）：libsui + GUI 客户端静态链入
+$(BUILD)/user/suikitest.c.o: user/apps/suikitest.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -I user/libsui/include -c $< -o $@
+$(BUILD)/user/suikitest.elf: $(BUILD)/user/suikitest.c.o $(SUI_OBJS) $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
+		-o $@ $(BUILD)/user/suikitest.c.o $(SUI_OBJS) $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
+	@echo "==> libsui self-test $@ ($$(stat -c%s $@) bytes)"
 
 # ---- FreeType 静态库（字体服务 pchfnt/fontsrv 的字形光栅化引擎）----
 # 仅编入 TrueType 渲染必需模块（base/sfnt/truetype/smooth/raster/autofit/
@@ -480,12 +500,9 @@ $(BUILD)/apps/pchfnt.o: user/apps/pchfnt.c
 # Rust 示例 ELF（cargo build 生成）；不存在则留空，不影响其余程序构建。
 # 注：RUST_DIR 在下方 rust 区段才定义，此处用相对项目根的字面前缀路径。
 RUST_BIN := $(wildcard rust/target/x86_64-sukios/debug/sukios-hello)
-# Rust 示例 ELF 的内嵌 blob（供内核开机自检 spawn；不存在则留空，weak 符号跳过）。
-ifeq ($(RUST_BIN),)
-RUST_BLOB :=
-else
-RUST_BLOB := $(BUILD)/user/rusthello.blob.o
-endif
+# 注：Rust 内嵌 blob（RUST_BLOB / STDT_BLOB）已整体移除——不再向内核注入任何
+# Rust ELF（按用户决策放弃 Rust 注入，保留零 Rust 依赖，内核仅由 C 程序自检）。
+# 下方 RUST_BIN 仅用于把可选的 cargo 产物拷入磁盘镜像（缺失则跳过，不影响构建）。
 
 # ---- miniz 内核能力（Ring0 压缩）----
 # kernel/abilities/ 默认被 C_SRCS 的 find 排除（用户态能力库不入内核）；此处**显式**
@@ -501,7 +518,28 @@ $(BUILD)/kernel/abilities/miniz/%.c.o: $(KMINIZ_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(KMINIZ_CFLAGS) -c $< -o $@
 
-OBJS := $(patsubst %,$(BUILD)/%.o,$(C_SRCS) $(S_SRCS)) $(USER_BLOBS) $(RUST_BLOB) $(KMINIZ_OBJS)
+# ---- 启动图资源（boot/anim/*.bmp -> 内核 .rodata）----
+# 构建期由 tools/bootanim_gen.py 扫描 boot/anim/ 下【全部】.bmp：转成自描述原始
+# 位图（.raw），并生成 blobs.S（.incbin 链入，导出 bootanim_<名>_start/_end）与
+# table.c（BootLogoID -> 符号区间 的表）。因此**新增启动图只需把 bmp 丢进
+# boot/anim/ 再 make**，无需改 Makefile 或内核代码。
+BOOTANIM_DIR  := $(BUILD)/bootanim
+BOOTANIM_BMPS := $(wildcard boot/anim/*.bmp)
+BOOTANIM_OBJS := $(BOOTANIM_DIR)/blobs.S.o $(BOOTANIM_DIR)/table.c.o
+
+# 两个产物出自同一次脚本运行（需先扫描全部 bmp 才知道有哪些符号），故一条规则。
+$(BOOTANIM_DIR)/blobs.S $(BOOTANIM_DIR)/table.c: $(BOOTANIM_BMPS) tools/bootanim_gen.py
+	@mkdir -p $(BOOTANIM_DIR)
+	python3 tools/bootanim_gen.py boot/anim $(BOOTANIM_DIR)
+
+# 生成物位于 build/ 下，不适用 $(BUILD)/%.c.o: %.c（那条用于源码树），故显式给出。
+$(BOOTANIM_DIR)/blobs.S.o: $(BOOTANIM_DIR)/blobs.S
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BOOTANIM_DIR)/table.c.o: $(BOOTANIM_DIR)/table.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+OBJS := $(patsubst %,$(BUILD)/%.o,$(C_SRCS) $(S_SRCS)) $(USER_BLOBS) $(KMINIZ_OBJS) $(BOOTANIM_OBJS)
 
 # ---- 磁盘镜像 (FAT32) ----
 DISK := $(BUILD)/disk.img
@@ -666,6 +704,8 @@ rust-env: make-rust-env
 rust-build:
 	@export PATH="$$HOME/.cargo/bin:$$PATH"; cd $(RUST_DIR) && cargo build
 
+# ---- Rust 相关目标已整体移除（按用户决策放弃 Rust 注入；内核仅由 C 程序自检）。 ----
+
 # ---- 用户程序编译规则（必须先于内核通配规则） ----
 $(BUILD)/user/%.S.o: user/%.S | $(CONFIG_H)
 	@mkdir -p $(dir $@)
@@ -780,19 +820,7 @@ $(BUILD)/user/%.ssvc.blob.o: $(BUILD)/user/%.elf
 	# .note.GNU-stack 段，确保内核栈不可执行。
 	objcopy --add-section .note.GNU-stack=/dev/null $@ $@.nostack && mv $@.nostack $@
 
-# Rust 示例 ELF -> 内核内嵌 blob（符号 _binary_rusthello_start/_end，kmain 经 weak 引用）。
-# 仅当 cargo build 产物存在时构建；否则 RUST_BLOB 为空，内核跳过该自检。
-ifneq ($(RUST_BIN),)
-$(RUST_BLOB): $(RUST_BIN)
-	@mkdir -p $(dir $@)
-	cp $(RUST_BIN) $(BUILD)/user/rusthello.bin
-	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-		--redefine-sym _binary_$(subst /,_,$(subst .,_,$(subst -,_,$(BUILD)/user/rusthello.bin)))_start=_binary_rusthello_start \
-		--redefine-sym _binary_$(subst /,_,$(subst .,_,$(subst -,_,$(BUILD)/user/rusthello.bin)))_end=_binary_rusthello_end \
-		--redefine-sym _binary_$(subst /,_,$(subst .,_,$(subst -,_,$(BUILD)/user/rusthello.bin)))_size=_binary_rusthello_size \
-		$(BUILD)/user/rusthello.bin $@
-	objcopy --add-section .note.GNU-stack=/dev/null $@ $@.nostack && mv $@.nostack $@
-endif
+# Rust 内嵌 blob 规则已移除（RUST_BLOB / STDT_BLOB）。内核不再注入 Rust ELF。
 
 # dltest 是独立程序（user/apps/dltest.c → build/apps/dltest.elf），但内核内嵌
 # blob 规则（USER_PROGS）按 user/<name>.elf 命名。这里把 app 产物拷成
@@ -946,6 +974,12 @@ $(KERNEL): $(OBJS) $(RELK) boot/linker.ld
 	    if (o >= 0x8000 || o+s > 0x8000) { print "!! L4 FAIL: MB2 header beyond first 32KiB (off="o" size="s")"; exit 1; } \
 	    print "==> L4 check: .boot VMA=0x"a" fileoff=0x"o" size=0x"s" (within first 32KiB)"; }'
 
+# ---- 注册表 hive（运行期配置数据，被钉进 ISO / 磁盘镜像）----
+# 显式列为镜像目标的依赖：否则 `make csre` 改了 .sre 后，镜像会因"看起来已是最新"
+# 而不重建，跑的还是旧配置（实际踩过的坑）。
+REG_SRES := configs/default/system.sre configs/default/user.sre \
+            configs/default/services.sre
+
 # ---- 生成可引导 ISO (BIOS + UEFI 双启动) ----
 iso: $(ISO)
 $(ISO): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB)
@@ -963,7 +997,7 @@ $(ISO): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB)
 iso-single: $(ISO_SINGLE)
 $(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
                 $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) \
-                others_tests/moonhalo.mp3 $(RUST_BIN)
+                others_tests/moonhalo.mp3 $(RUST_BIN) $(REG_SRES)
 	@mkdir -p $(ISODIR_SINGLE)/boot/grub
 	cp $(KERNEL) $(ISODIR_SINGLE)/boot/kernel.ski
 	cp grub/grub.cfg $(ISODIR_SINGLE)/boot/grub/grub.cfg
@@ -1007,7 +1041,7 @@ $(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
 # PLAYAUDIO 超过 8.3 短名 → mtools 自动创建长文件名(LFN)，FS_SERVER 已支持
 # 读取 LFN，故 shell 可用 `exec BIN/playaudio` 装载。
 disk: $(DISK)
-$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/moonhalo.mp3 $(RUST_BIN)
+$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/moonhalo.mp3 $(RUST_BIN) $(REG_SRES)
 	@mkdir -p $(BUILD)
 	truncate -s 64M $@
 	mformat -i $@ -F -v SUKIOS ::
@@ -1069,6 +1103,34 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/m
 		echo "  disk: skip RUSTHELLO.SKA (rust binary not built; run make make-rust-env + make rust-build)"; \
 	fi
 	@echo "==> Built FAT32 disk $(DISK)"
+
+# ---- 注册表（SukiRegistry Hive）反编译 / 编译（手动工具）----
+# JSON 是「可编辑工作副本」，**不入库**（.gitignore 忽略 *.sre.json）。
+# 标准流程：make desre（.sre -> .json）-> 手工编辑 JSON -> make csre（.json -> .sre）。
+# 三者（system/user/services）一起转；产物就地覆盖 configs/default/*.sre，
+# 随后 make iso / make disk 即带上新配置（镜像里的 ::SYS/CONFIGS/*.sre）。
+REG_HIVES := system user services
+
+.PHONY: desre csre reg-export reg-compile
+
+# desre / reg-export：二进制 -> JSON（反编译，供人工审阅与修改）
+desre reg-export:
+	@for h in $(REG_HIVES); do \
+		python3 tools/registry_editor.py export configs/default/$$h.sre \
+			configs/default/$$h.sre.json || exit 1; \
+	done
+	@echo "==> 已反编译到 configs/default/*.sre.json（编辑后 make csre 编译回 .sre）"
+
+# csre / reg-compile：JSON -> 二进制（编译，重建 .sre）
+csre reg-compile:
+	@for h in $(REG_HIVES); do \
+		if [ ! -f configs/default/$$h.sre.json ]; then \
+			echo "缺少 configs/default/$$h.sre.json（请先 make desre）"; exit 1; \
+		fi; \
+		python3 tools/registry_editor.py compile configs/default/$$h.sre.json \
+			configs/default/$$h.sre || exit 1; \
+	done
+	@echo "==> 已编译回 configs/default/*.sre（make iso / make disk 生效）"
 
 # ---- 运行 (带图形窗口，需 X/GTK) ----
 # -boot d 强制从光驱(ISO)引导：磁盘位于 index=0(第一硬盘)无引导扇区，

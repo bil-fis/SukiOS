@@ -72,6 +72,11 @@ node_modules/
 /rust/Cargo.lock
 /rust/target/
 
+# ---- 注册表可编辑 JSON（工作副本，不入库）----
+# 由 `make desre` 从 configs/default/*.sre 反编译得到，人工修改后用 `make csre`
+# 编译回 .sre；属临时工作产物，故不入库。
+configs/default/*.sre.json
+
 # ---- 私有签名证书 ----
 *rootCA*
 *_sign*

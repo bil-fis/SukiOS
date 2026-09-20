@@ -1,0 +1,11 @@
+[package]
+name = "stdtest"
+version = "0.1.0"
+edition = "2021"
+
+# std 目标：用 -Z build-std=std,panic_abort 现场编译 std（见 rust/.cargo/config.toml）
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

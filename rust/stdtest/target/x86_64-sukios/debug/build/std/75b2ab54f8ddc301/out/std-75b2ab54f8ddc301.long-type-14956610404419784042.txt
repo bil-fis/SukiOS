@@ -1,0 +1,2 @@
+&for<'a> fn(&'a CStr) -> core::result::Result<(), core::io::Error> {unlink}: CoerceUnsized<&dyn for<'a> core::ops::Fn(&'a Path) -> core::result::Result<(), core::io::Error>>
+CoerceUnsized<&dyn for<'a> core::ops::Fn(&'a Path) -> core::result::Result<(), core::io::Error>>

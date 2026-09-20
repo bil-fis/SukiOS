@@ -31,6 +31,8 @@
 #include <kernel/posix.h>    /* posix_dispatch()：完整 POSIX 系统调用层 */
 #include <kernel/fd.h>       /* fd_exit_task()：任务退出时释放其 fd 表 */
 #include <kernel/mouse.h>    /* mouse_get_packet()：SYS_MOUSE_READ 内核采集层 */
+#include <kernel/registry.h> /* RegistryQuery()：SYS_REGISTRY_READ 按路径读注册表 */
+#include <kernel/bootanim.h> /* bootanim_boot_done()：SYS_BOOT_SPLASH_WAIT 交接闸门 */
 
 /* sys_clone 在 kernel/syscall/sys_posix.c 实现（pthread 线程创建基座） */
 extern int64_t sys_clone(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -994,6 +996,68 @@ static uint64_t sys_tty_read(uint64_t a1, uint64_t a2)
 }
 
 /*
+ * sys_registry_read —— SYS_REGISTRY_READ 实现。
+ * ---------------------------------------------------------------------------
+ * 按路径读取注册表值（内核缓存的 system.sre，只读；写入由 CONFIG_SERVER 负责）。
+ * 路径形如 "System/Boot/ShowLogo"：首段=根键名，中间段=子键名，末段=值名。
+ *
+ *   参数 a1 = 用户态路径字符串（NUL 结尾）；
+ *        a2 = 用户态输出缓冲，a3 = 缓冲容量（字节）；
+ *        a4 = 用户态 uint32_t*（可传 0），回填值类型（SUKREG_TYPE_*）；
+ *   返回写入字节数（>=0）/ 路径不存在 -1 / 参数非法 -2。
+ *
+ * 注意：某些键「注册表内只是标识、真实值由内核探测」，例如
+ * System/Boot/BootDeviceType —— RegistryQuery 会经动态覆盖返回内核探测结果
+ * （"disk"/"cdrom"/"none"），因此 Ring3 读到的始终是真实启动设备。
+ *
+ * 安全性：用户指针一律经 copy_str_from_user / copy_to_user 校验，绝不直解引用。
+ */
+static uint64_t sys_registry_read(uint64_t a1, uint64_t a2, uint64_t a3,
+                                  uint64_t a4)
+{
+    char path[192];
+    int64_t pl = copy_str_from_user(path, (const char *)a1, sizeof(path));
+    if (pl <= 0)
+        return (uint64_t)-2;
+
+    uint32_t type = 0;
+    const uint8_t *data = NULL;
+    uint64_t len = 0;
+    if (RegistryQuery(path, &type, &data, &len) != 0)
+        return (uint64_t)-1;
+
+    uint32_t cap = (uint32_t)a3;
+    uint32_t n = (len < (uint64_t)cap) ? (uint32_t)len : cap;
+    if (n > 0 && !copy_to_user((void *)a2, data, n))
+        return (uint64_t)-2;
+    if (a4) {
+        uint32_t t = type;
+        if (!copy_to_user((void *)a4, &t, sizeof(t)))
+            return (uint64_t)-2;
+    }
+    return (uint64_t)n;
+}
+
+/*
+ * sys_boot_splash_wait —— SYS_BOOT_SPLASH_WAIT 实现（启动画面交接闸门）。
+ * ---------------------------------------------------------------------------
+ * 仅显示服务调用：内核在启动早期绘制开机动画（启动图 + 进度条）并持有屏幕。
+ * 显示服务映射帧缓冲、声明 SYS_DISPLAY_READY 之后阻塞在此，直到内核完成
+ * 【驱动 + 全部 Ring3 服务初始化 + 启动画面收尾】并调用 bootanim_handoff()。
+ * 返回即表示可以绘制桌面并进入消息循环（进入用户登录/桌面流程）。
+ *
+ * 实现：轮询 + msleep(5) 真睡眠（不忙等、不空转 CPU），单核下也不会饿死其它任务。
+ * 无参、恒返回 0。
+ */
+static uint64_t sys_boot_splash_wait(void)
+{
+    while (!bootanim_boot_done()) {
+        msleep(5);
+    }
+    return 0;
+}
+
+/*
  * sys_display_blit —— SYS_DISPLAY_BLIT 实现。
  * ---------------------------------------------------------------------------
  * 供 Ring3 显示诊断程序（如 BMP 加载器）把一块像素（xRGB32）写入帧缓冲。内核
@@ -1091,9 +1155,11 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
      * 信号边界已统一在 posix_dispatch 返回路径经 sig_deliver_check 处理（含默认
      * 终止），不再需要中途的 pending_kill 检查。 */
 
-    /* SukiNative 原生对象 API：130..149 路由到 sys_suki_dispatch；
-     * 网络 socket 子系统：150..199 路由到 sys_net_dispatch（转发 NS_PORT）。 */
-    if (num >= 130 && num <= 149) {
+    /* SukiNative 原生对象 API：130..149 与 Phase 3（214..249）路由到
+     * sys_suki_dispatch；网络 socket 子系统：150..199 路由到 sys_net_dispatch
+     * （转发 NS_PORT）。Phase 3 为 Rust std 等「不经 POSIX 层」的调用者提供
+     * 时间/休眠/随机等原生能力（号位自 214 起，200..213 已被内核扩展占用）。 */
+    if ((num >= 130 && num <= 149) || (num >= 214 && num <= 249)) {
         return sys_suki_dispatch(num, a1, a2, a3, a4, a5, a6);
     }
     if (num >= 150 && num <= 199) {
@@ -1125,6 +1191,8 @@ uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2,
     case SYS_DISPLAY_READY:   display_set_active(); return 0;
     case SYS_CONSOLE_READ:    return sys_console_read(a1, a2);
     case SYS_TTY_READ:        return sys_tty_read(a1, a2);
+    case SYS_REGISTRY_READ:   return sys_registry_read(a1, a2, a3, a4);
+    case SYS_BOOT_SPLASH_WAIT: return sys_boot_splash_wait();
     case SYS_DISPLAY_BLIT:    return sys_display_blit(a1, a2, a3, a4, a5);
     case SYS_OOL_UNMAP:       return ipc_ool_unmap_user(a1);
     case SYS_PORT_ALLOC:      return sys_port_alloc();

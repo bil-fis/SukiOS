@@ -43,6 +43,7 @@
 #include <kernel/task.h>
 #include <mm/vma.h> /* P0-5：vma_selftest */
 #include <kernel/abilities/kminiz.h> /* 内核内嵌压缩能力（miniz）自检 */
+#include <kernel/bootanim.h>    /* 启动动画：启动图标 + 圆角进度条（registry 驱动） */
 #include <kernel/syscall.h>
 #include <mm/pmm.h>
 #include <mm/vmm.h>
@@ -86,6 +87,7 @@ extern const uint8_t user_curl_test_start[], user_curl_test_end[];
 extern const uint8_t user_curl_app_test_start[], user_curl_app_test_end[];
 extern const uint8_t user_dltest_start[], user_dltest_end[];
 extern const uint8_t user_winhello_start[], user_winhello_end[];
+extern const uint8_t user_suikitest_start[], user_suikitest_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -108,20 +110,19 @@ static void console_srv(void *arg)
 
 boot_info_t g_boot;
 
+/*
+ * 早期屏幕铺垫：此刻 registry 尚未解析（stage3 才读 /sys/configs/system.sre），
+ * 故这里只把屏幕清成黑色（= 启动动画的黑底），不做任何图标绘制。
+ * 真正的启动图标与进度条由 BootPlayAnimation()（stage3，registry 解析后）依
+ * System/Boot 的 ShowLogo / ShowProgress / BootLogoID / CustomLogo 绘制。
+ */
 static void draw_boot_logo(void)
 {
     if (!fb_available())
     {
         return;
     }
-    uint32_t W = fb_width();
-    fb_clear(FB_BG);
-    uint32_t s = 96;
-    uint32_t x = (W - s) / 2;
-    uint32_t y = 40;
-    fb_fill_rect(x, y, s, s, FB_PINK);
-    fb_fill_rect(x + 16, y + 16, s - 32, s - 32, FB_BG);
-    fb_fill_rect(x + 32, y + 32, s - 64, s - 64, FB_CYAN);
+    fb_clear(FB_BLACK);
 }
 
 /* 阶段四内存子系统自检：PMM 分配/释放、kmalloc 读写、独立地址空间创建 */
@@ -174,6 +175,16 @@ static void mm_selftest(void)
 /* 全局：registry 是否允许加载 kdr（可由 /System/Kernel/KdrEnabled 关闭） */
 static bool g_kdr_enabled = true;
 
+/* registry 解析结果（Stage3LoadConfigAndKdr 填充）：启动动画按其绘制，
+ * 并作为「Kernel/Drivers/Services」等键的运行时查询基础。 */
+static system_config_t g_syscfg;
+static bool g_syscfg_ok = false;
+
+/* 内核【实际探测】到的启动设备类型。注册表 System/Boot/BootDeviceType 内只是
+ * 「标识」，真实取值以本探测为准：解析后经 RegistrySetOverrideString() 覆盖，
+ * 任何（内核或 Ring3）按该路径读值的调用者拿到的都是这里的真实结果。 */
+static const char *g_boot_dev_type = "none";
+
 /* 解析 GRUB 内核命令行（-v/--verbose）。预留 suki.debug=1（后期权限子系统调试角色）。 */
 static void ParseBootCmdline(void)
 {
@@ -202,10 +213,18 @@ static void SecurityReserve(void)
     kprintf("[boot] security: 权限提升子系统(UAC/授权)预留，本期不实现（见设计文档）；仅保留接入点\n");
 }
 
-/* 预留：启动动画。后期实现（详见后续启动动画设计），本期留空。 */
+/*
+ * 启动动画（stage3，registry 解析后）。
+ *   - ShowLogo      -> 是否绘制启动图标（CustomLogo 优先，其次 BootLogoID 内嵌图）；
+ *   - ShowProgress  -> 是否绘制进度条（黑底白填充、两侧圆角）；
+ *   - 之后由 boot_late_init 的各里程碑经 bootanim_progress() 推进进度。
+ * 帧缓冲不可用（纯文本回退）时静默跳过，绝不阻塞启动。
+ */
 static void BootPlayAnimation(void)
 {
-    kprintf("[boot] stage3: boot animation reserved (not implemented yet)\n");
+    kprintf("[boot] stage3: boot animation (registry-driven)\n");
+    bootanim_setup(g_syscfg_ok ? &g_syscfg : NULL);
+    bootanim_progress(15);
 }
 
 /* 第三步：读取 registry 配置（/sys/configs/system.sre）并按配置门控 kdr。
@@ -237,7 +256,13 @@ static void Stage3LoadConfigAndKdr(void)
     const sukreg_header_t *h = (const sukreg_header_t *)buf;
     system_config_t cfg;
     if (!RegistryParseSystem(buf, n, &cfg)) {
-        kprintf("[boot] config: hive parse/CRC failed, using defaults\n");
+        /* 诊断：打印实际读到的字节与头部字段，便于定位「读到了什么」 */
+        kprintf("[boot] config: hive parse/CRC failed, using defaults "
+                "(n=%u magic=%02x%02x%02x%02x%02x%02x%02x%02x ver=%u "
+                "body=%llu crc=%08x)\n",
+                n, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6],
+                buf[7], h->version, (unsigned long long)h->body_size,
+                h->crc32);
         kfree(buf);
         return;
     }
@@ -253,6 +278,28 @@ static void Stage3LoadConfigAndKdr(void)
         g_boot_verbose = cfg.boot_verbose;
     if (cfg.have_kdr)
         g_kdr_enabled = cfg.kdr_enabled;
+
+    /* 启动画面配置回声（ShowLogo/ShowProgress/BootLogoID/CustomLogo） */
+    kprintf("[boot] config: boot logo=%s progress=%s id='%s' custom=%s\n",
+            (cfg.have_show_logo ? (cfg.show_logo ? "on" : "off") : "default(on)"),
+            (cfg.have_show_progress ? (cfg.show_progress ? "on" : "off") : "default(on)"),
+            cfg.have_boot_logo_id ? cfg.boot_logo_id : "(default)",
+            (cfg.have_custom_logo && cfg.custom_logo_enabled)
+                ? (cfg.custom_logo_direct_path[0] ? cfg.custom_logo_direct_path
+                                                  : cfg.custom_logo_path)
+                : "off");
+
+    /* 保留整份 hive 字节（内部拷贝）供运行时按路径查询：
+     * SYS_REGISTRY_READ（Ring3 读注册表）与内核子系统（如 Drivers/Services 清单）
+     * 都基于此缓存；System/Boot/BootDeviceType 另由 RegistrySetOverrideString()
+     * 覆盖为内核实际探测结果。 */
+    if (!RegistryCacheSystem(buf, n))
+        kprintf("[boot] config: warn: registry cache alloc failed "
+                "(registry path queries unavailable)\n");
+
+    g_syscfg = cfg;
+    g_syscfg_ok = true;
+
     kfree(buf);
 }
 
@@ -467,6 +514,58 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
 }
 
 /*
+ * registry 读取链路自检：验证「解析 -> 缓存 -> 按路径查询 -> 动态值覆盖」，
+ * 即 SYS_REGISTRY_READ（Ring3 读注册表）所走的同一条通路。按类型安全解码
+ * （hive 中的字符串值不带 NUL，必须先拷入临时缓冲再打印）。
+ */
+static void RegistrySelfTest(void)
+{
+    static const char *const paths[] = {
+        "System/Boot/BootDeviceType",
+        "System/Boot/ShowLogo",
+        "System/Boot/ShowProgress",
+        "System/Boot/BootLogoID",
+        "System/Kernel/KdrEnabled",
+        "System/Drivers/Intel/UHCI/Enabled",
+        "System/Drivers/Intel/UHCI/Match",
+        "System/Services/Shell/Autostart",
+        "System/Display/Width",
+        "System/Boot/NoSuchValue",
+    };
+    kprintf("[reg] self-test begin (parse->cache->query->override)\n");
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        uint32_t type = 0;
+        const uint8_t *v = NULL;
+        uint64_t len = 0;
+        if (RegistryQuery(paths[i], &type, &v, &len) != 0) {
+            kprintf("[reg]   %s -> (missing)\n", paths[i]);
+            continue;
+        }
+        if (type == SUKREG_TYPE_STRING) {
+            char tmp[96];
+            size_t n = ((size_t)len < sizeof(tmp) - 1) ? (size_t)len
+                                                       : sizeof(tmp) - 1;
+            memcpy(tmp, v, n);
+            tmp[n] = '\0';
+            kprintf("[reg]   %s -> str \"%s\"\n", paths[i], tmp);
+        } else if (type == SUKREG_TYPE_BOOL) {
+            kprintf("[reg]   %s -> bool %s\n", paths[i],
+                    (len > 0 && v[0]) ? "true" : "false");
+        } else if (type == SUKREG_TYPE_UINT64 || type == SUKREG_TYPE_INT64) {
+            uint64_t x = 0;
+            for (uint64_t b = 0; b < 8 && b < len; b++)
+                x |= (uint64_t)v[b] << (8 * b);
+            kprintf("[reg]   %s -> int %llu\n", paths[i],
+                    (unsigned long long)x);
+        } else {
+            kprintf("[reg]   %s -> type %u (%llu bytes)\n", paths[i],
+                    (unsigned)type, (unsigned long long)len);
+        }
+    }
+    kprintf("[reg] self-test end\n");
+}
+
+/*
  * boot_late_init —— 内核完全稳定后、统一加载磁盘与 Ring3 服务的引导收尾线程。
  *
  * 运行时机：由 kmain 在 sched_switch_to_idle0() 之前经 task_create_kernel 拉起、
@@ -554,19 +653,31 @@ static void boot_late_init(void *arg)
         /* 第三步：读取 registry 配置（/sys/configs/system.sre）并按配置门控 kdr。
          * 文件缺失/CRC 失败则回退默认，绝不阻塞启动。 */
         Stage3LoadConfigAndKdr();
+
+        /* 记录【内核实际探测】到的启动设备：硬盘存在 -> '/' 由 FAT32（DISK 后端）
+         * 服务。注册表 System/Boot/BootDeviceType 内只是标识，真实结果以探测为准，
+         * 故此处覆盖该路径的读值（任何按路径读它的内核/Ring3 调用者都得到本结果）。 */
+        g_boot_dev_type = "disk";
+        RegistrySetOverrideString("System/Boot/BootDeviceType", g_boot_dev_type);
+        kprintf("[boot] BootDeviceType: detected '%s' (kernel probe), / = FAT32 disk\n",
+                g_boot_dev_type);
+
         if (g_kdr_enabled) {
             kdr_load_all();
         } else {
             kprintf("[boot] kdr loading disabled by registry config\n");
         }
-        BootPlayAnimation();   /* 预留：启动动画（本期未实现） */
+        BootPlayAnimation();   /* 启动动画：图标 + 圆角进度条（registry 驱动） */
+        bootanim_progress(30);
     }
     else
     {
         kprintf("[boot] no disk detected: FS_SERVER not started.\n");
         /* 仅光盘启动（脱离硬盘）：探测 ATAPI 光驱并挂载内核 ISO9660，
          * 使 '/' 由内核直接服务（含全部系统文件），Ring3 服务改从光盘读取。 */
+        bool iso_ok = false;
         if (CdromInit() && IsoMount()) {
+            iso_ok = true;
             kprintf("[boot] booting from ISO9660 on CD-ROM (read-only).\n");
         } else {
             kprintf("[boot] no CD-ROM/ISO either: POSIX file syscalls will "
@@ -579,13 +690,69 @@ static void boot_late_init(void *arg)
 
         /* 第三步：从 ISO 读取 registry 配置并按配置门控 kdr（无盘也需读配置） */
         Stage3LoadConfigAndKdr();
+
+        /* 实际探测结果：光盘挂载成功 -> '/' 由内核 ISO9660 服务。 */
+        g_boot_dev_type = iso_ok ? "cdrom" : "none";
+        RegistrySetOverrideString("System/Boot/BootDeviceType", g_boot_dev_type);
+        kprintf("[boot] BootDeviceType: detected '%s' (kernel probe), / = %s\n",
+                g_boot_dev_type, iso_ok ? "ISO9660 CD-ROM" : "(no filesystem)");
+
         if (g_kdr_enabled) {
             kdr_load_all();
         } else {
             kprintf("[boot] kdr loading disabled by registry config\n");
         }
-        BootPlayAnimation();   /* 预留：启动动画（本期未实现） */
+        BootPlayAnimation();   /* 启动动画：图标 + 圆角进度条（registry 驱动） */
+        bootanim_progress(30);
     }
+
+    /* ---- registry 读取链路自检 ----
+     * 校验「解析 -> 缓存 -> 按路径查询 -> 动态值覆盖」全链路（SYS_REGISTRY_READ
+     * 走的正是这条路），并确证 System/Boot/BootDeviceType 返回的是内核探测结果。 */
+    RegistrySelfTest();
+
+    /* ============================================================
+     * 显示服务最先拉起：映射帧缓冲 -> 声明 ready -> 阻塞等待「开机动画交接」。
+     *
+     * 语义（用户要求：开机动画要一直显示到「驱动 + 服务」全部初始化完毕）：
+     *   1) 显示服务此刻只做「映射帧缓冲 + 画离屏背景层」，**不提交显存**，
+     *      故不会覆盖内核正在显示的开机动画；随后调用 SYS_DISPLAY_READY，
+     *      内核置 g_display_active=true、内核诊断改走环形管道（不再涂抹屏幕）。
+     *   2) 紧接着它阻塞在 SYS_BOOT_SPLASH_WAIT 上；内核仍持有屏幕显示开机动画，
+     *      并在其后陆续拉起网络/输入/鼠标等服务。
+     *   3) 待全部服务就绪且 bootanim_finish() 收尾后，内核 bootanim_handoff()
+     *      放行 —— 显示服务首次提交桌面帧并进入消息循环，屏幕交给桌面，
+     *      随后 SukiLogon 启动 shell，进入用户登录/桌面流程。
+     *
+     * 启动屏障：必须等显示服务声明 ready（g_display_active 置位）再挂载后续
+     * 服务。历史故障是 display-server 与 mouse-server/shell 并发 spawn，单核下
+     * mouse-server 的紧凑轮询循环抢占 CPU，导致 display-server 迟迟到不了
+     * SYS_DISPLAY_READY、谁都不写屏而表现为「内核卡死」。用 msleep 让出（而非
+     * 空转 yield）在有界时间内等待，绝不无限自旋挂死引导。
+     * ========================================================== */
+    task_create_user(user_display_server_start,
+                     (size_t)(user_display_server_end - user_display_server_start),
+                     "SukiDisplayServer");
+    bootanim_progress(40);   /* 里程碑：显示服务已拉起（此时尚未接管屏幕） */
+
+    bool display_ready = false;
+    uint32_t waited = 0;
+    for (uint32_t i = 0; i < 2000; i++)
+    {
+        if (g_display_active)
+        {
+            display_ready = true;
+            break;
+        }
+        waited = i;
+        msleep(1);   /* wall-clock 有界（约 10ms/轮，上限约 20s） */
+    }
+    if (display_ready)
+        kprintf("[boot] display-server ready (g_display_active=1, waited=%u rounds); "
+                "boot screen still held, mounting remaining services...\n", waited);
+    else
+        kprintf("[boot] WARN: display-server did NOT become ready within "
+                "timeout; continuing anyway (UI may be degraded)\n");
 
     /* ---- 网络：启动 NET_PORT 内核服务（e1000 原始帧收发）----
      * 放在磁盘/FS_SERVER 之后：网卡自检会发送 ARP 并轮询等待应答（最多 2 秒，
@@ -593,6 +760,7 @@ static void boot_late_init(void *arg)
      * 网络服务（lwIP）后续经 NET_PORT 收发帧，并需 port_grant_send 授权。 */
 #if 1
     net_srv_start();
+    bootanim_progress(45);   /* 里程碑：网卡/DISK 服务就绪 */
 
     /* Ring3 网络服务（lwIP 协议栈）：作为 NET_PORT 的【客户端】收发帧。
      * 须授权其向 NET_PORT 发送（net_srv_task 已在 e1000_init 把 NET_PORT 设为
@@ -607,6 +775,7 @@ static void boot_late_init(void *arg)
                     (unsigned long)net_task->id);
         }
     }
+    bootanim_progress(60);   /* 里程碑：Ring3 网络服务已拉起 */
 #endif
 
     /* ---- Ring3 输入服务 + 显示服务（Shell 暂不启动）----
@@ -619,61 +788,27 @@ static void boot_late_init(void *arg)
     task_create_user(user_input_server_start,
                      (size_t)(user_input_server_end - user_input_server_start),
                      "SukiInputServer");
-    task_create_user(user_display_server_start,
-                     (size_t)(user_display_server_end - user_display_server_start),
-                     "SukiDisplayServer");
-
-    /* ============================================================
-     * 启动屏障（关键修复）：必须先等【显示服务完全就绪】再挂载后续服务。
-     *
-     * 历史故障：此前 display-server 与 mouse-server / shell 被并发 spawn。
-     * 单核下三者在同优先级轮转，mouse-server 一旦启动就进入
-     *   sys_mouse_read() + mach_msg_send(DISPLAY_PORT) 的紧凑循环，疯狂抢占
-     * CPU，导致 display-server 迟迟拿不到足够的运行时间推进到 SYS_DISPLAY_READY
-     * （即 g_display_active 置位、真正接管帧缓冲、进入 mach_msg_recv 消息循环）。
-     * 后果：
-     *   - 显示服务从未接管，内核 fbcon 仍处于「直接写屏」态；
-     *   - 鼠标/键盘产生的字符经 fbcon 直接落在屏幕上、满屏后滚屏；
-     *   - 因为显示服务没进入接收循环，mouse-server 发往 DISPLAY_PORT 的消息
-     *     堆积、shell 也无显示出口，整体表现为「内核卡死、无任何调试输出」。
-     *
-     * 修复：spawn display-server 后，本引导线程主动让出（task_yield）自旋等待
-     * g_display_active 置位（显示服务调用 SYS_DISPLAY_READY 的握手即刻位），
-     * 确认其已合成桌面并进入消息循环、能立即接收后续服务的 IPC，再 spawn
-     * mouse-server 与 shell。这与上方 disk-srv 的 port_has_waiter 等待同构，
-     * 并加足够大的轮数上限（单核下每轮 yield 都会切换到 display-server 推进
-     * 其初始化；实测 display-server 完成 fb map + 桌面合成需要若干万轮 yield，
-     * 故上限取 200000，约数十秒；若仍异常未就绪则放行并告警，绝不无限自旋
-     * 挂死引导）。
-     * ========================================================== */
-    bool display_ready = false;
-    uint32_t waited = 0;
-    for (uint32_t i = 0; i < 2000; i++)
-    {
-        if (g_display_active)
-        {
-            display_ready = true;
-            break;
-        }
-        waited = i;
-        /* 用内核 msleep 让出（wall-clock 有界，约 10ms/轮，上限约 20s），而非快速
-         * 空转 yield：优先级抢占调度下 display-server 需经调度器“防饥饿老化”升到
-         * 交互优先级才被选中，快速 yield 会在其升到交互级之前就耗尽循环。 */
-        msleep(1);
-    }
-    if (display_ready)
-        kprintf("[boot] display-server ready (g_display_active=1, waited=%u yield rounds); "
-                "mounting dependent services...\n", waited);
-    else
-        kprintf("[boot] WARN: display-server did NOT become ready within "
-                "timeout; spawning services anyway (UI may be degraded)\n");
+    bootanim_progress(70);   /* 里程碑：输入服务已拉起 */
 
     /* Ring3 鼠标驱动（.kdr 形态，待 kdr 加载器就绪后改由加载器动态装载）。
      * 经 SYS_MOUSE_READ 拉取内核 IRQ12 采集的鼠标包，把光标事件经 DISPLAY_PORT
-     * 发给 display-server 渲染。须在显示服务就绪后挂载，确保其消息能被立即接收。 */
+     * 发给显示服务渲染。显示服务此刻已声明 ready（帧缓冲已映射），事件会先进入
+     * 其端口队列，交接后立即被处理。 */
     task_create_user(user_mouse_server_start,
                      (size_t)(user_mouse_server_end - user_mouse_server_start),
                      "SukiMouseServer");
+    bootanim_progress(78);   /* 里程碑：鼠标服务已拉起 */
+
+    /* ============================================================
+     * 开机动画收尾 + 交接（用户要求：全部初始化完成后才离开开机动画界面）。
+     *   1) bootanim_finish()：保证启动画面至少可见 BOOTANIM_MIN_MS，并把进度
+     *      平滑补到 100%。此刻驱动初始化、FS/网络/输入/鼠标/显示服务均已就绪；
+     *   2) bootanim_handoff()：放行显示服务 —— 它从 SYS_BOOT_SPLASH_WAIT 返回，
+     *      提交首帧桌面并进入消息循环，屏幕正式交给桌面。
+     * ========================================================== */
+    bootanim_finish();
+    bootanim_handoff();
+
     /* 启动 SukiLogon（预留：登录管理器）。当前无用户/密码库，直接进入桌面
      * （SukiDesktopManager 以 SukiShell 作为桌面占位替身）。 */
     SukiLogon();
@@ -711,13 +846,6 @@ static void boot_late_init(void *arg)
                      "SukiCurlAppTest");
     kprintf("[boot-dbg] curl_app_test spawn ret=%p\n", (void *)sp2d);
 
-    /* 动态链接验证：spawn dltest（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
-     * 验证内核 elf.c 的 ET_DYN 模块加载/重定位/符号解析（dlopen 路径）。 */
-    task_t *sp3 = task_create_user(user_dltest_start,
-                     (size_t)(user_dltest_end - user_dltest_start),
-                     "SukiDlTest");
-    kprintf("[boot-dbg] dltest spawn ret=%p\n", (void *)sp3);
-
     /* 窗口系统端到端自检：spawn winhello（libsuki_gui 创建窗口 + OOL 零拷贝合成）。
      * 验证「应用 -> WM_PORT -> 显示服务合成 -> 帧缓冲」全链路，输出经串口落盘。 */
     task_t *sp4 = task_create_user(user_winhello_start,
@@ -725,27 +853,25 @@ static void boot_late_init(void *arg)
                      "SukiWinHello");
     kprintf("[boot-dbg] winhello spawn ret=%p\n", (void *)sp4);
 
-    /* Rust 工具链开机自检（Part 2 验收，见 results/step70.md）：
-     * 把 cargo 编译的 SukiOS ELF（make make-rust-env + cargo build 产物）作为
-     * 内嵌 blob 直接 spawn，验证 Rust 程序可被内核 ELF 加载器装载、走 syscall
-     * ABI 打印 "hello from rust on SukiOS" 并经串口输出。仅当 blob 存在（weak
-     * 符号非空）时执行；缺失则跳过、不影响启动。 */
-    {
-        extern const uint8_t _binary_rusthello_start[] __attribute__((weak));
-        extern const uint8_t _binary_rusthello_end[]   __attribute__((weak));
-        const uint8_t *rb = _binary_rusthello_start;
-        const uint8_t *re = _binary_rusthello_end;
-        if (rb && re && re > rb) {
-            task_t *rt = task_create_user(rb, (size_t)(re - rb), "SukiRustHello");
-            if (rt)
-                kprintf("[rust-boot] spawned RUSTHELLO pid=%lu\n",
-                        (unsigned long)rt->id);
-            else
-                kprintf("[rust-boot] warn: RUSTHELLO spawn failed\n");
-        } else {
-            kprintf("[rust-boot] (skipped: rust ELF blob not built)\n");
-        }
-    }
+    /* libsui 控件库端到端自检：spawn suikitest（libsui 创建窗口 + 控件 + OOL 合成）。
+     * 验证「应用 -> WM_PORT -> 显示服务增量合成 -> 帧缓冲」全链路，输出经串口落盘。 */
+    task_t *sp5 = task_create_user(user_suikitest_start,
+                     (size_t)(user_suikitest_end - user_suikitest_start),
+                     "SukiSuiTest");
+    kprintf("[boot-dbg] suikitest spawn ret=%p\n", (void *)sp5);
+
+    /* 动态链接验证：spawn dltest（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
+     * 验证内核 elf.c 的 ET_DYN 模块加载/重定位/符号解析（dlopen 路径）。
+     * 注：dltest 内嵌 blob 体积较大，load_elf 偶发长耗时；故置于 winhello/suikitest
+     * 之后，确保 GUI 自检先完成、不阻塞窗口链路验证。 */
+    task_t *sp3 = task_create_user(user_dltest_start,
+                     (size_t)(user_dltest_end - user_dltest_start),
+                     "SukiDlTest");
+    kprintf("[boot-dbg] dltest spawn ret=%p\n", (void *)sp3);
+
+    /* 注：Rust 工具链开机自检（原 RUSTHELLO / STDTEST 内嵌 blob spawn）已按
+     * 用户决策整体移除——不再向内核注入任何 Rust ELF；内核启动与 GUI/WM 自检
+     * 由 winhello 等 C 程序承担，保持零 Rust 依赖、可稳定启动。 */
 
     kprintf("[boot] core services spawned (input+display); shell deferred "
             "until display layer ready.\n\n");

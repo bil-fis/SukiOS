@@ -1,0 +1,1 @@
+{"rustc":4647323300477708746,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[3778966308548958430,"build_script_build",false,14630607603705727035]],"local":[{"RerunIfChanged":{"output":"x86_64-sukios/debug/build/std/6a84558b1d6adde4/run/stdout","paths":["build.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}

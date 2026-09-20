@@ -760,6 +760,18 @@ typedef struct suki_fd_set {
 #define SYS_SUKI_PROC_CREATE    148
 #define SYS_SUKI_MEM_ALLOC      149
 
+/* ---- G''. SukiNative Phase 3：原生 OS 能力（214..）----
+ * 面向「不经 POSIX 层」的调用者（典型为 Rust std 的 sukios 后端）：时间、休眠、
+ * 随机、以及后续的文件元数据/目录/线程等。号位自 214 起（200..213 已被内核扩展
+ * 占用），按需递增，统一实现于 kernel/syscall/sys_suki.c。
+ * 约定：成功返回 >=0（或直接返回值本身），失败返回 -SUKI_E*。 */
+#define SYS_SUKI_TIME_MONOTONIC 214  /* 无参 -> 自启动起的单调纳秒（u64） */
+#define SYS_SUKI_TIME_REALTIME  215  /* 无参 -> Unix Epoch 纳秒（u64） */
+#define SYS_SUKI_SLEEP_NS       216  /* a1=纳秒 -> 睡眠至少该时长（不忙等），返回 0 */
+#define SYS_SUKI_RANDOM         217  /* a1=用户缓冲, a2=字节数 -> 写入字节数 */
+#define SYS_SUKI_FUTEX_WAIT     218  /* a1=u32* 用户地址, a2=期望值, a3=超时ns(0=永久) */
+#define SYS_SUKI_FUTEX_WAKE     219  /* a1=u32* 用户地址, a2=唤醒个数(<=0 全部) -> 唤醒数 */
+
 /* ---- G'（续）SukiNative ABI 公共类型（内核/用户共享，单一真相源）---- */
 typedef enum {
     SUKI_OT_NONE  = 0,
@@ -834,6 +846,25 @@ typedef struct suki_objinfo {
  *   返回实际拷贝字节数（0=暂无数据），非法指针返回 (uint64_t)-1。 */
 #define SYS_TTY_READ        211
 
+/* 内核扩展：按路径读取注册表值（内核缓存的 system.sre，只读；写入由
+ * CONFIG_SERVER 负责）。路径形如 "System/Boot/ShowLogo"（首段=根键名，
+ * 中间段=子键名，末段=值名）。
+ *   参数 a1 = 用户态路径字符串（NUL 结尾）；
+ *        a2 = 用户态输出缓冲；a3 = 缓冲容量（字节）；
+ *        a4 = 用户态 uint32_t*（可传 0），回填值的类型（SUKREG_TYPE_*）；
+ *   返回实际写入缓冲的字节数（>=0）；路径不存在返回 -1；参数/指针非法返回 -2。
+ * 说明：System/Boot/BootDeviceType 在注册表内只是「标识」，真实启动设备由内核
+ * 探测决定，本调用返回的即探测结果（"disk"/"cdrom"/"none"）。 */
+#define SYS_REGISTRY_READ   212
+
+/* 内核扩展：启动画面交接闸门（仅显示服务使用）。
+ * 内核在启动早期绘制「开机动画（启动图 + 进度条）」，并持有屏幕；显示服务在
+ * 映射帧缓冲、声明 SYS_DISPLAY_READY 之后调用本调用【阻塞等待】，直到内核完成
+ * 全部初始化（驱动 + 各 Ring3 服务）并放行。返回 0 表示可以绘制桌面/进入消息
+ * 循环（此后屏幕交给显示服务，进入用户登录/桌面流程）。
+ * 参数：无；返回：恒 0。 */
+#define SYS_BOOT_SPLASH_WAIT 213
+
 /* 内核扩展：Ring3 程序（如 BMP 加载器）请求把一块像素 blit 到帧缓冲，用于显示
  * 诊断（检查画面乱码/错位）。内核拥有帧缓冲内核映射，直接写入。
  *   参数 a1 = 用户态像素缓冲（uint32_t*，xRGB32 格式：(r<<16)|(g<<8)|b）；
@@ -864,7 +895,7 @@ typedef struct suki_objinfo {
  *    成功返回 0，失败（指针非法）返回 (uint64_t)-1。事件语义见 kernel/mouse.h。 */
 #define SYS_MOUSE_READ      204
 
-#define SYSCALL_MAX         204
+#define SYSCALL_MAX         217
 
 /* ========================================================================== */
 /*  六、每进程资源上限（内核 fd 表规模等）                                     */

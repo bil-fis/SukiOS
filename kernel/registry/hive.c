@@ -12,6 +12,7 @@
  */
 #include <kernel/registry.h>
 #include <kernel/string.h>
+#include <mm/kmalloc.h>   /* RegistryCacheSystem：缓存整份 hive 字节 */
 
 /* 小端读取辅助 */
 static uint32_t le32(const uint8_t *p)
@@ -205,6 +206,17 @@ static const uint8_t *FindValueByPath(const uint8_t *base, uint64_t total,
                           out_type, out_len);
 }
 
+/* 把 hive 中的字符串值拷入定长字段（超长安全截断，恒以 NUL 结尾）。 */
+static void CopyStrField(char *dst, size_t cap, const uint8_t *src, uint64_t len)
+{
+    if (!dst || cap == 0)
+        return;
+    size_t n = ((size_t)len < cap - 1) ? (size_t)len : cap - 1;
+    if (src && n)
+        memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 bool RegistryParseSystem(const uint8_t *data, size_t size, system_config_t *cfg)
 {
     if (!data || !cfg || size < SUKREG_HEADER_SIZE)
@@ -266,5 +278,159 @@ bool RegistryParseSystem(const uint8_t *data, size_t size, system_config_t *cfg)
         cfg->have_verbose = true;
         cfg->boot_verbose = (len > 0 && v[0] != 0);
     }
+
+    /* ---- System/Boot：启动设备标识 + 启动画面（图标/进度条/自定义 logo）---- */
+    v = FindValueByPath(data, total, root_off, "System/Boot/BootDeviceType",
+                        &type, &len);
+    if (v && type == SUKREG_TYPE_STRING) {
+        cfg->have_boot_device_type = true;
+        CopyStrField(cfg->boot_device_type, sizeof(cfg->boot_device_type), v, len);
+    }
+    v = FindValueByPath(data, total, root_off, "System/Boot/ShowLogo", &type, &len);
+    if (v && type == SUKREG_TYPE_BOOL) {
+        cfg->have_show_logo = true;
+        cfg->show_logo = (len > 0 && v[0] != 0);
+    }
+    v = FindValueByPath(data, total, root_off, "System/Boot/ShowProgress",
+                        &type, &len);
+    if (v && type == SUKREG_TYPE_BOOL) {
+        cfg->have_show_progress = true;
+        cfg->show_progress = (len > 0 && v[0] != 0);
+    }
+    v = FindValueByPath(data, total, root_off, "System/Boot/BootLogoID",
+                        &type, &len);
+    if (v && type == SUKREG_TYPE_STRING) {
+        cfg->have_boot_logo_id = true;
+        CopyStrField(cfg->boot_logo_id, sizeof(cfg->boot_logo_id), v, len);
+    }
+    v = FindValueByPath(data, total, root_off, "System/Boot/CustomLogo/Enabled",
+                        &type, &len);
+    if (v && type == SUKREG_TYPE_BOOL) {
+        cfg->have_custom_logo = true;
+        cfg->custom_logo_enabled = (len > 0 && v[0] != 0);
+    }
+    v = FindValueByPath(data, total, root_off, "System/Boot/CustomLogo/Path",
+                        &type, &len);
+    if (v && type == SUKREG_TYPE_STRING) {
+        cfg->have_custom_logo = true;
+        CopyStrField(cfg->custom_logo_path, sizeof(cfg->custom_logo_path), v, len);
+    }
+    v = FindValueByPath(data, total, root_off, "System/Boot/CustomLogo/DirectPath",
+                        &type, &len);
+    if (v && type == SUKREG_TYPE_STRING) {
+        cfg->have_custom_logo = true;
+        CopyStrField(cfg->custom_logo_direct_path,
+                     sizeof(cfg->custom_logo_direct_path), v, len);
+    }
     return true;
+}
+
+/* ===========================================================================
+ * 运行时缓存 + 按路径查询 + 动态值覆盖
+ * ===========================================================================
+ * 内核只读注册表；SYS_REGISTRY_READ 让 Ring3 也可按路径取值。缓存整份
+ * system.sre 字节（前序键树），任意路径查询都直接在缓存里导航，无需重读磁盘。
+ * 动态覆盖用于「注册表内只是标识、真实值由内核探测」的键：典型为
+ * System/Boot/BootDeviceType —— 用户态读它时拿到的是内核实际探测结果。
+ */
+
+static uint8_t *g_reg_cache = NULL;      /* 缓存的 hive 字节（kmalloc） */
+static size_t   g_reg_size = 0;          /* 缓存字节数 */
+
+#define REG_OVERRIDE_MAX 8
+static struct {
+    const char *path;
+    const char *value;
+} g_reg_override[REG_OVERRIDE_MAX];
+static int g_reg_override_n = 0;
+
+bool RegistryCacheSystem(const uint8_t *data, size_t size)
+{
+    if (!data || size < SUKREG_HEADER_SIZE)
+        return false;
+    uint8_t *copy = (uint8_t *)kmalloc(size);
+    if (!copy)
+        return false;
+    memcpy(copy, data, size);
+    if (g_reg_cache)
+        kfree(g_reg_cache);
+    g_reg_cache = copy;
+    g_reg_size = size;
+    /* 覆盖表按新缓存作废（启动期只缓存一次，此处仅为语义严谨）。 */
+    g_reg_override_n = 0;
+    return true;
+}
+
+bool RegistryOverrideLookup(const char *path, const char **out_value)
+{
+    if (!path)
+        return false;
+    for (int i = 0; i < g_reg_override_n; i++) {
+        const char *p = g_reg_override[i].path;
+        const char *q = path;
+        while (*p && *p == *q) { p++; q++; }
+        if (*p == '\0' && *q == '\0') {
+            if (out_value)
+                *out_value = g_reg_override[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+void RegistrySetOverrideString(const char *path, const char *value)
+{
+    if (!path || !value)
+        return;
+    for (int i = 0; i < g_reg_override_n; i++) {
+        const char *p = g_reg_override[i].path;
+        const char *q = path;
+        while (*p && *p == *q) { p++; q++; }
+        if (*p == '\0' && *q == '\0') {
+            g_reg_override[i].value = value;   /* 替换（值字符串由调用方常驻持有） */
+            return;
+        }
+    }
+    if (g_reg_override_n >= REG_OVERRIDE_MAX)
+        return;
+    g_reg_override[g_reg_override_n].path = path;
+    g_reg_override[g_reg_override_n].value = value;
+    g_reg_override_n++;
+}
+
+int RegistryQuery(const char *path, uint32_t *out_type,
+                  const uint8_t **out_data, uint64_t *out_len)
+{
+    /* 1) 动态覆盖优先：内核探测出的真实值（如 BootDeviceType） */
+    {
+        const char *ov = NULL;
+        if (RegistryOverrideLookup(path, &ov) && ov) {
+            if (out_type) *out_type = SUKREG_TYPE_STRING;
+            if (out_data) *out_data = (const uint8_t *)ov;
+            if (out_len)  *out_len = (uint64_t)strlen(ov);
+            return 0;
+        }
+    }
+    /* 2) 静态 hive */
+    if (!g_reg_cache || g_reg_size < SUKREG_HEADER_SIZE)
+        return -1;
+    const sukreg_header_t *h = (const sukreg_header_t *)g_reg_cache;
+    if (memcmp(h->magic, "SUKREG\0\0", 8) != 0)
+        return -1;
+    uint64_t body_size = h->body_size;
+    if (body_size > g_reg_size - SUKREG_HEADER_SIZE)
+        return -1;
+    uint64_t total = SUKREG_HEADER_SIZE + body_size;
+    uint64_t root_off = h->root_offset;
+    if (root_off < SUKREG_HEADER_SIZE || root_off > total)
+        return -1;
+    uint32_t t = 0;
+    uint64_t l = 0;
+    const uint8_t *v = FindValueByPath(g_reg_cache, total, root_off, path, &t, &l);
+    if (!v)
+        return -1;
+    if (out_type) *out_type = t;
+    if (out_data) *out_data = v;
+    if (out_len)  *out_len = l;
+    return 0;
 }

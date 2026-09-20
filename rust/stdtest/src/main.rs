@@ -1,64 +1,91 @@
-// rust/stdtest/src/main.rs
-//
-// Rust 标准库（std）在 SukiOS 上的冒烟测试：
-//   * println! 走 stdio（std 的 sys::stdio 后端）
-//   * Vec/String/HashMap 走 std 的全局分配器（sys::alloc 后端）
-//   * std::env::args 走 sys::args 后端
-//   * std::time 走 sys::time 后端
-// 构建：cd rust/stdtest && cargo +nightly build -Zbuild-std=std,panic_abort
-//
-// 注意：sukios 是自定义目标，std 视其为「受限平台」，需开启 restricted_std；
-// 且 Rust 的 std 二进制默认无 crt0、`_start` 入口，故用 #![no_main] 自行提供
-// System V 初始栈入口 `_start`，最后用公开的 std::process::exit 终止。
-
+// sukios 是自定义目标，std 视其为「受限平台」，需显式开启该 feature 才能使用 std。
 #![feature(restricted_std)]
 #![no_main]
 
-// SukiOS 内核按 System V 初始栈把控制权交给 ELF 入口 `_start`：
-//   [rsp]                 = argc (i32)
-//   [rsp+8 ..]            = argv[0..argc]（指针数组，以 NULL 结尾）
-//   [rsp+8+(argc+1)*8 ..] = envp[]（指针数组，以 NULL 结尾）
+use std::arch::asm;
+
+/// 绕过 std、直接用 SukiNative SYS_DEBUG_WRITE(=4) 写串口的诊断输出。
+/// 约定与 `sukios_ffi::write` 一致：a1=buf, a2=len（fd 被内核忽略）。
+#[inline(never)]
+unsafe fn raw_write(s: &[u8]) {
+    asm!(
+        "mov rax, 4",
+        "mov rdi, {buf}",
+        "mov rsi, {len}",
+        "syscall",
+        buf = in(reg) s.as_ptr(),
+        len = in(reg) s.len(),
+        out("rax") _, out("rdi") _, out("rsi") _, out("rdx") _,
+        out("rcx") _, out("r11") _,
+        options(nostack)
+    );
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> ! {
+    raw_write(b"S0 _start\n");
+
+    // panic hook 用裸 syscall 写出崩溃位置（std 的 stdout 可能自身异常，故绕过）。
+    std::panic::set_hook(Box::new(|info: &std::panic::PanicInfo| {
+        unsafe {
+            raw_write(b"PANIC@");
+            if let Some(l) = info.location() {
+                let f = l.file();
+                raw_write(f.as_bytes());
+            }
+            raw_write(b"\n");
+        }
+    }));
+    raw_write(b"S1 hook_set\n");
+
     let sp: usize;
-    core::arch::asm!("mov {}, rsp", out(reg) sp, options(nostack));
+    asm!("mov {}, rsp", out(reg) sp, options(nostack));
     let _argc = *(sp as *const i32);
     let _argv = sp.wrapping_add(8) as *const *const u8;
-    let _envp = sp.wrapping_add(8).wrapping_add((_argc as usize + 1) * 8) as *const *const u8;
-    // 注：std::env 的参数登记由 std 内部在运行时初始化阶段完成（sukios 后端经
-    // native_set_args）；#![no_main] 下跳过 lang_start，此处仅读取栈布局备用。
-    let _ = (_argv, _envp);
-    std_test_main();
+    let _ = (_argc, _argv);
+
+    // 防御性栈对齐：进入测试体前把 %rsp 对齐到 16 字节并预留 8 字节返回槽。
+    asm!(
+        "and rsp, 0xFFFFFFFFFFFFFFF0",
+        "sub rsp, 8",
+        "call {0}",
+        in(reg) std_test_main,
+    );
     std::process::exit(0);
 }
 
-fn std_test_main() {
-    println!("[stdtest] hello from Rust std on SukiOS");
+unsafe extern "C" fn std_test_main() {
+    raw_write(b"T0\n");
+    println!("[stdtest] hello from rust std on SukiOS");
+    raw_write(b"T1\n");
 
-    let args: Vec<String> = std::env::args().collect();
-    println!("[stdtest] args = {:?}", args);
+    let _v: Vec<u32> = (0..3).collect();
+    raw_write(b"T2\n");
+    println!("args = {:?}", std::env::args().collect::<Vec<_>>());
+    raw_write(b"T3\n");
 
-    let v: Vec<u32> = (1..=10).collect();
-    let sum: u32 = v.iter().sum();
-    println!("[stdtest] Vec sum(1..=10) = {}", sum);
+    let mut s = String::from("abc");
+    s.push('d');
+    raw_write(b"T4\n");
+    println!("s = {}", s);
+    raw_write(b"T5\n");
 
-    let mut s = String::from("Suki");
-    s.push_str("OS");
-    println!("[stdtest] String = {} (len={})", s, s.len());
+    let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    m.insert(1, 2);
+    raw_write(b"T6\n");
+    println!("m = {:?}", m);
+    raw_write(b"T7\n");
 
-    let mut m = std::collections::HashMap::new();
-    m.insert("os", "SukiOS");
-    m.insert("arch", "x86_64");
-    println!("[stdtest] HashMap[os] = {:?}", m.get("os"));
+    let _cur = std::thread::current();
+    let _n = _cur.name();
+    raw_write(b"T8\n");
+    println!("thread name = {:?}", _n);
+    raw_write(b"T9\n");
 
-    let t = std::time::Instant::now();
-    let mut acc = 0u64;
-    for i in 0..100_000u64 {
-        acc = acc.wrapping_add(i);
-    }
-    println!("[stdtest] loop acc={} took {:?}", acc, t.elapsed());
-
-    println!("[stdtest] thread name = {:?}", std::thread::current().name());
-
+    let t0 = std::time::Instant::now();
+    let _x: u64 = (0..1000).map(|i| i as u64).sum();
+    let _ = t0.elapsed();
+    raw_write(b"T10\n");
     println!("[stdtest] PASS");
+    raw_write(b"T11\n");
 }

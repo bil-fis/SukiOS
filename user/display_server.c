@@ -33,6 +33,10 @@
 #define MOUSE_CURSOR_W 12
 #define MOUSE_CURSOR_H 18
 
+/* 增量渲染：维护脏矩形列表，仅把变化区域重新合成并拷贝到帧缓冲 */
+static void mark_dirty(int x, int y, int w, int h);
+static void flush_dirty(void);
+
 /* ---- 帧缓冲映射结果（与内核 include/kernel/framebuffer.h 逐字节布局一致） ---- */
 typedef struct fb_map_result {
     uint32_t enabled;
@@ -56,43 +60,21 @@ static uint32_t g_fb_pitch  = 0;         /* 字节/行 */
 static uint32_t g_stride    = 0;         /* 像素/行 = pitch/4 */
 static uint32_t *g_canvas   = NULL;      /* 合成画布（双缓冲后缓冲，指向 g_desk） */
 
-/* 桌面顶部装饰条高度（纯几何，无文字） */
-#define TITLE_H    40
-
 /* 颜色（xRGB32） */
-#define COL_DESKTOP   0x00101926
-#define COL_BAR       0x003A2A4A
-#define COL_ACCENT    0x00579BFE
-#define COL_CLOSEBG   0x00C0392B
-#define COL_CLOSEFG   0x00FFFFFF
+#define COL_DESKTOP       0x00000000   /* 帧缓冲背景 = 纯黑（已删除桌面装饰条） */
+#define COL_BAR_INACTIVE  0x003A2A4A   /* 非活动窗口标题栏（窗口装饰，非桌面） */
+#define COL_ACCENT        0x00579BFE
+#define COL_CLOSEBG       0x00C0392B
+#define COL_CLOSEFG       0x00FFFFFF
 
-/* 像素写入真实帧缓冲（含边界保护） */
-static inline void fb_px(uint32_t x, uint32_t y, uint32_t rgb)
-{
-    if (x >= g_fb_width || y >= g_fb_height) return;
-    g_canvas[y * g_stride + x] = rgb;
-}
-
-static void fill_rect_fb(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
-{
-    if (x >= g_fb_width) return;
-    if (x + w > g_fb_width) w = g_fb_width - x;
-    for (uint32_t j = 0; j < h; j++) {
-        uint32_t py = y + j;
-        if (py >= g_fb_height) break;
-        uint32_t *row = g_canvas + (uint64_t)py * g_stride + x;
-        for (uint32_t i = 0; i < w; i++) row[i] = rgb;
-    }
-}
-
-/* 仅绘制纯色背景 + 顶部装饰条（不渲染任何字符 / 终端窗口） */
+/* 背景纯黑。显示服务不渲染任何桌面元素（装饰条 / 菜单栏 / 任务栏等），
+ * 仅做窗口管理与合成，故此处只填纯黑；未变化的区域完全不重绘。 */
 static void draw_desktop(void)
 {
     for (uint32_t y = 0; y < g_fb_height; y++) {
         uint32_t *row = g_desk + (uint64_t)y * g_stride;
         for (uint32_t x = 0; x < g_fb_width; x++) row[x] = COL_DESKTOP;
     }
-    fill_rect_fb(0, 0, g_fb_width, TITLE_H, COL_BAR);
 }
 
 /* ===========================================================================
@@ -180,7 +162,8 @@ static void wm_handle_create(const wm_create_req_t *req, mach_msg_header_t *hdr)
     char b[16]; u_print(u_utoa_s(w->id, b, sizeof(b)));
     u_print("\n");
     wm_set_focus(w);
-    composite();
+    mark_dirty(w->x, w->y, (int)w->w, (int)w->h);
+    flush_dirty();
     return;
 fail:
     resp.h.msgh_bits        = MACH_SEND_MSG;
@@ -202,7 +185,8 @@ static void wm_handle_flush(wm_flush_req_t *f)
     memcpy(w->pixels, src, cp);
     /* 解映射收到的 OOL 物理页（引用计数 -1）；mach_msg_destroy 仅取 OOL 虚拟地址 */
     mach_msg_destroy((uint64_t)f->ool.address);
-    composite();
+    mark_dirty((int)w->x, (int)w->y, (int)w->w, (int)w->h);
+    flush_dirty();
 }
 
 static void wm_handle_destroy(const wm_destroy_req_t *m)
@@ -215,6 +199,8 @@ static void wm_handle_destroy(const wm_destroy_req_t *m)
     /* 销毁前清理焦点/拖拽悬空引用，避免键盘/拖拽后续转发到已释放窗口 */
     if (g_focus == w) g_focus = NULL;
     if (g_drag  == w) g_drag  = NULL;
+    /* 销毁前先记录旧位置（数组移除后会覆盖该槽，故提前保存供增量重绘） */
+    int ddx = w->x, ddy = w->y; uint32_t ddw = w->w, ddh = w->h;
     uint64_t need = (uint64_t)w->w * w->h * 4;
     sys_munmap(w->pixels, need);
     /* 从数组中移除（保留顺序=Z 稳定） */
@@ -222,7 +208,8 @@ static void wm_handle_destroy(const wm_destroy_req_t *m)
     for (int i = idx; i + 1 < g_win_count; i++) g_wins[i] = g_wins[i + 1];
     g_win_count--;
     u_print("[wm] window destroyed\n");
-    composite();
+    mark_dirty(ddx, ddy, (int)ddw, (int)ddh);
+    flush_dirty();
 }
 
 static void wm_handle_set_event(const wm_set_event_req_t *m)
@@ -261,6 +248,7 @@ static void wm_set_focus(wm_window_t *w)
     if (g_focus == w) return;
     if (g_focus) {
         g_focus->has_focus = false;
+        mark_dirty(g_focus->x, g_focus->y, (int)g_focus->w, (int)g_focus->h);
         suki_event_t ev; memset(&ev, 0, sizeof(ev));
         ev.type = SUKI_EVENT_WINDOW_FOCUS;
         ev.u.mouse.buttons = 0;
@@ -269,6 +257,7 @@ static void wm_set_focus(wm_window_t *w)
     g_focus = w;
     if (g_focus) {
         g_focus->has_focus = true;
+        mark_dirty(g_focus->x, g_focus->y, (int)g_focus->w, (int)g_focus->h);
         suki_event_t ev; memset(&ev, 0, sizeof(ev));
         ev.type = SUKI_EVENT_WINDOW_FOCUS;
         ev.u.mouse.buttons = 1;
@@ -333,61 +322,150 @@ static void cursor_move_only(int32_t oldx, int32_t oldy)
     draw_cursor_at(g_cur_x, g_cur_y);
 }
 
-static void composite(void)
+/* ===========================================================================
+ * 增量合成器
+ * - 维护脏矩形列表；仅把变化区域重新合成并拷贝到帧缓冲（未变化的区域与对应
+ *   显存完全不重绘、不拷贝）。
+ * - 背景 = 纯黑（draw_desktop 只填黑），故清脏区域即填黑。
+ * - 光标单独画到显存（不参与离屏层，鼠标移动可据此做局部擦除）。
+ * ======================================================================== */
+#define MAX_DIRTY 8
+static int  g_dirty_n = 0;
+static int  g_dirty[MAX_DIRTY][4];   /* x, y, w, h */
+/* 当前合成裁剪窗（窗口局部刷新 / 移动时只绘制相交区域） */
+static int  g_clx, g_cly, g_clw, g_clh;
+
+/* 在 g_canvas（=g_desk）上把矩形 [x,y,w,h] 与裁剪窗 + 屏幕相交后填充 rgb */
+static void fill_clip(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb)
 {
-    if (!g_fb || !g_desk) return;
-    /* 双缓冲：合成到 g_desk（g_canvas）后一次性提交到帧缓冲 */
-    g_canvas = g_desk;
-    draw_desktop();
-    /* 窗口（Z-order = 创建顺序，后者在上） */
-    for (int i = 0; i < g_win_count; i++) {
-        wm_window_t *w = &g_wins[i];
-        if (!w->visible) continue;
-        int32_t x0 = w->x, y0 = w->y;
-        uint32_t ww = w->w, hh = w->h;
-        if (x0 + (int32_t)ww <= 0 || y0 + (int32_t)hh <= 0 ||
-            x0 >= (int32_t)g_fb_width || y0 >= (int32_t)g_fb_height) continue;
-        int32_t cx0 = x0 < 0 ? 0 : x0;
-        int32_t cy0 = y0 < 0 ? 0 : y0;
-        int32_t cx1 = (x0 + (int32_t)ww > (int32_t)g_fb_width) ? (int32_t)g_fb_width : x0 + (int32_t)ww;
-        int32_t cy1 = (y0 + (int32_t)hh > (int32_t)g_fb_height) ? (int32_t)g_fb_height : y0 + (int32_t)hh;
-        /* 逐【行】memcpy：源/目标 stride 不同时逐行拷贝（原为逐像素赋值） */
-        for (int32_t y = cy0; y < cy1; y++) {
-            const uint32_t *s = w->pixels + (uint64_t)(y - y0) * ww + (uint32_t)(cx0 - x0);
-            uint32_t *d = g_canvas + (uint64_t)y * g_stride + (uint32_t)cx0;
-            memcpy(d, s, (size_t)(cx1 - cx0) * 4);
-        }
-        /* 窗口装饰：边框 + 标题栏（纯几何，无文字）+ 关闭按钮 */
-        uint32_t border = 2;
-        fill_rect_fb((uint32_t)x0, (uint32_t)y0, ww, border, COL_ACCENT);
-        fill_rect_fb((uint32_t)x0, (uint32_t)y0 + hh - border, ww, border, COL_ACCENT);
-        fill_rect_fb((uint32_t)x0, (uint32_t)y0, border, hh, COL_ACCENT);
-        fill_rect_fb((uint32_t)x0 + ww - border, (uint32_t)y0, border, hh, COL_ACCENT);
-        if (w->style & SUKI_WS_TITLEBAR) {
-            uint32_t bar_h = WIN_TITLE_H;
-            if (hh >= bar_h) {
-                fill_rect_fb((uint32_t)x0 + border, (uint32_t)y0 + border,
-                             ww - border * 2, bar_h - border,
-                             w->has_focus ? COL_ACCENT : COL_BAR);
-                /* 关闭按钮（标题栏右上角）：红底 + 白色 X（纯几何，非字符渲染） */
-                int32_t bx = (int32_t)x0 + (int32_t)ww - 18;
-                int32_t by = (int32_t)y0 + 2;
-                if (bx >= 0 && by >= 0) {
-                    fill_rect_fb((uint32_t)bx, (uint32_t)by, 16, 16, COL_CLOSEBG);
-                    for (int32_t i = 3; i < 13; i++) {
-                        if (bx + i < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
-                            g_canvas[(by + i) * g_stride + (bx + i)] = COL_CLOSEFG;
-                        if (bx + (15 - i) >= 0 && bx + (15 - i) < (int32_t)g_fb_width &&
-                            by + i < (int32_t)g_fb_height)
-                            g_canvas[(by + i) * g_stride + (bx + (15 - i))] = COL_CLOSEFG;
-                    }
+    int cx0 = g_clx, cy0 = g_cly, cx1 = g_clx + g_clw, cy1 = g_cly + g_clh;
+    int x1 = (int)(x + w), y1 = (int)(y + h);
+    if ((int)x >= cx1 || (int)y >= cy1 || x1 <= cx0 || y1 <= cy0) return;
+    int bx = (int)x < cx0 ? cx0 : (int)x;
+    int by = (int)y < cy0 ? cy0 : (int)y;
+    int ex = x1 > cx1 ? cx1 : x1;
+    int ey = y1 > cy1 ? cy1 : y1;
+    if (bx < 0) bx = 0;
+    if (by < 0) by = 0;
+    if (ex > (int)g_fb_width)  ex = (int)g_fb_width;
+    if (ey > (int)g_fb_height) ey = (int)g_fb_height;
+    for (int j = by; j < ey; j++) {
+        uint32_t *row = g_canvas + (uint64_t)j * g_stride;
+        for (int i = bx; i < ex; i++) row[i] = rgb;
+    }
+}
+
+/* 绘制单个窗口的像素 + 几何装饰，仅输出与裁剪窗相交部分（背景黑由调用方清除） */
+static void wm_paint_window(wm_window_t *w)
+{
+    if (!w->visible) return;
+    int32_t x0 = w->x, y0 = w->y;
+    uint32_t ww = w->w, hh = w->h;
+    int c0x = g_clx, c0y = g_cly, c1x = g_clx + g_clw, c1y = g_cly + g_clh;
+    int wx1 = (int)(x0 + ww), wy1 = (int)(y0 + hh);
+    if (x0 >= c1x || y0 >= c1y || wx1 <= c0x || wy1 <= c0y) return;  /* 不相交 */
+    int by0 = y0 < c0y ? c0y : y0;
+    int by1 = wy1 > c1y ? c1y : wy1;
+    int bx0 = x0 < c0x ? c0x : x0;
+    int bx1 = wx1 > c1x ? c1x : wx1;
+    if (by0 < 0) by0 = 0;
+    if (bx0 < 0) bx0 = 0;
+    if (by1 > (int)g_fb_height) by1 = (int)g_fb_height;
+    if (bx1 > (int)g_fb_width)  bx1 = (int)g_fb_width;
+    /* 像素逐行 memcpy（源/目标 stride 不同时逐行） */
+    for (int y = by0; y < by1; y++) {
+        const uint32_t *s = w->pixels + (uint64_t)(y - y0) * ww + (uint32_t)(bx0 - x0);
+        uint32_t *d = g_canvas + (uint64_t)y * g_stride + (uint32_t)bx0;
+        memcpy(d, s, (size_t)(bx1 - bx0) * 4);
+    }
+    /* 窗口装饰：边框 + 标题栏（纯几何，无文字）+ 关闭按钮 */
+    uint32_t b = 2;
+    fill_clip((uint32_t)x0, (uint32_t)y0, ww, b, COL_ACCENT);
+    fill_clip((uint32_t)x0, (uint32_t)y0 + hh - b, ww, b, COL_ACCENT);
+    fill_clip((uint32_t)x0, (uint32_t)y0, b, hh, COL_ACCENT);
+    fill_clip((uint32_t)x0 + ww - b, (uint32_t)y0, b, hh, COL_ACCENT);
+    if (w->style & SUKI_WS_TITLEBAR) {
+        uint32_t bar_h = WIN_TITLE_H;
+        if (hh >= bar_h) {
+            fill_clip((uint32_t)x0 + b, (uint32_t)y0 + b, ww - b * 2, bar_h - b,
+                      w->has_focus ? COL_ACCENT : COL_BAR_INACTIVE);
+            int32_t bx = (int32_t)x0 + (int32_t)ww - 18;
+            int32_t by = (int32_t)y0 + 2;
+            if (bx >= 0 && by >= 0) {
+                fill_clip((uint32_t)bx, (uint32_t)by, 16, 16, COL_CLOSEBG);
+                for (int32_t i = 3; i < 13; i++) {
+                    int32_t px = bx + i;
+                    if (px >= g_clx && px < c1x && by + i >= g_cly && by + i < c1y &&
+                        px < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
+                        g_canvas[(uint64_t)(by + i) * g_stride + px] = COL_CLOSEFG;
+                    int32_t px2 = bx + (15 - i);
+                    if (px2 >= g_clx && px2 < c1x && by + i >= g_cly && by + i < c1y &&
+                        px2 < (int32_t)g_fb_width && by + i < (int32_t)g_fb_height)
+                        g_canvas[(uint64_t)(by + i) * g_stride + px2] = COL_CLOSEFG;
                 }
             }
         }
     }
-    /* 提交完整帧到帧缓冲（离屏层 g_desk 始终【不含】光标） */
+}
+
+/* 重绘单个脏矩形：清黑 -> 重绘相交窗口 -> 仅拷贝该区域到帧缓冲 */
+static void redraw_region(int rx, int ry, int rw, int rh)
+{
+    if (!g_fb || !g_desk) return;
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rw <= 0 || rh <= 0) return;
+    if (rx + rw > (int)g_fb_width)  rw = (int)g_fb_width - rx;
+    if (ry + rh > (int)g_fb_height) rh = (int)g_fb_height - ry;
+    if (rw <= 0 || rh <= 0) return;
+    g_canvas = g_desk;
+    g_clx = rx; g_cly = ry; g_clw = rw; g_clh = rh;
+    /* 清黑（仅该区域） */
+    for (int y = ry; y < ry + rh; y++)
+        memset(g_canvas + (uint64_t)y * g_stride + rx, 0, (size_t)rw * 4);
+    /* 重绘相交窗口（Z-order = 创建顺序，后者在上） */
+    for (int i = 0; i < g_win_count; i++) wm_paint_window(&g_wins[i]);
+    /* 仅拷贝该区域到帧缓冲（离屏层 g_desk 始终【不含】光标） */
+    for (int y = ry; y < ry + rh; y++) {
+        const uint32_t *s = g_desk + (uint64_t)y * g_stride + rx;
+        uint32_t *d = (uint32_t *)g_fb + (uint64_t)y * g_stride + rx;
+        memcpy(d, s, (size_t)rw * 4);
+    }
+}
+
+void mark_dirty(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    if (g_dirty_n >= MAX_DIRTY) {   /* 超出上限：退化为全屏脏矩形 */
+        g_dirty[0][0] = 0; g_dirty[0][1] = 0;
+        g_dirty[0][2] = (int)g_fb_width; g_dirty[0][3] = (int)g_fb_height;
+        g_dirty_n = 1; return;
+    }
+    g_dirty[g_dirty_n][0] = x; g_dirty[g_dirty_n][1] = y;
+    g_dirty[g_dirty_n][2] = w; g_dirty[g_dirty_n][3] = h;
+    g_dirty_n++;
+}
+
+/* 处理所有累计脏矩形（增量提交到帧缓冲），最后重画光标 */
+static void flush_dirty(void)
+{
+    if (g_dirty_n == 0) return;
+    for (int i = 0; i < g_dirty_n; i++)
+        redraw_region(g_dirty[i][0], g_dirty[i][1],
+                      g_dirty[i][2], g_dirty[i][3]);
+    draw_cursor_at(g_cur_x, g_cur_y);   /* 光标最上层，只画到显存 */
+    g_dirty_n = 0;
+}
+
+/* 全屏合成（仅启动交接 / 显式全量刷新用） */
+static void composite(void)
+{
+    if (!g_fb || !g_desk) return;
+    g_canvas = g_desk;
+    draw_desktop();
+    g_clx = 0; g_cly = 0; g_clw = (int)g_fb_width; g_clh = (int)g_fb_height;
+    for (int i = 0; i < g_win_count; i++) wm_paint_window(&g_wins[i]);
     memcpy((void *)g_fb, g_desk, (size_t)g_fb_height * g_stride * sizeof(uint32_t));
-    /* 光标（最上层，只画到显存；后续鼠标移动可据此做局部擦除） */
     draw_cursor_at(g_cur_x, g_cur_y);
 }
 
@@ -413,16 +491,23 @@ int main(void)
     g_desk = (uint32_t *)sys_mmap((uint64_t)g_fb_height * g_stride * sizeof(uint32_t), 3);
     if (!g_desk) { u_print("display: desk alloc failed\n"); sys_exit(1); }
 
-    u_print("display: fb mapped @32bpp, pure compositor ready\n");
-
-    /* 3) 画布指向背景缓冲，绘制背景层（双缓冲：合成到 g_desk 后一次性提交） */
+    /* 3) 画布指向背景缓冲，绘制背景层（双缓冲：合成到 g_desk 后一次性提交）。
+     *    注意：这里只画【离屏】缓冲，不碰显存——此刻内核正显示开机动画。 */
     g_canvas = g_desk;
     draw_desktop();
 
-    /* 4) 通知内核：显示服务已接管帧缓冲（纯合成器，不再渲染字符） */
+    /* 4) 通知内核：显示服务已接管帧缓冲（此后内核诊断改走环形管道，不再写屏，
+     *    开机动画不会被诊断文本涂抹） */
     suki_syscall1(SYS_DISPLAY_READY, 0);
+    u_print("display: fb mapped @32bpp, pure compositor ready\n");
 
-    /* 4b) 立即合成并提交首帧（否则开局显存仍是上一阶段残留） */
+    /* 4a) 开机动画交接闸门：在内核完成【驱动 + 全部 Ring3 服务初始化 + 启动画面
+     *     收尾】之前，屏幕仍由内核的开机动画（启动图 + 进度条）占用；本服务在此
+     *     阻塞等待（内核用 msleep 让出 CPU，不忙等）。返回即表示系统启动完成，
+     *     可以提交桌面首帧并进入消息循环，随后进入用户登录/桌面流程。 */
+    suki_syscall1(SYS_BOOT_SPLASH_WAIT, 0);
+
+    /* 4b) 干净接手屏幕：提交首帧桌面（此前显存仍是开机动画画面） */
     composite();
 
     /* 5) 消息循环：同时轮询 DISPLAY_PORT（鼠标/键盘）与 WM_PORT（窗口管理） */
@@ -446,9 +531,12 @@ int main(void)
                 /* 拖拽进行中：直接跟随光标移动窗口（忽略命中） */
                 if (g_drag) {
                     if (h->msgh_id == MOUSE_MSG_MOVE) {
+                        int32_t ox = g_drag->x, oy = g_drag->y;
                         g_drag->x = m->x - g_drag_offx;
                         g_drag->y = m->y - g_drag_offy;
-                        composite();
+                        mark_dirty(ox, oy, (int)g_drag->w, (int)g_drag->h);
+                        mark_dirty(g_drag->x, g_drag->y, (int)g_drag->w, (int)g_drag->h);
+                        flush_dirty();
                     } else if (h->msgh_id == MOUSE_MSG_BUTTON) {
                         /* 左键释放 -> 结束拖拽；并视情况下发 MOUSE_UP 给窗口 */
                         if (!(m->buttons & 1)) {
@@ -461,7 +549,7 @@ int main(void)
                                 ev.u.mouse.buttons = m->buttons;
                                 wm_forward_event(hit, &ev);
                             }
-                            composite();
+                            flush_dirty();
                         }
                     }
                     continue;
@@ -474,7 +562,7 @@ int main(void)
                             suki_event_t ev; memset(&ev, 0, sizeof(ev));
                             ev.type = SUKI_EVENT_WINDOW_CLOSE;
                             wm_forward_event(hit, &ev);
-                            composite();
+                            flush_dirty();
                             continue;
                         }
                         if (m->y >= hit->y && m->y < hit->y + (int32_t)WIN_TITLE_H) {
@@ -482,7 +570,7 @@ int main(void)
                             g_drag_offx = m->x - hit->x;
                             g_drag_offy = m->y - hit->y;
                             wm_set_focus(hit);
-                            composite();
+                            flush_dirty();
                             continue;
                         }
                     }
@@ -494,7 +582,7 @@ int main(void)
                         ev.u.mouse.buttons = m->buttons;
                         wm_forward_event(hit, &ev);
                     }
-                    composite();
+                    flush_dirty();
                 } else if (h->msgh_id == MOUSE_MSG_BUTTON) {
                     /* 松开：结束拖拽并下发 MOUSE_UP */
                     g_drag = NULL;
@@ -505,7 +593,7 @@ int main(void)
                         ev.u.mouse.buttons = m->buttons;
                         wm_forward_event(hit, &ev);
                     }
-                    composite();
+                    flush_dirty();
                 } else {
                     /* MOVE / WHEEL：转发给命中窗口 */
                     if (hit) {
@@ -519,7 +607,7 @@ int main(void)
                     if (h->msgh_id == MOUSE_MSG_MOVE) {
                         cursor_move_only(oldx, oldy);   /* 仅重画光标 */
                     } else {
-                        composite();
+                        flush_dirty();                  /* WHEEL 不改像素，仅清脏 */
                     }
                 }
             } else if (h->msgh_id == KEY_MSG_DOWN || h->msgh_id == KEY_MSG_UP) {
@@ -568,7 +656,12 @@ int main(void)
             case WM_MSG_SET_POS: {
                 wm_set_pos_req_t *r = (wm_set_pos_req_t *)msgbuf;
                 wm_window_t *w = wm_find(r->id);
-                if (w) { w->x = r->x; w->y = r->y; composite(); }
+                if (w) {
+                    mark_dirty(w->x, w->y, (int)w->w, (int)w->h);
+                    w->x = r->x; w->y = r->y;
+                    mark_dirty(w->x, w->y, (int)w->w, (int)w->h);
+                    flush_dirty();
+                }
                 break;
             }
             case WM_MSG_GET_FOCUS: {

@@ -16,7 +16,3 @@
 [submodule "lib/lua-5.4.9"]
 	path = lib/lua-5.4.9
 	url = https://github.com/lua/lua.git
-[submodule "lib/wpewebkit-2.54"]
-	path = lib/wpewebkit-2.54
-	url = https://github.com/WebKit/WebKit.git
-	branch = webkitglib/2.54

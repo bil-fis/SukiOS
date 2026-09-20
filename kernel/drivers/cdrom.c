@@ -48,6 +48,9 @@ static uint8_t  g_cd_dev = 0;             /* 0=master, 1=slave */
 /* 单块读上限（防止一次请求过大造成堆分配/超时失控）；ISO9660 小文件足够。 */
 #define CD_MAX_BLOCKS   64
 
+/* 光盘逻辑块大小（ATAPI 数据相位的 DRQ 粒度）。 */
+#define CD_BLOCK_BYTES  2048u
+
 static bool      g_cdrom_present = false;
 static spinlock_t g_cd_lock = SPINLOCK_INIT("cdrom");
 
@@ -174,16 +177,44 @@ static bool CdromPacket(const uint8_t *cdb, uint8_t cdb_len,
         return false;
     }
 
-    uint16_t *p = (uint16_t *)buf;
-    uint32_t words = buf_bytes / 2;
-    if (is_read) {
-        for (uint32_t i = 0; i < words; i++) {
-            p[i] = inw(CD_DATA);
+    /*
+     * PIO 数据传输：必须【按 2048 字节块】逐块搬，且每块前重新等待 DRQ。
+     *
+     * osdev《ATAPI》数据相位：设备每准备好一个逻辑块（2048B）就置 DRQ，
+     * 主机搬走该块后设备取下/写下一块并重新置 DRQ。若像旧实现那样一口气把
+     * 整段（count*2048）搬完，第 2 块起会在设备尚未就绪时读空 FIFO —— 读回
+     * 全零，且命令最终仍报成功（ERR 未置），于是「文件第 2 个扇区起被清零」。
+     *
+     * 历史潜伏原因：此前内核读过的 ISO 文件（.reg 配置 403B、README 67B）
+     * 均 < 2048B 只需 1 块；层级化 .sre 配置（3034B）首次需要 2 块，遂暴露。
+     */
+    uint8_t *pb = (uint8_t *)buf;
+    uint32_t done = 0;
+    while (done < buf_bytes) {
+        if (!CdromPoll(CdromCondDrq, 5000000000ULL)) {
+            spin_unlock_irqrestore(&g_cd_lock, flags);
+            return false;
         }
-    } else {
-        for (uint32_t i = 0; i < words; i++) {
-            outw(CD_DATA, p[i]);
+        if (inb(CD_CMD) & CD_ST_ERR) {
+            spin_unlock_irqrestore(&g_cd_lock, flags);
+            return false;
         }
+        uint32_t blk = buf_bytes - done;
+        if (blk > CD_BLOCK_BYTES) {
+            blk = CD_BLOCK_BYTES;
+        }
+        uint16_t *p = (uint16_t *)(pb + done);
+        uint32_t words = blk / 2;
+        if (is_read) {
+            for (uint32_t i = 0; i < words; i++) {
+                p[i] = inw(CD_DATA);
+            }
+        } else {
+            for (uint32_t i = 0; i < words; i++) {
+                outw(CD_DATA, p[i]);
+            }
+        }
+        done += blk;
     }
 
     /* 等待命令完成（BSY 清） */

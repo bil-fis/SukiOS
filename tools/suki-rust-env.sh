@@ -62,12 +62,25 @@ fi
 # ---- 5) 生成目标规格（含仓库绝对路径） ----
 RD="$REPO_ROOT/rust"
 mkdir -p "$RD/.cargo"
+# 目标规格（x86_64-sukios）：
+#   os = "sukios"           —— 自定义 OS；std 的 cfg_select 按 target_os="sukios"
+#                              命中我们自己的 sys/<模块>/sukios.rs 后端。
+#   **不声明 target-family** —— 避免 std 编译 unix 通用代码（pal::unix / os::unix /
+#                              sys::io::unix / backtrace 符号化）而引入 crates.io 的
+#                              libc（它不认识 sukios）。未覆盖的能力由 std 的
+#                              unsupported 分支兜底。
+#   main-needs-argc-argv    —— 让 rustc 生成 `main(argc, argv)`，与内核构造的
+#                              System V 初始栈 + 我们自己的 _start 配合（无需 libc）。
+#   has-thread-local = false —— P0 阶段：std 退化为 racy 的 thread_local 回退实现
+#                              （不需要内核 ELF TLS 支持）；后续阶段再开。
 cat > "$RD/x86_64-sukios.json" <<JSON
 {
   "arch": "x86_64",
-  "os": "none",
+  "os": "sukios",
   "env": "",
   "vendor": "sukios",
+  "main-needs-argc-argv": true,
+  "has-thread-local": false,
   "linker-flavor": "gcc",
   "linker": "$RUST_USER_CC",
   "executables": true,

@@ -474,6 +474,9 @@ bool usb_init(void)
     }
     memset(g_addr_used, 0, sizeof(g_addr_used));
 
+    /* 本函数在 boot_late 内核任务上下文执行（不再是 kmain），故控制器复位等长延
+     * 可直接用 msleep 真睡眠让出 CPU（用户要求「复位也不要忙等」）。 */
+    uhci_set_can_sleep(true);
     if (!uhci_init()) {
         kprintf("[usb] no host controller, USB stack disabled\n");
         return false;

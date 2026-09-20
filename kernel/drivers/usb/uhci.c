@@ -224,16 +224,16 @@ bool uhci_init(void)
     }
     g_io = io_base;
 
-    /* 4) 复位：HCRESET（自清）+ GRESET */
+    /* 4) 复位：HCRESET（自清）+ GRESET。延时可睡眠让出 CPU（usb_delay_ms）。 */
     uw16(UHCI_USBCMD, UHCI_CMD_HCRESET);
-    usb_udelay(20000);
+    usb_delay_ms(20);
     for (int i = 0; i < 100 && !(ur16(UHCI_USBSTS) & UHCI_STS_HCHALTED); i++) {
-        usb_udelay(1000);
+        usb_delay_ms(1);
     }
     uw16(UHCI_USBCMD, UHCI_CMD_GRESET);
-    usb_udelay(20000);
+    usb_delay_ms(20);
     uw16(UHCI_USBCMD, 0);
-    usb_udelay(5000);
+    usb_delay_ms(5);
 
     /* 5) 帧列表（4KB 对齐，1024 项，初始全终止） */
     void *fl = pmm_alloc_page();
@@ -285,7 +285,7 @@ bool uhci_init(void)
     uw16(UHCI_USBINTR, 0);
     uhci_rebuild_chain();
     uw16(UHCI_USBCMD, (uint16_t)(UHCI_CMD_RS | UHCI_CMD_CF | UHCI_CMD_MAXP));
-    usb_udelay(10000);
+    usb_delay_ms(10);
 
     g_ready = true;
     kprintf("[uhci] ready: I/O=0x%X ports=%d PCI %u:%u.%u\n",
@@ -321,7 +321,7 @@ bool uhci_root_port_reset(int port, bool *low_speed)
         if (ps & UHCI_PORT_PED) {
             break;
         }
-        usb_udelay(1000);
+        usb_delay_ms(1);        /* 等待端口使能：让出 CPU（非忙等） */
     }
     if (!(ps & UHCI_PORT_PED)) {
         return false;
@@ -419,7 +419,13 @@ int uhci_control(uint8_t addr, uint8_t low_speed, uint8_t mps0,
 
         int spins = 0;
         while ((g_td[ntd - 1].status & UHCI_TD_ACTIVE) && spins < 500) {
-            usb_udelay(200);
+            /* 先短自旋 ~2ms（多数控制传输此时已完成，避免睡眠/唤醒开销），
+             * 之后若仍活动则用 msleep 让出 CPU，不再长时间忙等。 */
+            if (spins < 10 || !g_can_sleep) {
+                usb_udelay(200);
+            } else {
+                msleep(1);
+            }
             spins++;
         }
         uhci_rebuild_chain();       /* 恢复中断调度链 */

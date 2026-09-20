@@ -418,19 +418,12 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
      * （fd_install_stdio 在每个 Ring3 任务创建时执行，需要槽池已初始化）。 */
     posix_init();
 
-    /* ============================================================
-     * 驱动优先阶段（用户要求：「让驱动最先加载，加载完毕后再进入系统后续流程」）
-     *
-     * 此刻：内核核心子系统（调度/IPC/POSIX）已就绪；device_manager_scan_pci()
-     * 已把全部 PCI 功能注册为 device_t（尚未绑定）；尚未创建任何 Ring3 服务。
-     * 调用 builtin_drivers_register() 统一注册内置驱动（ata/ahci/hda/e1000/uhci），
-     * 每次 driver_register() 触发设备/驱动管理器「双向匹配」→ 对匹配设备 probe()
-     * 执行硬件初始化。于是：
-     *   - 全部驱动先于 console/net/disk/display/input/shell 等后续流程完成初始化；
-     *   - 驱动完全由设备管理器与驱动管理器统一管理（不再散落于 kmain/boot_late）。
-     * ========================================================== */
-    builtin_drivers_register();
-
+    /* 驱动优先阶段已移至 boot_late_init（内核收尾内核线程）的【最前面】执行：
+     * 每个驱动 probe 会对其硬件做复位/等待（如 UHCI 控制器与端口复位 20~100ms），
+     * 这些等待必须用内核 msleep 真睡眠让出 CPU（用户要求「复位也不要忙等」）。
+     * 而 msleep 需要真实的“可睡眠任务上下文”，kmain 阶段 current_task 仍是 idle0
+     * （把 idle0 置 BLOCKED 不安全），故统一放到 boot_late 任务里执行；位置仍在
+     * 【任何 Ring3 服务之前】，满足“驱动最先加载”。 */
     task_create_kernel(console_srv, NULL, "SukiConsoleServer");
 
     /* HDA 音频（class 04/03）与 Intel 8254x/e1000 网卡（class 02/00）均已在上述
@@ -495,6 +488,16 @@ static void boot_late_init(void *arg)
     (void)arg;
 
     kprintf("[boot] late-init thread: kernel fully stable, loading services...\n");
+
+    /* ============================================================
+     * 驱动优先阶段（在任何 Ring3 服务之前）——由 device/driver manager 统一注册
+     * 并 probe 内置驱动（ata/ahci/hda/e1000/uhci）。
+     *
+     * 关键：驱动探测/复位（如 UHCI 控制器与端口复位 20~100ms）一律用内核 msleep
+     * 真睡眠让出 CPU（不再忙等）。msleep 需要真实可睡眠的任务上下文，本线程
+     * （boot_late 内核任务）满足；kmain 阶段 current_task 是 idle0，不满足，故放这里。
+     * ========================================================== */
+    builtin_drivers_register();
 
     /* 进入用户态服务前关闭「内核诊断镜像到帧缓冲」：此后 [ipc]/[sched] 等
      * 运行期日志只走串口，帧缓冲专供 Ring3 shell/UI，避免按键时被刷屏。

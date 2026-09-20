@@ -38,7 +38,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **架构目标**：x86_64 物理机 / QEMU 虚拟机，64 位 long mode，4 级分页。
 - **稳定基线**：单核（`CONFIG_SMP=0`，默认）已被确立为主验证形态。所有功能开发与回归均以单核为准，确保「生产场景零 panic」。
 - **安全地基**：SMAP/SMEP、NX、UMIP、KPTI、栈金丝雀、用户指针 `copy_from_user`/`copy_to_user` 围栏、KASLR、IST 守卫栈均在启动早期装配。
-- **GUI 起点**：已实现 display_server（帧缓冲独占 + 终端栅格化 + 鼠标光标绘制）。TTF 字形渲染由 **FreeType 字体服务**（`lib/freetype-2.14.3`，FTL 许可）承担，界面字体采用 `ResourceHanRoundedCN-Medium.ttf`（资源圆体，OFL-1.1）。
+- **GUI 起点**：已实现 `display-server`（窗口管理 + 增量合成器，纯黑背景，窗口为 iSuki 新样式：38px 标题栏、圆角 12、左侧红/黄/绿三色交通灯）。客户端经 **iSuki 原生控件库 `libsui`** 自绘像素，经 OOL 零拷贝提交到 `WM_PORT` 合成。TTF 字形渲染由 **FreeType 字体服务**（`lib/freetype-2.14.3`，FTL 许可）承担，界面字体采用 `ResourceHanRoundedCN-Medium.ttf`（资源圆体，OFL-1.1）。
 
 **硬件 / 架构约定：**
 
@@ -98,7 +98,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 
 ### 2.4 IPC（Mach 风格）
 - 全局端口表 `kernel_port_t`；`mach_msg_send` / `mach_msg_recv`；发送/接收权能力检查（`port_claim`）。
-- 小消息内核 memcpy 转发；大消息 OOL 物理页重映射零拷贝（引用计数 +1）。
+- 小消息内核 memcpy 转发；大消息 OOL 物理页重映射零拷贝（引用计数 +1）。单条 OOL 上限 **2048 页 = 8 MiB**（`include/ipc/port.h` 的 `MACH_MSG_OOL_MAX_PAGES`），窗口离屏缓冲上限同步放宽到 8 MiB。
 
 ### 2.5 设备驱动（Ring0 裸驱动）
 - **ATA / IDE PIO**（i440FX 传统 IDE）与 **AHCI**（SATA，DMA + 中断），probe 优先级 AHCI > ATA。
@@ -114,19 +114,19 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **disk-srv**（内核线程）：响应 `DISK_PORT`，真实扇区读写。
 - **fs-server**：用 **FatFs（ChaN R0.16）** 做 FAT32 解析；支持 create/write/append/read_at/read_file（OOL）/mkdir/rename/truncate/unlink/list，LFN 正确，整条路径经真实磁盘 IO 自检（self-test ALL PASS）。
 - **input-server**：转发键盘输入。
-- **display-server**：独占帧缓冲、栅格化终端文本（内嵌 8x8 字体）、绘制鼠标光标（像素快照法）；内核经 `SYS_DISPLAY_READY`/IPC 转发控制台输出避免覆盖桌面。界面字体经 `fontsrv`（FreeType）渲染。
+- **display-server**：**窗口管理 + 纯合成器**。已删除桌面装饰条 / 菜单栏 / 任务栏，仅保留窗口管理与增量合成；帧缓冲背景纯黑。窗口为 iSuki 新样式（38px 标题栏、圆角 12、左侧三色交通灯、活动态强调蓝边框），客户区像素由客户端 `sys_mmap` 分配、经 OOL 零拷贝合成；采用脏矩形增量渲染（静止窗口零重绘），光标仅画小矩形。详见 `results/step108.md` / `step109.md`。
 - **mouse-server**：Ring3 鼠标驱动（`.kdr` 形态，临时内嵌 spawn），经 `SYS_MOUSE_READ` 拉包、累计坐标、发光标事件到 display-server。
 - **net-server**：网络服务（`user/net_server.c`）。作为 `NET_PORT` 客户端收发原始帧（交给 Ring0 e1000 驱动），并作为 `NS_PORT` 服务端用 **lwIP 2.2.1**（raw API，`NO_SYS=1`）实现 TCP/IP 协议栈与 DHCP；内核 150–166 socket syscall 经 IPC 转发到此。启动即自动获取 IP（QEMU user-net 网关 `10.0.2.2`），证明「e1000 → NET_PORT → lwIP」全链路打通。
 - **fontsrv**：字体服务（`user/fontsrv.c`）。加载 `ResourceHanRoundedCN-Medium.ttf`，经 FreeType 光栅化字形位图，经 `FONT_PORT` IPC 提供给 display-server / `pchfnt` 等程序绘制到帧缓冲。
 - **shell**：bash 风格交互式命令行。已实现：历史记录（**内存环形缓冲，最多 100 条，超出丢弃最旧，不落盘**；↑/↓ 滚动）、**Tab 文件名补全**（唯一匹配直接补全、目录补 `/`、多匹配补公共前缀并列出候选）、**行内光标编辑**（←/→ 移动光标、Home/End 跳行首行尾、Backspace 删前、Delete 删后、Enter 提交）、管道 `|` 与重定向 `>`、`$VAR`/`$?` 变量展开、内建命令（`help`/`echo`/`cat`/`ls`/`cd`/`pwd`/`mkdir`/`touch`/`rm`/`write`/`date`/`whoami`/`ps`/`ports`/`portclaim`/`exec`/`spawn`/`clear`/`reboot`）。方向键由 input_server 把 PS/2 扫描码（e0 前缀）编码为 ANSI 转义序列送达。
 - **BMP 加载器**（`user/apps/bmploader.c`）：流式读取 BMP 并经内核 `SYS_DISPLAY_BLIT` 通道 blit 到帧缓冲。
 
-**开机自检程序**（随内核启动自动运行，输出经串口落盘，验证各子系统；其中 `RUSTHELLO` 经 `weak` 符号引用，对应 blob 缺失则跳过，其余恒随构建运行）：
+**开机自检程序**（随内核启动自动运行，输出经串口落盘，验证各子系统；均随构建确定性运行）：
 - **posixtest**：POSIX 系统调用层一致性测试，含 `pthread`/`clone`/`futex` 多线程用例。
 - **nettest**：socket 冒烟测试，验证 `net_server` 通路（ARP/DHCP/TCP 端到端），并覆盖 libc 层 socket API（inet_*、getaddrinfo、poll）。
 - **curl_test**：libcurl 移植端到端验证（easy 接口对宿主机 HTTP 服务发起真实 GET，校验 HTTP 200 与响应体字节）。
 - **dltest**：动态链接端到端验证（DT_NEEDED 自动加载 + 运行期 `dlopen`/`dlsym`/`dlclose` + COPY 重定位 + 槽位回收）。
-- **RUSTHELLO**：Rust 程序（详见 §2.10），打印 `hello from rust on SukiOS` 后退出。
+- **suikitest**：iSuki 原生控件库 `libsui` 端到端冒烟测试，创建窗口 + 控件、渲染并经 OOL 提交合成，成功打印 `[suikitest] window rendered + flushed -> PASS`（详见 §2.15）。
 
 **独立用户程序**（FAT32 磁盘 `::BIN/`）：`hello`、`playaudio`（minimp3 MP3 解码）、`audiotest`、`pchfnt`（TTF 字形渲染，经 `fontsrv`）。
 
@@ -145,12 +145,9 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - ISO（BIOS+UEFI 双启动，GRUB）、FAT32 磁盘镜像（mtools）、QEMU 运行目标（`run` / `run-headless` / `run-ahci` / `run-uefi` / `run-q`）。
 - 交叉工具链（`x86_64-elf-gcc`）自动探测，缺失回退主机 `gcc` + `-ffreestanding`。
 
-### 2.10 Rust 开发工具链与运行时
-- **一键环境**：`make make-rust-env`（别名 `rust-env`）自动探查/安装 rustup（nightly + `rust-src`）、构建 SukiOS 用户态运行时静态库 `libsuki.a`（来自 `user/lib/*.c`，提供 `malloc/free/pthread/syscall` 等），并生成 `rust/x86_64-sukios.json` 自定义目标规格与 `rust/.cargo/config.toml`（指向本仓库交叉链接器 `x86_64-sukios-elf-gcc` + `user/user.ld` + `libsuki.a`）。详见 `results/step69.md`。
-- **编译示例**：`make rust-build`（等价 `cd rust && cargo build`）产出 `rust/target/x86_64-sukios/debug/sukios-hello` —— 一个合法的 SukiOS ELF（ET_EXEC，入口 `0x400000`）。
-- **运行时验证（开机自检）**：该 Rust ELF 作为**内核内嵌 blob** 在 `boot_late_init` 由 `task_create_user()` 确定性 spawn（与 `posixtest` 同款路径，不依赖 shell）；其 `_start` 经标准 x86_64 `syscall` 指令（System V AMD64 ABI，`%rax`=号、`%rdi/%rsi/%rdx/%r10/%r8/%r9`=参数）调用 `SYS_DEBUG_WRITE(4)` 打印 `hello from rust on SukiOS`、再调 `SYS_TASK_EXIT(2,0)`，内核串口日志可见 `RUSTHELLO` 装载于 `0x400000`（W^X）、退出码 0、零 panic。详见 `results/step70.md`。
-- **磁盘路径**：`make disk` 会（在 rust 二进制存在时）把它拷入 FAT32 磁盘 `::BIN/RUSTHELLO.SKA`，可在 shell 里 `exec BIN/rusthello` 经真实「从磁盘 exec」路径运行。
-- 当前 Rust 支持为 **`#![no_std]` + 自定义 bare-metal 目标 + 经 FFI 复用 `libsuki.a`**；Rust `std` 库（Servo 前置）尚未移植（见 §3）。
+### 2.10 Rust 支持已整体移除（历史）
+- SukiOS 现已为**纯 C 实现**：内核（C）+ 用户态服务 / 程序（C，freestanding）。原内核内嵌的 Rust 开机自检（`RUSTHELLO` / `STDTEST`）与 Rust blob 构建规则已在重构中整体移除——`Makefile` 不再引用 Rust 工具链，`kmain.c` 不再 spawn 任何 Rust 任务，`rust/` 目录为历史残留（可删除，不再参与构建）。
+- 原计划经 Rust 移植 Servo 浏览器的路径已搁置；如未来重新引入 Rust，需重建 `make make-rust-env` 与目标规格 / blob 自检链路（参考历史 `results/step69.md` / `step70.md`）。当前纯 C 内核 / 服务 / 程序构建**不依赖任何 Rust 工具链**。
 
 ### 2.11 动态链接与共享库（`.sl`）
 - **内核加载器 `ld.suki`**：ELF 加载（execve / spawn）时解析 `DT_NEEDED`，自动映射并基址重定位依赖的共享库；运行期 `dlopen` / `dlsym` / `dlclose` / `dlerror` 经系统调用 **126–129** 完全由内核完成符号解析与页表映射（用户指针一律 `copy_from_user` / `copy_to_user`）。
@@ -168,7 +165,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 ### 2.13 curl 命令行应用（`::BIN/CURL.SKA`）
 - **同源**：直接编译上游 `lib/curl/src`（curl 命令行工具，42 个源文件），与 Linux 上的 `curl` 是同一份代码、同一套参数语义（`curl_getparam`/`tool_operate` 等），不是自研简化版。
 - **构建**：`build/apps/curl.elf`（约 1.63 MiB），链接 `USER_LIB_OBJS + libcurl.a + libz.a + libmbedtls.a`；安装到 FAT32 磁盘 `::BIN/CURL.SKA`（与其他独立程序一致，`exec BIN/curl` 装载）。
-- **内核配套**：原 `EXEC_ELF_MAX` 为 1 MiB，放不下 1.6 MiB 的 curl CLI，已上调至 **4 MiB**（exec 读盘本就是 `FS_MSG_READ_AT` 分块读，不受 OOL 16 页限制）。
+- **内核配套**：原 `EXEC_ELF_MAX` 为 1 MiB，放不下 1.6 MiB 的 curl CLI，已上调至 **4 MiB**（exec 读盘本就是 `FS_MSG_READ_AT` 分块读，不受 OOL 上限——现为 2048 页 / 8 MiB——限制）。
 - **libc 补齐**：为工具新增 `isatty`（返回 0，走非终端分支）、`ftruncate`、`freopen`、`rand/srand`；`fcntl` 改为标准可变参数；`<sys/stat.h>` 补 `st_atime/st_mtime/st_ctime` 成员别名。
 - **验证**：开机自检 `curl_app_test`（`user/apps/curl_app_test.c`）以真实命令行参数 **execve 磁盘上的 `::BIN/CURL.SKA`**（与 shell 同路径），日志显示任务名变为 `CURL.SKA` 且 **exit code 0**（请求成功完成，响应体 `Hello from SukiOS host HTTP server!` 经用户 TTY 环形管道回显到 shell 终端窗口）。
 - **构建坑（已修）**：`lib/curl/src` 内含独立工具 `curlinfo.c`（自带 `int main()`，仅打印功能清单），若一并编入 `curl.elf`，链接器会选用它的 `main` 而非 `tool_main.c` 的 `main`，导致运行 `curl` 时只打印功能列表、不做任何请求。已在 `Makefile` 的 `CURLTOOL_SRCS` 中 `$(filter-out .../curlinfo.c, ...)` 显式排除（详见 `results/step86.md`）。
@@ -179,6 +176,13 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **用途**：为后续**最小系统环境（minOSEnv / rootfs）**预留内核态解压能力（如 initramfs、`.spkg` 软件包）。开机自检 `kminiz_selftest()` 做压缩→解压往返校验（kernel.ski 启动即打印 `[kminiz] selftest OK`）。
 - **说明**：用户态不再使用 miniz（改用真实 zlib，见 §2.12）。
 
+### 2.15 iSuki 原生控件库 `libsui`
+- **形态**：`user/libsui/`（接口 `include/sui.h` + 实现 `src/sui_core.c` / `src/sui_widgets.c`），C 编写、freestanding 用户态库；对照 `iSuki UI 界面库设计规范.md` 实现，作为 GUI 客户端的控件基座（非内核组件）。
+- **窗口模型**：`sui_create_window()` 经 `SukiCreateWindow`（`user/lib/gui.c`）向 `WM_PORT` 请求创建窗口，客户端 `sys_mmap` 分配离屏缓冲，自绘像素后 `SukiFlush` 经 **OOL 零拷贝**提交合成；窗口装饰（标题栏 / 交通灯 / 圆角）由 `display-server` 合成时绘制（显示服务不渲染文字）。
+- **控件集**：label / button / checkbox / switch / slider / progress / input / card 等，统一主题（iSuki 颜色 / 字体档）与画布原语（矩形 / 圆角）；控件自绘进离屏缓冲。
+- **布局与事件**：简单布局（锚点 / 填充）+ 事件分发（`SUI_EVENT_*`）。
+- **验证**：开机自检 `suikitest`（`user/apps/suikitest.c`）创建 660×440 窗口（1.16 MiB，落在 8 MiB OOL 上限内），绘制控件并经 OOL 提交合成，串口见 `[suikitest] window rendered + flushed -> PASS`、窗口 id 正常创建与销毁，零 panic（详见 `results/step108.md`）。
+
 ---
 
 ## 3. 尚未实现 / 早期
@@ -186,7 +190,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 > 以下为当前明确**未实现 / 早期**的部分，列出以避免误用。
 
 - **网络子系统（早期但已打通）**：Ring0 **e1000 驱动 + 用户态 `net_server`（lwIP 2.2.1，raw API）** 已打通「e1000 → `NET_PORT` → lwIP」全链路，DHCP 自动获取 IP，内核 **150–166** socket syscall 经 `NS_PORT` 转发；`nettest` 开机自检验证通路。仍属早期：非阻塞 / 异步语义、连接状态精细管理、DNS 客户端应用、多网卡 / 多协议栈、virtio-net 等仍在完善；当前仅验证 QEMU `user` 后端（`10.0.2.2` 网关 / `10.0.2.3` DNS）。
-- **真正的 GUI 应用框架**：已有 display-server 基础（终端栅格化 + 光标），但**无窗口系统 / 合成器 / 应用离屏 Buffer 合成管线**；TTF 字形渲染已接入：由 `fontsrv` 字体服务加载 FreeType 渲染字形位图，经 IPC 供 `pchfnt` 等程序绘制到帧缓冲（详见 `results/step53.md`）。
+- **桌面环境与 WM 高级特性（早期）**：窗口系统、增量合成器、iSuki 控件库 `libsui` 已落地（见 §2.6 / §2.15），但尚缺完整桌面环境（无任务栏 / 开始菜单 / 多工作区 / 窗口动画 / 阴影）、system tray、全局快捷键管理等。TTF 字形渲染已接入：由 `fontsrv` 字体服务加载 FreeType 渲染字形位图，经 IPC 供 `pchfnt` 等程序绘制到帧缓冲（详见 `results/step53.md`）。
 - **存储**：仅 FAT32 经 FatFs；无 ext2/3/4、exFAT、NTFS、ISO9660（除引导 ISO 外）。
 - **多文件系统 / 多磁盘 / GPT**：仅识别首个磁盘首分区 FAT32。
 - **完整 POSIX 语义（部分已实现）**：传统 `fork` / `clone` / 线程（`pthread` 基座）/ `futex` / **信号框架**（`SIGACTION` / `SIGRETURN` / `SIGPROCMASK` / `TKILL` / `RAISE`）已落地，并由 `posixtest` 多线程用例验证；仍缺：swap / huge page / NUMA，以及作业控制、会话 / 进程组精细语义、完整信号投递集等高级 POSIX 语义。
@@ -196,7 +200,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 - **真实硬件适配广度**：主要在 QEMU 验证；未在现代物理机、不同 AHCI/网卡型号上系统测试。
 - **多核调度策略**：开启 SMP 时为对称 RR；无 CFS / 优先级继承 / 负载均衡迁移。
 - **curl CLI 输出在图形窗口中可见（已实现）**：早期 `curl` 等命令行程序的 stdout/stderr 写内核 `TTY` 后端，而 `user_puts` 在显示服务接管帧缓冲后**只写串口、不写帧缓冲**，故窗口里看不到。已在内核新增「用户 TTY 环形管道」（`kernel/console.c` 的 `g_user_tty_pipe` + `SYS_TTY_READ=204`），`tty_write` 在显示激活时把输出捕获进该管道；shell（`user/shell.c`）在事件循环与 `exec` 等待后 `drain_tty_pipe()` 取回并渲染进自己的终端窗口。串口仍恒定输出（headless 可观测）。因此 `exec BIN/curl <url>` 的响应体现在图形 shell 窗口中可见。`curlinfo.c` 误编入导致 CLI 只打印功能列表的坑已修（见 §2.13）。
-- **Rust 标准库（`std`）未移植**：当前 Rust 支持为 `#![no_std]` + 自定义 bare-metal 目标（`rust/x86_64-sukios.json`）+ 经 FFI 复用 `libsuki.a`（提供 `malloc`/`pthread`/`syscall` 等底层能力）。`rust-src` 组件已随 `make make-rust-env` 安装，但 `library/std` 的 `os="sukios"` 后端（build-std 编译 std）尚未实现，故暂不能使用 `#[std]` 生态；Servo 等重型 Rust 应用移植需此能力，列为后续里程碑。
+
 
 ---
 
@@ -212,7 +216,7 @@ SukiOS 采用「混合内核（hybrid kernel）」架构：核心内核（Ring0�
 | `mtools`（`mformat`/`mcopy`/`mmd`） | 生成 FAT32 磁盘镜像 | `make disk` 依赖 |
 | `qemu-system-x86_64` | 运行模拟器 | 建议 `/dev/kvm` 启用硬件加速 |
 | `python3` | KASLR 重定位表生成（`tools/gen_relk.py`） | 构建期依赖 |
-| Rust 工具链（`rustup`/`rustc`/`cargo`，nightly） | 构建 Rust 组件（`make make-rust-env` 自动安装） | 仅开发 Rust 程序时需要；纯 C 内核/服务构建不依赖 |
+
 | （可选）`OVMF`（`/usr/share/OVMF/OVMF_CODE_4M.fd`） | UEFI 启动 | `make run-uefi` 需要 |
 
 ### 4.2 构建命令
@@ -255,17 +259,9 @@ make run-q-debug          # PVH 直启 + 详细诊断
 make debug                # 等价于 run-dbg（别名）
 make info                 # 打印当前工具链/对象信息
 make gcc                  # 从源码构建 x86_64-sukios 交叉工具链（Binutils+GCC，见 cross/）
-make rust-libs            # 仅重建 libsuki.a 运行时归档
 ```
 
-#### Rust 程序开发（可选，步骤见 `results/step69.md`）
-```bash
-make make-rust-env   # 一键安装 rustup(nightly)+rust-src、构建 libsuki.a、生成目标规格
-make rust-build      # cd rust && cargo build -> rust/target/x86_64-sukios/debug/sukios-hello
-make disk            # 把 rust 二进制拷入 ::BIN/RUSTHELLO.SKA（存在时）
-make run-headless    # 开机自检自动 spawn RUSTHELLO，串口见 "hello from rust on SukiOS"
-```
-> 仅构建/运行纯 C 内核与用户态服务**不需要** Rust 工具链；Rust 为可选项，缺失时 `make iso`/`make disk` 忽略 Rust 部分并正常产出。
+
 
 ### 4.3 运行（QEMU）
 
@@ -329,12 +325,13 @@ SukiOS/
 ├── user/                  # Ring3 服务与程序（C，freestanding）
 │   ├── fs_server.c        # FAT32 服务（FatFs + DISK_PORT）
 │   ├── input_server.c     # 键盘输入服务
-│   ├── display_server.c   # 显示合成服务（帧缓冲独占 + 终端栅格化 + 光标）
+│   ├── display_server.c   # 显示合成服务（窗口管理 + 增量合成器，纯黑背景，iSuki 新样式窗口）
 │   ├── mouse_server.c     # 鼠标驱动（Ring3 .kdr 形态）
 │   ├── net_server.c       # 网络服务（lwIP 2.2.1，NET_PORT/NS_PORT）
 │   ├── fontsrv.c          # 字体服务（FreeType，FONT_PORT）
 │   ├── shell.c            # 交互 shell
-│   ├── apps/              # 独立程序：hello / playaudio / audiotest / bmploader / pchfnt / nettest / dltest
+│   ├── apps/              # 独立程序：hello / playaudio / audiotest / bmploader / pchfnt / nettest / dltest / suikitest
+│   ├── libsui/            # iSuki 原生控件库（include/sui.h + src/sui_core.c + src/sui_widgets.c）
 │   ├── libs/              # 共享库示例（libtest.sl 等，动态链接验证）
 │   └── lib/               # 用户态 freestanding 桩：crt0 / suki.c / libc / pthread / dlfcn / suki.h
 ├── drivers/FatFs/         # ChaN FatFs R0.16
@@ -354,7 +351,7 @@ SukiOS/
 ├── tools/                 # gen_relk.py（KASLR 重定位）等
 ├── results/               # 阶段性实现文档（stepNN.md）
 ├── osdev_wiki/            # OSDev 维基离线副本（实现参考）
-├── rust/                  # Rust 工具链示例工程（make make-rust-env 生成规格/归档，源码入库）
+├── rust/                  # 历史示例工程（已弃用：内核已移除 Rust 依赖，见 §2.10；可删除）
 ├── SukiNative API 完整系统接口规范.md   # SukiNative 130–149 对象 API 规范
 ├── SukiOS 全栈技术参考手册.md           # 全栈技术参考
 ├── SukiOS 混合风格权限提升设计文档.md   # 权限/能力设计
@@ -398,7 +395,7 @@ git submodule status                          # 查看各子模块当前提交
 > 现已切换为上述固定 tag 的子模块；两者内容与上游 tag 逐文件一致（构建产物尺寸不变），
 > 项目侧的裁剪 / 配置全部通过外部头（`user/lib/lwipopts.h`、`user/lib/arch/cc.h`、
 > `user/lib/freetype_shim.h`、`user/lib/ftmodule_min.h`）完成，**不修改上游源码**。
-> `mbedtls` 与 `curl` 已作为子模块就绪但**尚未接入构建**（见 §3）。
+> `mbedtls` 与 `curl` 已作为子模块就绪并**已接入构建**（见 §2.12 / §2.13）：libcurl 经手写 `curl_config.h` 集成，HTTPS 由 mbedTLS 提供后端。
 
 ---
 
@@ -479,7 +476,7 @@ tail -8 /tmp/sukios.log
 - **Cyano Hao** —— Resource Han Rounded（资源圆体，OFL-1.1），界面字体。
 - **FreeType Project** —— FreeType 字体光栅化引擎（FTL 许可），`lib/freetype-2.14.3/`（submodule），驱动 TTF 字形渲染。
 - **lwIP（Adam Dunkels / Simon Goldschmidt 等）** —— lwIP 轻量级 TCP/IP 协议栈（BSD-3-Clause），`lib/lwip-2.2.1/`（submodule），驱动 `net_server` 网络能力。
-- **Mbed TLS（Arm / TrustedFirmware）** —— 轻量级 TLS/加密库（Apache-2.0 或 GPL-2.0-or-later 双许可），`lib/mbedtls/`（submodule，3.6 LTS），规划为 SukiOS HTTPS/TLS 后端。
+- **Mbed TLS（Arm / TrustedFirmware）** —— 轻量级 TLS/加密库（Apache-2.0 或 GPL-2.0-or-later 双许可），`lib/mbedtls/`（submodule，3.6 LTS），已作为 SukiOS HTTPS/TLS 后端接入 libcurl（见 §2.12）。
 - **curl（Daniel Stenberg 等）** —— libcurl 传输库（curl 许可），`lib/curl/`（submodule），规划为 SukiOS 的 HTTP/HTTPS 客户端。
 - **newlib 贡献者**（Red Hat、UC Berkeley 等）—— freestanding 用户态实现参考。
 - **GRUB / SeaBIOS / OVMF / QEMU** —— 可引导固件与验证环境。
@@ -510,7 +507,7 @@ tail -8 /tmp/sukios.log
 | libcurl（submodule） | `lib/curl/` | curl 许可（MIT/X 风格，Daniel Stenberg 等） |
 | Lua（submodule） | `lib/lua-5.4.9/` | MIT（Lua.org / PUC-Rio） |
 | WPE WebKit（submodule） | `lib/wpewebkit-2.54/` | LGPL-2.1-or-later / BSD（WebKit 项目与贡献者） |
-| Rust 工具链（rustup / rustc / cargo） | 本地安装（不随仓库分发） | MIT OR Apache-2.0（Rust Project Developers） |
+
 
 ---
 

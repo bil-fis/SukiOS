@@ -255,32 +255,10 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
 ------------------------------------------------------------------------------
 
 
-------------------------------------------------------------------------------
-7. Rust 开发工具链（本地构建依赖，不随本仓库再分发）
-   安装方式:  make make-rust-env（自动探查/安装；见 rust/ 下示例工程与 results/step69.md）
-   组件:      rustup / rustc / cargo（Rust 编程语言工具链）
-   上游:      https://www.rust-lang.org/   (git: https://github.com/rust-lang/rust)
-   版本:      nightly（由 rust/rust-toolchain.toml 固定；后续 Servo 移植需 rust-src 组件做 build-std）
-   许可证:    MIT OR Apache-2.0（双许可）
-   版权声明 (Rust 项目，取自 rust-lang/rust LICENSE-APACHE / LICENSE-MIT 摘要):
-       Copyright (c) The Rust Project Developers.
-       Licensed under the Apache License, Version 2.0 or the MIT license, at your
-       option. You may not use this file except in compliance with said licenses.
 
-   说明:
-       Rust 工具链**不**包含在本仓库的源代码或二进制分发中——它由
-       `make make-rust-env` 在开发者本机经 rustup 安装（MIT OR Apache-2.0
-       许可）。本仓库仅提供与之配合的 SukiOS 专属构建产物与目标规格，二者均
-       属于本仓库自有代码，以 GPL-3.0 发布：
-         - rust/Cargo.toml、rust/rust-toolchain.toml、rust/src/main.rs（源码，入库）
-         - rust/x86_64-sukios.json（目标规格，脚本生成）、rust/libsuki.a
-           （SukiOS 用户态运行时静态库，由 user/lib/*.c 经交叉 ar 打包）
-       上述生成物均被 .gitignore 忽略，不随源码提交；Rust 程序经内核内嵌 blob
-       开机自检在 SukiOS 上真实运行（见 results/step70.md）。
-------------------------------------------------------------------------------
 
 ------------------------------------------------------------------------------
-8. lwIP - A Lightweight TCP/IP stack
+7. lwIP - A Lightweight TCP/IP stack
    路径:      lib/lwip-2.2.1/   (git submodule；全部源码：src/, doc/, COPYING 等)
    上游:      https://savannah.nongnu.org/projects/lwip/
               (git: https://github.com/lwip-tcpip/lwip.git)
@@ -314,7 +292,7 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
 
 
 ------------------------------------------------------------------------------
-9. Mbed TLS
+8. Mbed TLS
    路径:      lib/mbedtls/   (git submodule；library/, include/, LICENSE 等)
    上游:      https://github.com/Mbed-TLS/mbedtls
    版本:      3.6.7 (tag mbedtls-3.6.7；3.6 为长期支持 LTS 分支)
@@ -327,15 +305,15 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
       Copyright The Mbed TLS Contributors.
       完整许可文本见 lib/mbedtls/LICENSE（含 Apache License 2.0 全文）。
    附加说明:
-      SukiOS 以 git submodule 引入（见 README §5.1），**尚未接入构建**；规划为
-      SukiOS 的 TLS/HTTPS 加密后端（供 libcurl 使用）。接入时将编译为静态库并
+      SukiOS 以 git submodule 引入（见 README §2.12），**已接入构建**；作为
+      SukiOS 的 TLS/HTTPS 加密后端（供 libcurl 使用），编译为静态库并
       通过用户态平台适配层（熵源 RDRAND / 软 PRNG、timing 经 gettimeofday）
       提供宿主能力，不修改上游源码。GPL-2.0-or-later 与本仓库 GPL-3.0 兼容。
 ------------------------------------------------------------------------------
 
 
 ------------------------------------------------------------------------------
-10. curl / libcurl
+9. curl / libcurl
    路径:      lib/curl/   (git submodule；lib/, include/, COPYING 等)
    上游:      https://curl.se/   (git: https://github.com/curl/curl.git)
    版本:      8.22.0 (tag curl-8_22_0)
@@ -353,14 +331,14 @@ GPL-3.0 与这些组件的许可证（BSD 系列、zlib、CC0 公共领域等）
       THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. See
       lib/curl/COPYING for the full text.
    附加说明:
-      SukiOS 以 git submodule 引入（见 README §5.1），**尚未接入构建**；规划为
+      SukiOS 以 git submodule 引入（见 README §2.12 / §2.13），**已接入构建**；作为
       SukiOS 的 HTTP/HTTPS 客户端。接入方式见 results/step81.md（手写
       curl_config.h + 静态库集成），HTTPS 由 mbedTLS 提供后端。
 ------------------------------------------------------------------------------
 
 
 ------------------------------------------------------------------------------
-11. zlib
+10. zlib
    路径:      lib/zlib/   (git submodule；adler32.c, deflate.c, inflate.c,
               trees.c, zlib.h, zconf.h, LICENSE 等)
    上游:      https://zlib.net/   (git: https://github.com/madler/zlib.git)

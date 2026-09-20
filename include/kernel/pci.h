@@ -85,4 +85,14 @@ bool pci_enable_msi(const pci_dev_t *dev, uint8_t vector, uint8_t lapic_id);
 #define PCI_CAP_MSI   0x05
 #define PCI_CAP_MSIX  0x11
 
+/* PCI Express 能力（cap id 0x10，见 osdev "PCI Express"）。
+ *  pci_is_pcie  : 设备能力链表是否含 0x10（即是否为 PCIe 设备/端口）。
+ *  pci_pcie_type: 读 PCIe Capabilities Register(cap+0x02)[7:4] 的设备/端口类型：
+ *                 0=未知, 1=Endpoint, 4=Root Port, 5=RC Event Collector,
+ *                 6=RC Integrated Endpoint, 9=RC Integrated Endpoint(Root Complex)。
+ *                 传统 PCI 设备（i440FX）返回 0。 */
+#define PCI_CAP_PCIE  0x10
+bool    pci_is_pcie(const pci_dev_t *dev);
+uint8_t pci_pcie_type(const pci_dev_t *dev);
+
 #endif /* _SUKI_KERNEL_PCI_H */

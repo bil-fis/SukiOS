@@ -55,6 +55,12 @@
 /* 声明在 kernel/sched/sched.c：将 BSP 引导流切换到 idle0 独立内核栈 */
 extern void sched_switch_to_idle0(void);
 
+/* 内置驱动注册（kernel/driver/builtin_drivers.c）：把内建 PCI 驱动（ata/ahci/
+ * hda/e1000/uhci）统一登记到设备/驱动管理器；drivers_disk_ready() 供 late-init
+ * 判定磁盘子系统是否已就绪。 */
+extern int  builtin_drivers_register(void);
+extern bool drivers_disk_ready(void);
+
 /* 前向声明：内核完全稳定后的引导收尾线程（定义于本文件末尾）。
  * 由 kmain 在 sched_switch_to_idle0() 之前经 task_create_kernel 拉起，
  * 运行于独立内核栈、被正常调度，负责加载 disk-srv 与全部 Ring3 服务。 */
@@ -389,13 +395,11 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
     mouse_init();    /* 经 I/O APIC GSI12 -> IRQ12 */
     interrupts_enable();
 
-    /* ---- 阶段五·补：USB 主机栈（UHCI 主机控制器 + Hub 类 + HID 键鼠）。
-     * 即插即用：创建「USB 主机服务」内核任务周期性轮询（进程上下文，
-     * 可安全使用复位/枚举延时），根端口/Hub 端口变化触发自动枚举。
-     * 由构建配置器 CONFIG_DRIVER_USB 门控（默认开，全量编译）。 */
-#if CONFIG_DRIVER_USB
-    usb_init();
-#endif
+    /* ---- 阶段五·补：USB 主机栈改由「驱动优先阶段」统一初始化 ----
+     * USB(UHCI) 现作为一个 driver_t 在下方 posix_init() 之后的
+     * builtin_drivers_register() 中经设备/驱动管理器匹配、probe，与其它内置驱动
+     * 一并【在任何 Ring3 服务之前】完成初始化，避免此前“USB 枚举与 display/input
+     * 服务并发初始化互相拖慢、display-server 迟迟不就绪”的竞争窗口。 */
 
     /* ---- 阶段六：syscall + Ring3 ---- */
     syscall_init();
@@ -414,16 +418,24 @@ void kmain(uint64_t magic, uint64_t mbi_phys)
      * （fd_install_stdio 在每个 Ring3 任务创建时执行，需要槽池已初始化）。 */
     posix_init();
 
+    /* ============================================================
+     * 驱动优先阶段（用户要求：「让驱动最先加载，加载完毕后再进入系统后续流程」）
+     *
+     * 此刻：内核核心子系统（调度/IPC/POSIX）已就绪；device_manager_scan_pci()
+     * 已把全部 PCI 功能注册为 device_t（尚未绑定）；尚未创建任何 Ring3 服务。
+     * 调用 builtin_drivers_register() 统一注册内置驱动（ata/ahci/hda/e1000/uhci），
+     * 每次 driver_register() 触发设备/驱动管理器「双向匹配」→ 对匹配设备 probe()
+     * 执行硬件初始化。于是：
+     *   - 全部驱动先于 console/net/disk/display/input/shell 等后续流程完成初始化；
+     *   - 驱动完全由设备管理器与驱动管理器统一管理（不再散落于 kmain/boot_late）。
+     * ========================================================== */
+    builtin_drivers_register();
+
     task_create_kernel(console_srv, NULL, "SukiConsoleServer");
 
-    /* ---- 阶段八·补：Intel HDA 音频（内核态特例，类 ATA） ---- */
-    hda_init();
-
-    /* ---- 网络：Intel 8254x(e1000) 网卡（内核态特例，类 ATA/HDA） ----
-     * 仅做【探测 + 复位 + 读 MAC + 建描述符环 + 使能收发】；原始帧收发服务
-     * 由 net_srv_start() 在 late-init 阶段以 NET_PORT 内核任务提供。
-     * 协议栈（lwIP）在用户态，符合混合内核红线。 */
-    e1000_init();
+    /* HDA 音频（class 04/03）与 Intel 8254x/e1000 网卡（class 02/00）均已在上述
+     * 驱动优先阶段经 device/driver manager 探测并初始化。net_srv_start()
+     * （NET_PORT 内核收发服务）仍按原设计在 late-init 阶段启动。 */
 
     /* ---- 阶段八/九：磁盘（内核态特例）与 Ring3 服务的加载 ----
      * 关键设计（用户明确要求：「内核基本完全稳定后，再开始加载用户态」）：
@@ -504,8 +516,9 @@ static void boot_late_init(void *arg)
      *      spawn FS_SERVER 并授权其向 DISK_PORT 发请求——否则消费者先发、
      *      生产者尚未进入等待，该条请求会永久无人应答（历史故障）。
      * ========================================================== */
-    bool ahci_ok = ahci_init();
-    bool disk_ok = ata_init() || ahci_ok;
+    /* 磁盘驱动（AHCI/ATA）已在「驱动优先阶段」由 device/driver manager 探测
+     * 初始化；此处仅查询其结果并启动 DISK_PORT 服务端（disk-srv）。 */
+    bool disk_ok = drivers_disk_ready();
     if (disk_ok)
     {
         disk_srv_start();

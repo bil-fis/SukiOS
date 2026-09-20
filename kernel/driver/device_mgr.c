@@ -186,6 +186,19 @@ static void pci_register_one(uint8_t bus, uint8_t dev, uint8_t func)
         hex4(nm + 5, did);
     }
     d->name = nm ? nm : "pci";
+
+    /* PCIe 标注：能力链表含 cap 0x10 即为 PCIe 设备/端口（osdev "PCI Express"）。
+     * 传统 PCI 平台（-machine pc / i440FX）通常全部为 PCI，无此能力；
+     * 具备 MCFG 的平台（q35/PCIe）会命中并打印设备/端口类型。 */
+    {
+        pci_dev_t pd = { bus, dev, func, vid, did };
+        if (pci_find_cap(&pd, PCI_CAP_PCIE, NULL)) {
+            kprintf("[device]   ^ PCIe device %02x:%02x.%u type=%u\n",
+                    (unsigned)bus, (unsigned)dev, (unsigned)func,
+                    (unsigned)pci_pcie_type(&pd));
+        }
+    }
+
     device_register(d);
 }
 

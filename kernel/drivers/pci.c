@@ -227,6 +227,23 @@ bool pci_find_cap(const pci_dev_t *dev, uint8_t cap_id, uint8_t *off_out)
     return false;
 }
 
+/* P0 驱动框架：PCIe 能力探测（见 include/kernel/pci.h 说明）。 */
+bool pci_is_pcie(const pci_dev_t *dev)
+{
+    return pci_find_cap(dev, PCI_CAP_PCIE, NULL);
+}
+
+uint8_t pci_pcie_type(const pci_dev_t *dev)
+{
+    uint8_t off;
+    if (!pci_find_cap(dev, PCI_CAP_PCIE, &off)) {
+        return 0;
+    }
+    uint16_t cap = pci_cfg_read16(dev->bus, dev->dev, dev->func,
+                                  (uint8_t)(off + 2));
+    return (uint8_t)((cap >> 4) & 0xF);
+}
+
 bool pci_msi_capable(const pci_dev_t *dev, bool *has_msix)
 {
     if (has_msix) *has_msix = false;

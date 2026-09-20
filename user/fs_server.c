@@ -41,7 +41,7 @@
 
 /* 应答/整文件缓冲（所有输出写入此处，杜绝外部指针写） */
 #define RESP_DATA_MAX    FS_DATA_MAX            /* 内联应答数据上限 (3500) */
-#define FILEBUF_SIZE     (16u * 4096u)          /* 16 KiB×16 = 256 KiB：整文件读上限（与内核 OOL 16 页一致） */
+#define FILEBUF_SIZE     (256u * 4096u)         /* 1 MiB 大文件读缓冲（对应 MACH_MSG_OOL_MAX_PAGES=256 页） */
 static uint8_t  g_resp[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + RESP_DATA_MAX + 16];
 static uint8_t  g_filebuf[FILEBUF_SIZE] __attribute__((aligned(4096))); /* 整文件读（OOL 内容源） */
 
@@ -50,6 +50,30 @@ static FATFS   g_fatfs;
 static FIL     g_fil;
 static DIR     g_dir;
 static FILINFO g_finfo;
+
+/* 顺序读流缓存（FS_MSG_READ_AT 性能关键修复）：
+ * exec_read_file（execve/spawn 整映像装载）、playaudio/bmploader 流式播放、
+ * POSIX read(fd) 等，均按 offset 递增【顺序】分块读同一文件（每块 ≤ FS_READ_MAX=
+ * 3584B）。若每次分块读都 f_open + f_lseek(offset)，FatFs 的 f_lseek 必须从簇链
+ * 头部逐簇走到 offset，整体退化为 O(n²) 簇链遍历——952KiB 的 fontsrv 映像需 ~270
+ * 块，累计走链与反复目录查找开销使读取耗时数十秒，表现为 shell 卡死在
+ * "launching font service"、所有大文件读取同样极慢。
+ * 此处缓存「当前打开的文件 + 逻辑读位置」，顺序读时直接 f_read 前进（FatFs 内部
+ * 已持有当前簇/扇区缓存，无需回走），仅在路径变化或 offset 跳变时才重开/定位，
+ * 把复杂度降为 O(n)。写类/元数据类消息会先使本缓存失效（见 service_loop），
+ * 确保写后读回不拿到陈旧数据。 */
+static FIL     g_stream_fil;
+static bool    g_stream_open = false;
+static char    g_stream_path[256] = {0};
+static FSIZE_t g_stream_pos = 0;
+
+static void fs_stream_close(void)
+{
+    if (g_stream_open) {
+        f_close(&g_stream_fil);
+        g_stream_open = false;
+    }
+}
 
 
 /* ===================== 小工具 ===================== */
@@ -1060,7 +1084,9 @@ static void handle_read(uint32_t local_port, uint32_t id, const char *fname)
     mach_msg_send(g_resp, resp_header()->msgh_size);
 }
 
-/* 分块读（FS_MSG_READ_AT）：从 offset 起读 length 字节。 */
+/* 分块读（FS_MSG_READ_AT）：从 offset 起读 length 字节。
+ * 采用顺序读流缓存（见上方 g_stream_* 说明）：保持文件打开并连续推进位置，
+ * 避免每块 f_open+f_lseek(offset) 造成的 O(n²) 簇链遍历（大文件读取提速数十倍）。 */
 static void handle_read_at(uint32_t local_port, uint32_t id,
                            uint32_t offset, uint32_t length, const char *fname)
 {
@@ -1068,36 +1094,47 @@ static void handle_read_at(uint32_t local_port, uint32_t id,
     u_memcpy(path, fname, u_strlen(fname) + 1);
     normalize_path(path);
 
-    FRESULT fr = f_open(&g_fil, path, FA_READ | FA_OPEN_EXISTING);
-    if (fr != FR_OK) {
-        /* 诊断：打印实际 FatFs 错误码与路径，便于排查子目录/大小写/挂载问题 */
-        u_print("[fs] read_at open FAIL fr=");
-        { char d[16]; u_print(u_utoa_s((uint64_t)fr, d, sizeof(d))); }
-        u_print(" path='");
-        u_print(path);
-        u_print("'\n");
-        build_resp(local_port, id, fr_to_status(fr), 0, NULL);
-        mach_msg_send(g_resp, resp_header()->msgh_size);
-        return;
+    bool reopen = (!g_stream_open) || (u_strcmp(g_stream_path, path) != 0);
+    if (reopen) {
+        fs_stream_close();
+        FRESULT fr = f_open(&g_stream_fil, path, FA_READ | FA_OPEN_EXISTING);
+        if (fr != FR_OK) {
+            /* 诊断：打印实际 FatFs 错误码与路径，便于排查子目录/大小写/挂载问题 */
+            u_print("[fs] read_at open FAIL fr=");
+            { char d[16]; u_print(u_utoa_s((uint64_t)fr, d, sizeof(d))); }
+            u_print(" path='");
+            u_print(path);
+            u_print("'\n");
+            build_resp(local_port, id, fr_to_status(fr), 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            return;
+        }
+        g_stream_open = true;
+        u_memcpy(g_stream_path, path, u_strlen(path) + 1);
+        g_stream_pos = 0;
     }
-    char *data = (char *)(g_resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t));
-    UINT br = 0;
-    uint32_t want = length;
-    if (want > RESP_DATA_MAX) want = RESP_DATA_MAX;
-    if (offset > 0) {
-        FRESULT ls = f_lseek(&g_fil, (FSIZE_t)offset);
+
+    if ((FSIZE_t)offset != g_stream_pos) {
+        FRESULT ls = f_lseek(&g_stream_fil, (FSIZE_t)offset);
         if (ls != FR_OK) {
-            f_close(&g_fil);
+            fs_stream_close();
             build_resp(local_port, id, fr_to_status(ls), 0, NULL);
             mach_msg_send(g_resp, resp_header()->msgh_size);
             return;
         }
+        g_stream_pos = (FSIZE_t)offset;
     }
-    fr = f_read(&g_fil, data, want, &br);
-    f_close(&g_fil);
+
+    char *data = (char *)(g_resp + sizeof(mach_msg_header_t) + sizeof(fs_resp_t));
+    UINT br = 0;
+    uint32_t want = length;
+    if (want > RESP_DATA_MAX) want = RESP_DATA_MAX;
+    FRESULT fr = f_read(&g_stream_fil, data, want, &br);
     if (fr != FR_OK) {
+        fs_stream_close();
         build_resp(local_port, id, fr_to_status(fr), 0, NULL);
     } else {
+        g_stream_pos += (FSIZE_t)br;
         build_resp(local_port, id, FS_OK, (uint32_t)br, NULL);
     }
     mach_msg_send(g_resp, resp_header()->msgh_size);
@@ -1129,6 +1166,48 @@ static void handle_read_file(uint32_t local_port, uint32_t id, const char *fname
     f_close(&g_fil);
     if (fr != FR_OK || (FSIZE_t)br != fsize) {
         build_resp(local_port, id, FS_ERR_IO, 0, NULL);
+        mach_msg_send(g_resp, resp_header()->msgh_size);
+        return;
+    }
+    fs_resp_t *ofr = (fs_resp_t *)g_filebuf;
+    ofr->status = FS_OK;
+    ofr->length = (uint32_t)br;
+    build_ool_resp(local_port, id, (uint32_t)br);
+    mach_msg_send(g_resp, resp_header()->msgh_size);
+}
+
+/* 大文件分块读（FS_MSG_READ_FILE_AT）：从 offset 起读最多 length 字节，应答走 OOL。
+ * 用于 execve/spawn 装载大映像：一次可回传近 1 MiB，避免内联 3500B 分块读的数百次
+ * 往返（每次往返的唤醒延迟被放大后读取近乎“挂死”）。 */
+static void handle_read_file_at(uint32_t local_port, uint32_t id,
+                                uint32_t offset, uint32_t length, const char *fname)
+{
+    char path[256];
+    u_memcpy(path, fname, u_strlen(fname) + 1);
+    normalize_path(path);
+
+    FRESULT fr = f_open(&g_fil, path, FA_READ | FA_OPEN_EXISTING);
+    if (fr != FR_OK) {
+        build_resp(local_port, id, fr_to_status(fr), 0, NULL);
+        mach_msg_send(g_resp, resp_header()->msgh_size);
+        return;
+    }
+    if (offset > 0) {
+        FRESULT ls = f_lseek(&g_fil, (FSIZE_t)offset);
+        if (ls != FR_OK) {
+            f_close(&g_fil);
+            build_resp(local_port, id, fr_to_status(ls), 0, NULL);
+            mach_msg_send(g_resp, resp_header()->msgh_size);
+            return;
+        }
+    }
+    uint32_t cap = FILEBUF_SIZE - sizeof(fs_resp_t);
+    uint32_t want = (length < cap) ? length : cap;
+    UINT br = 0;
+    fr = f_read(&g_fil, g_filebuf + sizeof(fs_resp_t), want, &br);
+    f_close(&g_fil);
+    if (fr != FR_OK) {
+        build_resp(local_port, id, fr_to_status(fr), 0, NULL);
         mach_msg_send(g_resp, resp_header()->msgh_size);
         return;
     }
@@ -1300,6 +1379,26 @@ static void service_loop(void)
         uint32_t id    = h->msgh_id;
         uint8_t *payload = reqbuf + sizeof(mach_msg_header_t);
 
+        /* 写/元数据修改类消息：先使顺序读流缓存失效，避免随后读同一路径时
+         * 命中已失效的打开句柄与簇缓存而拿到陈旧数据（读类消息不改动文件，
+         * 无需失效）。 */
+        switch (id) {
+        case FS_MSG_WRITE:
+        case FS_MSG_WRITEFD:
+        case FS_MSG_TRUNCATE:
+        case FS_MSG_FTRUNC:
+        case FS_MSG_CREATE:
+        case FS_MSG_MKDIR:
+        case FS_MSG_MKDIR2:
+        case FS_MSG_RENAME:
+        case FS_MSG_UNLINK:
+        case FS_MSG_UNLINK2:
+            fs_stream_close();
+            break;
+        default:
+            break;
+        }
+
         switch (id) {
         case FS_MSG_LIST:
             handle_list(local, id, (const char *)payload);
@@ -1318,6 +1417,12 @@ static void service_loop(void)
         case FS_MSG_READ_FILE: {
             char *fname = (char *)payload;
             handle_read_file(local, id, fname);
+            break;
+        }
+        case FS_MSG_READ_FILE_AT: {
+            fs_read_file_at_req_t *rfa = (fs_read_file_at_req_t *)payload;
+            char *fname = (char *)(payload + sizeof(fs_read_file_at_req_t));
+            handle_read_file_at(local, id, rfa->offset, rfa->length, fname);
             break;
         }
         case FS_MSG_CREATE:

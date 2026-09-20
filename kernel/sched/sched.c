@@ -86,6 +86,11 @@ static uint32_t g_rr_counter = 0;     /* 新任务 RR 绑定 CPU 的轮转计数
  * 原本每轮忙等 8ms，单核下白占 ~80% CPU 致整机卡顿、鼠标延迟）。 */
 static uint64_t g_jiffies = 0;
 
+/* 调度器是否已初始化完成：spinlock.h 的 spin_unlock 会在持锁计数归零时调用
+ * sched_maybe_preempt()，而早期引导（sched_init 之前）g_percpu 尚未就绪，故以本
+ * 标志守护，未就绪时该调用直接返回。 */
+bool g_sched_ready = false;
+
 uint64_t sched_next_pid(void)
 {
     /* 多核并发创建任务时 PID 必须原子分配（P0-R1） */
@@ -308,6 +313,7 @@ void sched_init(void)
     g_scratch[0]        = &t0->scr_rip;
     set_cpu_current(t0);
     g_task_count = 1;
+    g_sched_ready = true;   /* 至此 percpu/运行队列就绪，允许 unlock 抢占点生效 */
     kprintf("[sched] scheduler initialized (SMP RR), idle0 pid=%lu stack=%p\n",
             (unsigned long)t0->id, (void *)t0->kstack_base);
 }
@@ -687,6 +693,9 @@ void schedule(void)
         spin_unlock_irqrestore(&g_sched_lock, f);
         return;
     }
+    /* 已确认可安全切换：消费被推迟的调度请求（need_resched）。清位可避免随后本函数
+     * 释放 g_sched_lock 时，spin_unlock 的抢占点再次进入 schedule() 造成递归。 */
+    g_percpu[cpu].need_resched = 0;
 
     /* M7 修复：内核栈溢出守卫 */
     if (cur && cur->kstack_base) {
@@ -774,6 +783,26 @@ void schedule(void)
 
     /* 切换完成后，在“新任务”栈上回收此前已退出任务的残留资源 */
     reap_dead();
+}
+
+/* spin_unlock 抢占点（preempt_enable 语义）：由 spinlock.h 在「本 CPU 持锁计数
+ * 归零」时调用。若此前存在被推迟的调度请求（need_resched，由持锁期间到达的
+ * self-IPI/RESCHED 在 schedule() 中被置位），立即调度一次，使被唤醒任务在锁释放
+ * 后马上运行，而不是苦等下一个 100Hz 节拍。这是紧耦合 IPC（shell↔FS↔disk）往返
+ * 延迟从数十毫秒降到微秒级、大文件读取不再“近乎挂死”的关键。 */
+void sched_maybe_preempt(void)
+{
+    if (!g_sched_ready) {
+        return;
+    }
+    uint32_t c = cpu_index();
+    if (g_preempt_count[c] != 0) {
+        return;   /* 仍持有其它自旋锁：继续推迟，待其释放时再触发 */
+    }
+    if (!g_percpu[c].need_resched) {
+        return;
+    }
+    schedule();
 }
 
 /* 唤醒一个阻塞任务（IPC/等待协议用）。

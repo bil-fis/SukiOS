@@ -39,6 +39,12 @@
  * 单元素；多核下每 CPU 独立计数，互不干扰。 */
 extern uint32_t g_preempt_count[MAX_CPUS];
 
+/* 调度器提供的「锁释放后立即抢占」入口（kernel/sched/sched.c 实现）。
+ * spin_unlock 在持锁计数归零时调用：若存在被推迟的调度请求（need_resched）则
+ * 立即 schedule()，使被唤醒任务在锁释放后马上运行，而非苦等下一个 100Hz 节拍。
+ * 这是紧耦合 IPC（shell↔FS↔disk）往返延迟从数十毫秒降到微秒级的关键。 */
+extern void sched_maybe_preempt(void);
+
 /* 取得当前运行任务名（sched.c 提供，返回 cpu_local()->current_task->name）。
  * 用于在死锁诊断时打印持锁任务名；返回不透明字符串避免与 task.h 循环包含。 */
 extern const char *get_current_task_name(void);
@@ -122,6 +128,15 @@ static inline void spin_unlock(spinlock_t *l)
     /* owner += 1（只动低 16 位；直接对低半字做原子加） */
     __atomic_fetch_add((volatile uint16_t *)&l->tickets, 1,
                        __ATOMIC_RELEASE);
+
+    /* 锁释放后立即抢占点：本 CPU 持锁计数归零时，若此前有被推迟的调度请求
+     * （need_resched），马上 schedule()。此前该请求要等到下一个 100Hz 节拍才被处理，
+     * 使紧耦合 IPC 每跳延迟被放大到数十毫秒（实测每 3500B 读块 4~300ms，大文件读取
+     * 近乎“挂死”）。函数内部自带 g_sched_ready/持锁计数/need_resched 三重检查，故在
+     * 任何上下文调用都安全。 */
+    if (g_preempt_count[_idx] == 0) {
+        sched_maybe_preempt();
+    }
 }
 
 /* 尝试拿锁：成功返回 true。仅当无人排队且立即可得才成功。 */

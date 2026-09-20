@@ -60,6 +60,14 @@
 #define FS_MSG_SYNC      36  /* 刷写卷缓存 */
 #define FS_MSG_UTIME     37  /* 设置文件时间；负载 = fs_utime_req_t + 路径 */
 #define FS_MSG_CHMOD     38  /* 设置权限/属性；负载 = fs_chmod_req_t + 路径 */
+#define FS_MSG_READ_FILE_AT 39 /* 大文件分块读：从 offset 起读 length 字节，应答走 OOL */
+
+/* 大文件分块读（FS_MSG_READ_FILE_AT）：应答走 OOL 物理页，单次最多 FS_FILE_CHUNK 字节。
+ * 该值受 MACH_MSG_OOL_MAX_PAGES(256 页 = 1MiB) 约束。旧实现用内联 3500B 分块读
+ * （FS_MSG_READ_AT），950KiB 的 fontsrv 映像需 ~270 次往返；在数百毫秒级唤醒延迟被
+ * 放大后读取近乎“挂死”（shell 卡在 launching font service）。改用近 1MiB OOL 分块后，
+ * 该映像仅需 1 次往返，读取时间从数十秒降到毫秒级。 */
+#define FS_FILE_CHUNK    (1u * 1024u * 1024u)
 
 /* 单条读/写数据上限：<= DISK_MAX_SECTORS*512(3584)，且必须 < MACH_MSG_INLINE_MAX(3968) */
 #define FS_WRITE_MAX     3584
@@ -110,6 +118,13 @@ typedef struct fs_read_at_req {
     uint32_t length;
     /* 后随文件名字符串 */
 } fs_read_at_req_t;
+
+/* 一代：大文件分块读请求（应答走 OOL） */
+typedef struct fs_read_file_at_req {
+    uint32_t offset;
+    uint32_t length;              /* 期望读取字节数（截断到 FS_FILE_CHUNK） */
+    /* 后随文件名字符串（NUL 结尾） */
+} fs_read_file_at_req_t;
 
 /* 一代：写请求 */
 typedef struct fs_write_req {

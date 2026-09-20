@@ -480,24 +480,31 @@ uint8_t *exec_read_file(const char *path, size_t pl,
         port_free(rp);
         return NULL;
     }
+    /* OOL 接收缓冲：单次最多 FS_FILE_CHUNK(1 MiB) 文件数据。动态分配避免大栈帧，
+     * 且每调用独立（内核 syscall 可被阻塞/让出，不可用 static 共享缓冲）。 */
+    uint8_t *chunkbuf = (uint8_t *)kmalloc(FS_FILE_CHUNK);
+    if (!chunkbuf) {
+        port_free(rp);
+        kfree(elfbuf);
+        return NULL;
+    }
 
-    uint8_t req[sizeof(mach_msg_header_t) + sizeof(fs_read_at_req_t) + EXEC_PATH_MAX];
-    uint8_t resp[sizeof(mach_msg_header_t) + sizeof(fs_resp_t) + FS_READ_MAX + 64];
+    uint8_t req[sizeof(mach_msg_header_t) + sizeof(fs_read_file_at_req_t) + EXEC_PATH_MAX];
+    uint8_t resp[sizeof(mach_msg_header_t) + 64];
 
     uint32_t offset = 0, total = 0;
+    uint8_t *ret = elfbuf;
     for (;;) {
         if (total >= EXEC_ELF_MAX) {
-            /* 超出内核可装载上限，放弃 */
-            port_free(rp);
-            kfree(elfbuf);
-            return NULL;
+            ret = NULL;                  /* 超出内核可装载上限，放弃 */
+            break;
         }
         uint32_t want = (uint32_t)(EXEC_ELF_MAX - total);
-        if (want > FS_READ_MAX) want = FS_READ_MAX;
+        if (want > FS_FILE_CHUNK) want = FS_FILE_CHUNK;
 
         memset(req, 0, sizeof(req));
         mach_msg_header_t *rh = (mach_msg_header_t *)req;
-        fs_read_at_req_t *ra = (fs_read_at_req_t *)(req + sizeof(*rh));
+        fs_read_file_at_req_t *ra = (fs_read_file_at_req_t *)(req + sizeof(*rh));
         ra->offset = offset;
         ra->length = want;
         memcpy(req + sizeof(*rh) + sizeof(*ra), path, pl + 1);
@@ -505,45 +512,47 @@ uint8_t *exec_read_file(const char *path, size_t pl,
         rh->msgh_size = sizeof(*rh) + sizeof(*ra) + (uint32_t)pl + 1;
         rh->msgh_remote_port = FS_PORT;
         rh->msgh_local_port = rp;
-        rh->msgh_id = FS_MSG_READ_AT;
+        rh->msgh_id = FS_MSG_READ_FILE_AT;
         rh->msgh_reserved = 0;
 
         if (ipc_send_kernel(FS_PORT, req, rh->msgh_size) != MACH_MSG_SUCCESS) {
-            port_free(rp);
-            kfree(elfbuf);
-            return NULL;
+            ret = NULL;
+            break;
         }
 
-        uint32_t out = 0;
-        if (ipc_recv_kernel(rp, resp, sizeof(resp), &out, true) != MACH_MSG_SUCCESS) {
-            port_free(rp);
-            kfree(elfbuf);
-            return NULL;
+        /* 接收 OOL 大块：inline 仅头部，数据在 OOL 物理页，内核直接拷入 chunkbuf。 */
+        uint32_t inout = 0, oolout = 0;
+        if (ipc_recv_ool_kernel(rp, resp, sizeof(resp), &inout,
+                                chunkbuf, FS_FILE_CHUNK, &oolout, true)
+                != MACH_MSG_SUCCESS) {
+            ret = NULL;
+            break;
         }
-        mach_msg_header_t *sh = (mach_msg_header_t *)resp;
-        fs_resp_t *fr = (fs_resp_t *)(resp + sizeof(*sh));
+        if (oolout < sizeof(fs_resp_t)) {
+            ret = NULL;
+            break;
+        }
+        fs_resp_t *fr = (fs_resp_t *)chunkbuf;
         if (fr->status != FS_OK) {
-            port_free(rp);
-            kfree(elfbuf);
-            return NULL;
+            ret = NULL;
+            break;
         }
         if (fr->length == 0) {
             break;                       /* EOF：文件读完 */
         }
-        if (fr->length > FS_READ_MAX ||
+        if (fr->length > FS_FILE_CHUNK - sizeof(fs_resp_t) ||
             total + fr->length > EXEC_ELF_MAX) {
-            port_free(rp);
-            kfree(elfbuf);
-            return NULL;
+            ret = NULL;
+            break;
         }
-        const uint8_t *data = resp + sizeof(*sh) + sizeof(*fr);
-        memcpy(elfbuf + total, data, fr->length);
+        memcpy(elfbuf + total, chunkbuf + sizeof(fs_resp_t), fr->length);
         total += fr->length;
         offset += fr->length;
     }
     port_free(rp);
+    kfree(chunkbuf);
 
-    if (total == 0) {
+    if (ret == NULL || total == 0) {
         kfree(elfbuf);
         return NULL;
     }

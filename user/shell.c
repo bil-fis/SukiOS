@@ -1331,6 +1331,17 @@ int main(int argc, char **argv)
             shell_out("[shell] pchfnt selftest spawned\n");
     }
 
+    /* iSukiUI 概念稿复刻演示 iSukiDemo：从磁盘 /BIN/ISUKIDEMO.SKA 拉起
+     * （不再内嵌内核；headless 下窗口合成 + 自检测经串口落盘，可验证） */
+    {
+        char *iargv[] = { (char*)"/BIN/ISUKIDEMO.SKA", NULL };
+        int ipid = sys_task_spawn((char*)"/BIN/ISUKIDEMO.SKA", iargv, NULL);
+        if (ipid < 0)
+            shell_out("[shell] warn: iSukiDemo spawn failed\n");
+        else
+            shell_out("[shell] iSukiDemo launched\n");
+    }
+
     /* 注：nettest（网络子系统端到端验证）已由 kmain 作为内嵌 USER_PROG 在开机自检
      * 阶段确定性 spawn（输出经串口落盘，详见 kmain.c）。此处不再重复拉起，避免双
      * 实例造成 socket fd 清理与日志混乱。 */

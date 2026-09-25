@@ -167,7 +167,7 @@ endif
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello suikitest isukidemo
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello suikitest
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 -Wa,--noexecstack \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -1007,6 +1007,7 @@ $(ISO): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB)
 iso-single: $(ISO_SINGLE)
 $(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
                 $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) \
+                $(BUILD)/user/isukidemo.elf \
                 others_tests/moonhalo.mp3 $(RUST_BIN) $(REG_SRES)
 	@mkdir -p $(ISODIR_SINGLE)/boot/grub
 	cp $(KERNEL) $(ISODIR_SINGLE)/boot/kernel.ski
@@ -1039,7 +1040,7 @@ $(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
 		echo "  iso-single: BIN/$$up.SKA <= $(BUILD)/apps/$$p.elf"; \
 		cp $(BUILD)/apps/$$p.elf $(ISODIR_SINGLE)/BIN/$$up.SKA; \
 	done
-	# iSukiUI 演示程序（依赖 libsui + FreeType；同时内嵌于内核由 boot 自动 spawn）
+	# iSukiUI 演示程序 iSukiDemo（依赖 libsui；字体经 fontsrv 离屏渲染；不再内嵌内核，由 shell 从 /BIN/ISUKIDEMO.SKA 开机拉起）
 	cp $(BUILD)/user/isukidemo.elf $(ISODIR_SINGLE)/BIN/ISUKIDEMO.SKA
 	@if [ -f $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello ]; then \
 		cp $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello $(ISODIR_SINGLE)/BIN/RUSTHELLO.SKA; \
@@ -1053,7 +1054,7 @@ $(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
 # PLAYAUDIO 超过 8.3 短名 → mtools 自动创建长文件名(LFN)，FS_SERVER 已支持
 # 读取 LFN，故 shell 可用 `exec BIN/playaudio` 装载。
 disk: $(DISK)
-$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/moonhalo.mp3 $(RUST_BIN) $(REG_SRES)
+$(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) $(BUILD)/user/isukidemo.elf others_tests/moonhalo.mp3 $(RUST_BIN) $(REG_SRES)
 	@mkdir -p $(BUILD)
 	truncate -s 64M $@
 	mformat -i $@ -F -v SUKIOS ::
@@ -1106,7 +1107,7 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/m
 		echo "  disk: BIN/$$up.SKA  <= $(BUILD)/apps/$$p.elf"; \
 		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up.SKA; \
 	done
-	# iSukiUI 演示程序（依赖 libsui + FreeType；同时内嵌于内核由 boot 自动 spawn）
+	# iSukiUI 演示程序 iSukiDemo（依赖 libsui；字体经 fontsrv 离屏渲染；不再内嵌内核，由 shell 从 /BIN/ISUKIDEMO.SKA 开机拉起）
 	mcopy -i $@ $(BUILD)/user/isukidemo.elf ::BIN/ISUKIDEMO.SKA
 # Rust 示例程序（make make-rust-env + cargo build 产物，见 results/step69.md）。
 	# 仅当该 SukiOS ELF 已存在时放入镜像；缺失则跳过（不影响其余程序）。

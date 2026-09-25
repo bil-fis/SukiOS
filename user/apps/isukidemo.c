@@ -9,13 +9,13 @@
  *   - 五个页面（总览 / 控件 / 列表 / 对话框 / 外观），由侧边栏切换
  *   - 全部 libsui 控件：按钮 / 输入 / 文本域 / 复选 / 单选 / 开关 / 滑块 /
  *     分段 / 标签页 / 列表 / 卡片 / 进度 / 提示条 / 头像 / 徽标 / 下拉 / 对话框 / 通知
- *   - 中文经 FreeType 后端渲染（libsui 已自带字体引擎）
+ *   - 中文经 fontsrv 离屏渲染（libsui 委托 SukiFontServer，不再自带 FreeType）
  *
  * 窗口边框、焦点环（3px accent-soft 外扩）、失焦样式均按 HTML 设计令牌实现
  * （见 libsui 的 sui_render_window / sui_canvas_draw_focus_ring）。
  *
- * 运行：内核开机自动 spawn（SukiIsukiDemo）；也可在图形环境手动
- *       `exec BIN/ISUKIDEMO.SKA` 交互体验。
+ * 运行：开机由 shell 从 /BIN/ISUKIDEMO.SKA 拉起（任务名 iSukiDemo）；
+ *       也可在图形环境手动 `exec iSukiDemo` 交互体验。
  */
 #include "sui.h"
 #include "../lib/suki.h"   /* u_print / sys_yield / sys_exit */
@@ -424,6 +424,11 @@ static void build_appearance(sui_widget_t *pg)
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    /* 自命名为 iSukiDemo（替代内核内嵌时期的 SukiIsukiDemo 与磁盘文件名 ISUKIDEMO） */
+    {
+        const char *nm = "iSukiDemo";
+        suki_syscall2(114 /* SYS_PRCTL */, 15 /* PR_SET_NAME */, (uint64_t)(const void *)nm);
+    }
     u_print("[isukidemo] start (iSukiUI concept replica)\n");
 
     sui_init(NULL);

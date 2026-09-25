@@ -483,10 +483,23 @@ bool usb_init(void)
     }
     g_hc_ready = true;
 
-    /* 【不在此处同步枚举】避免在 kmain 里以忙等完成端口复位（100/50/30ms）而拖慢
-     * 引导。首次枚举交给下面的轮询任务：其首个 usb_poll() 即在【任务上下文】执行，
-     * 端口复位等长延用 msleep 让出 CPU，故枚举与 display/input 等服务可并行推进，
-     * UI 不会被 USB 拖慢（用户要求“像 PS/2 那样快、USB 不要忙等”）。 */
+    /* 恢复 step101 修复：提交 478191e 误将“同步首次枚举”回退为「仅异步轮询任务
+     * 枚举」，重新引入“USB 键鼠长时间无响应”的非确定性——枚举首次运行时机取决于
+     * 调度器何时切到 usb_service_task，某些时序下被推到全部 Ring3 服务之后，端口
+     * 复位期间 UI 无输入。
+     * 此处【在 boot_late 任务上下文、任何 Ring3 服务之前】同步完成首次枚举：根端口
+     * 键盘/Hub、Hub 下行鼠标逐轮推进（轮 1 枚举根端口，其后续轮推进 Hub 下行）。
+     * 关键：同步枚举阶段临时切回【忙等】(g_can_sleep=false)，复制 step101 验证通过
+     * 的连续时序——端口复位 100/50/30ms 紧接 SET_ADDRESS，不被调度/tick 插入打断，
+     * 才能在 QEMU 下确定性地首轮枚举成功（纯 msleep 让出 CPU 会让 SET_ADDRESS 落在
+     * 设备复位后尚未就绪的窗口而失败）。此时无其它任务需运行（Ring3 尚未创建），
+     * 短暂 100% 占 CPU 不影响任何服务；枚举成功后恢复 msleep 给后续轮询任务。 */
+    uhci_set_can_sleep(false);
+    for (int i = 0; i < 6; i++) {
+        usb_poll();
+    }
+    uhci_set_can_sleep(true);
+
     task_t *t = task_create_kernel(usb_service_task, NULL, "SukiUsbHost");
     if (!t) {
         kprintf("[usb] failed to start host service task\n");

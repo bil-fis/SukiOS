@@ -291,6 +291,12 @@ static int32_t g_cur_x = 0;
 static int32_t g_cur_y = 0;
 static uint32_t g_cur_buttons = 0;
 
+/* 当前正在绘制（合成）的窗口；供 fill_clip / 像素拷贝判断圆角挖洞，使圆角处保留
+ * 下层窗口/桌面内容，而非错误地填黑（修复窗口重叠时上层圆角把下层窗口涂黑的
+ * “四角黑框”缺陷）。 */
+static wm_window_t *g_paint_win = NULL;
+static int wm_corner_cut(const wm_window_t *w, int i, int j);  /* 前向声明 */
+
 /* 直写真实帧缓冲的单像素（光标只画到显存，绝不被写入离屏层） */
 static inline void fb_put_px(int32_t x, int32_t y, uint32_t rgb)
 {
@@ -307,26 +313,11 @@ static void draw_cursor_at(int32_t ox, int32_t oy)
             if (g_cursor_mask[j][i]) fb_put_px(ox + i, oy + j, col);
 }
 
-/* 从离屏层（始终不含光标）恢复一行到显存——用于擦除旧光标 */
-static void fb_restore_row_from_desk(int32_t y, int32_t x, int32_t wdt)
-{
-    if (y < 0 || (uint32_t)y >= g_fb_height) return;
-    if (x < 0) { wdt += x; x = 0; }
-    if (wdt <= 0 || x >= (int32_t)g_fb_width) return;
-    if (x + wdt > (int32_t)g_fb_width) wdt = (int32_t)g_fb_width - x;
-    uint32_t *d = (uint32_t *)g_fb + (uint64_t)y * g_stride + (uint32_t)x;
-    const uint32_t *s = g_desk + (uint64_t)y * g_stride + (uint32_t)x;
-    memcpy(d, s, (size_t)wdt * 4);
-}
-
-/* 鼠标仅移动：擦旧光标 + 画新光标。只触碰两个 ~12x18 小矩形，
- * 取代“每次移动全屏重绘 + 3.6MB 整屏拷贝”（响应速度关键）。 */
-static void cursor_move_only(int32_t oldx, int32_t oldy)
-{
-    for (int32_t j = 0; j < MOUSE_CURSOR_H; j++)
-        fb_restore_row_from_desk(oldy + j, oldx, MOUSE_CURSOR_W);
-    draw_cursor_at(g_cur_x, g_cur_y);
-}
+/* 鼠标移动不再使用 fb_restore_row_from_desk / cursor_move_only 直接覆盖显存；
+ * 改为在消息循环中把旧/新光标矩形 mark_dirty，由增量合成器重绘（见下方
+ * MOUSE_MSG_MOVE 处理），保证旧光标位置被正确重绘为下层窗口内容，并与圆角
+ * 挖洞状态保持一致。
+ */
 
 /* ===========================================================================
  * 增量合成器
@@ -357,7 +348,10 @@ static void fill_clip(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r
     if (ey > (int)g_fb_height) ey = (int)g_fb_height;
     for (int j = by; j < ey; j++) {
         uint32_t *row = g_canvas + (uint64_t)j * g_stride;
-        for (int i = bx; i < ex; i++) row[i] = rgb;
+        for (int i = bx; i < ex; i++) {
+            if (g_paint_win && wm_corner_cut(g_paint_win, i, j)) continue;
+            row[i] = rgb;
+        }
     }
 }
 
@@ -386,32 +380,23 @@ static void wm_fill_disc(int32_t cx, int32_t cy, int32_t rad, uint32_t color)
         }
 }
 
-/* 圆角窗口：清除四角（背景纯黑，清即圆角）。仅清除位于当前裁剪窗内的像素，
- * 避免破坏裁剪窗之外、由更低 Z 窗口已合成的内容；更高 Z 窗口随后会覆盖本窗角点。 */
-static void wm_round_corners(const wm_window_t *w, int r)
+/* 圆角“挖洞”判定：像素 (i,j) 是否位于窗口四角半径 WIN_RADIUS 的圆外（需保留下层）。
+ * 仅当像素落在某个角顶点的 r×r 邻域内且在圆外时才返回 1；窗口其余位置返回 0。
+ * 用于 wm_paint_window 的像素拷贝与装饰填充：圆角处不写画布，使下层窗口/桌面自然
+ * 透过，彻底修复“上层窗口圆角把下层窗口涂黑”的四角黑框缺陷（旧实现直接填黑四角）。 */
+static int wm_corner_cut(const wm_window_t *w, int i, int j)
 {
+    int r = WIN_RADIUS;
     int32_t x0 = w->x, y0 = w->y;
     int32_t x1 = (int32_t)(w->x + w->w), y1 = (int32_t)(w->y + w->h);
-    int cx0 = g_clx, cy0 = g_cly, cx1 = g_clx + g_clw, cy1 = g_cly + g_clh;
-    int r2 = r * r;
     int32_t corners[4][2] = { {x0, y0}, {x1, y0}, {x0, y1}, {x1, y1} };
     for (int k = 0; k < 4; k++) {
         int32_t vx = corners[k][0], vy = corners[k][1];
-        int xb = vx - r < cx0 ? cx0 : (vx - r < 0 ? 0 : vx - r);
-        int xe = vx + r > cx1 ? cx1 : (vx + r > (int32_t)g_fb_width  ? (int32_t)g_fb_width  : vx + r);
-        int yb = vy - r < cy0 ? cy0 : (vy - r < 0 ? 0 : vy - r);
-        int ye = vy + r > cy1 ? cy1 : (vy + r > (int32_t)g_fb_height ? (int32_t)g_fb_height : vy + r);
-        for (int j = yb; j < ye; j++)
-            for (int i = xb; i < xe; i++) {
-                int32_t dx = i - vx, dy = j - vy;
-                if (dx*dx + dy*dy > r2) {
-                    if (i >= cx0 && i < cx1 && j >= cy0 && j < cy1 &&
-                        i >= 0 && j >= 0 &&
-                        i < (int32_t)g_fb_width && j < (int32_t)g_fb_height)
-                        g_canvas[(uint64_t)j * g_stride + i] = 0;
-                }
-            }
+        int32_t dx = i - vx, dy = j - vy;
+        if (dx < -r || dx > r || dy < -r || dy > r) continue;  /* 不在该角 r×r 邻域 */
+        if (dx*dx + dy*dy > r*r) return 1;                      /* 角邻域内且在圆外 */
     }
+    return 0;
 }
 
 /* 绘制单个窗口的像素 + 几何装饰，仅输出与裁剪窗相交部分（背景黑由调用方清除） */
@@ -431,11 +416,22 @@ static void wm_paint_window(wm_window_t *w)
     if (bx0 < 0) bx0 = 0;
     if (by1 > (int)g_fb_height) by1 = (int)g_fb_height;
     if (bx1 > (int)g_fb_width)  bx1 = (int)g_fb_width;
-    /* 像素逐行 memcpy（源/目标 stride 不同时逐行） */
+    g_paint_win = w;
+    /* 像素拷贝：圆角区域（四角圆外）不写画布，保留下层窗口/桌面内容（挖洞而非填黑）。
+     * 仅窗口最上/最下 WIN_RADIUS 行可能触及角邻域需逐像素判断；中间行无角邻域，整块拷贝。 */
     for (int y = by0; y < by1; y++) {
-        const uint32_t *s = w->pixels + (uint64_t)(y - y0) * ww + (uint32_t)(bx0 - x0);
-        uint32_t *d = g_canvas + (uint64_t)y * g_stride + (uint32_t)bx0;
-        memcpy(d, s, (size_t)(bx1 - bx0) * 4);
+        const uint32_t *srow = w->pixels + (uint64_t)(y - y0) * ww;
+        uint32_t *drow = g_canvas + (uint64_t)y * g_stride;
+        int in_corner_row = (y >= y0 && y < y0 + WIN_RADIUS) ||
+                            (y >= wy1 - WIN_RADIUS && y < wy1);
+        if (!in_corner_row) {
+            memcpy(drow + bx0, srow + (bx0 - x0), (size_t)(bx1 - bx0) * 4);
+        } else {
+            for (int x = bx0; x < bx1; x++) {
+                if (wm_corner_cut(w, x, y)) continue;
+                drow[x] = srow[x - x0];
+            }
+        }
     }
     /* 窗口装饰（iSuki 新样式，纯几何无文字）：1px 边框 + 38px 标题栏 + 左侧三色交通灯 + 圆角(12) */
     uint32_t b = 1;
@@ -456,8 +452,7 @@ static void wm_paint_window(wm_window_t *w)
             wm_fill_disc((int32_t)x0 + 54, cy, 6, COL_TL_MAX);
         }
     }
-    /* 圆角窗口：清除四角（背景纯黑即圆角效果） */
-    wm_round_corners(w, WIN_RADIUS);
+    /* 圆角效果由上面的像素/装饰挖洞（wm_corner_cut）实现，不再填黑四角。 */
 }
 
 /* 重绘单个脏矩形：清黑 -> 重绘相交窗口 -> 仅拷贝该区域到帧缓冲 */
@@ -588,6 +583,7 @@ int main(void)
                         g_drag->y = m->y - g_drag_offy;
                         mark_dirty(ox, oy, (int)g_drag->w, (int)g_drag->h);
                         mark_dirty(g_drag->x, g_drag->y, (int)g_drag->w, (int)g_drag->h);
+                        mark_dirty(oldx, oldy, MOUSE_CURSOR_W, MOUSE_CURSOR_H);  /* 旧光标位置 */
                         flush_dirty();
                     } else if (h->msgh_id == MOUSE_MSG_BUTTON) {
                         /* 左键释放 -> 结束拖拽；并视情况下发 MOUSE_UP 给窗口 */
@@ -662,7 +658,12 @@ int main(void)
                         wm_forward_event(hit, &ev);
                     }
                     if (h->msgh_id == MOUSE_MSG_MOVE) {
-                        cursor_move_only(oldx, oldy);   /* 仅重画光标 */
+                        /* 鼠标移动：旧光标矩形与新光标矩形都标记为脏，交给增量合成器
+                         * 重绘（重绘会恢复下层窗口内容并清除圆角残影），末尾统一画新光标。
+                         * 不再用 fb_restore_row_from_desk 直接覆盖，避免与增量状态不一致。 */
+                        mark_dirty(oldx, oldy, MOUSE_CURSOR_W, MOUSE_CURSOR_H);
+                        mark_dirty(g_cur_x, g_cur_y, MOUSE_CURSOR_W, MOUSE_CURSOR_H);
+                        flush_dirty();
                     } else {
                         flush_dirty();                  /* WHEEL 不改像素，仅清脏 */
                     }

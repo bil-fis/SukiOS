@@ -291,11 +291,8 @@ static int32_t g_cur_x = 0;
 static int32_t g_cur_y = 0;
 static uint32_t g_cur_buttons = 0;
 
-/* 当前正在绘制（合成）的窗口；供 fill_clip / 像素拷贝判断圆角挖洞，使圆角处保留
- * 下层窗口/桌面内容，而非错误地填黑（修复窗口重叠时上层圆角把下层窗口涂黑的
- * “四角黑框”缺陷）。 */
-static wm_window_t *g_paint_win = NULL;
-static int wm_corner_cut(const wm_window_t *w, int i, int j);  /* 前向声明 */
+/* 圆角由应用（libsui）自行绘制：窗口像素缓冲四角已填窗口背景色。display_server
+ * 不再挖洞/填黑四角，直接整块拷贝应用像素，避免把应用圆角覆盖成黑色（黑边朝内）。 */
 
 /* 直写真实帧缓冲的单像素（光标只画到显存，绝不被写入离屏层） */
 static inline void fb_put_px(int32_t x, int32_t y, uint32_t rgb)
@@ -348,10 +345,7 @@ static void fill_clip(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t r
     if (ey > (int)g_fb_height) ey = (int)g_fb_height;
     for (int j = by; j < ey; j++) {
         uint32_t *row = g_canvas + (uint64_t)j * g_stride;
-        for (int i = bx; i < ex; i++) {
-            if (g_paint_win && wm_corner_cut(g_paint_win, i, j)) continue;
-            row[i] = rgb;
-        }
+        for (int i = bx; i < ex; i++) row[i] = rgb;
     }
 }
 
@@ -380,24 +374,7 @@ static void wm_fill_disc(int32_t cx, int32_t cy, int32_t rad, uint32_t color)
         }
 }
 
-/* 圆角“挖洞”判定：像素 (i,j) 是否位于窗口四角半径 WIN_RADIUS 的圆外（需保留下层）。
- * 仅当像素落在某个角顶点的 r×r 邻域内且在圆外时才返回 1；窗口其余位置返回 0。
- * 用于 wm_paint_window 的像素拷贝与装饰填充：圆角处不写画布，使下层窗口/桌面自然
- * 透过，彻底修复“上层窗口圆角把下层窗口涂黑”的四角黑框缺陷（旧实现直接填黑四角）。 */
-static int wm_corner_cut(const wm_window_t *w, int i, int j)
-{
-    int r = WIN_RADIUS;
-    int32_t x0 = w->x, y0 = w->y;
-    int32_t x1 = (int32_t)(w->x + w->w), y1 = (int32_t)(w->y + w->h);
-    int32_t corners[4][2] = { {x0, y0}, {x1, y0}, {x0, y1}, {x1, y1} };
-    for (int k = 0; k < 4; k++) {
-        int32_t vx = corners[k][0], vy = corners[k][1];
-        int32_t dx = i - vx, dy = j - vy;
-        if (dx < -r || dx > r || dy < -r || dy > r) continue;  /* 不在该角 r×r 邻域 */
-        if (dx*dx + dy*dy > r*r) return 1;                      /* 角邻域内且在圆外 */
-    }
-    return 0;
-}
+/* 圆角由应用（libsui）在窗口像素缓冲中绘制，display_server 整块拷贝，不再做圆角判定。 */
 
 /* 绘制单个窗口的像素 + 几何装饰，仅输出与裁剪窗相交部分（背景黑由调用方清除） */
 static void wm_paint_window(wm_window_t *w)
@@ -416,22 +393,12 @@ static void wm_paint_window(wm_window_t *w)
     if (bx0 < 0) bx0 = 0;
     if (by1 > (int)g_fb_height) by1 = (int)g_fb_height;
     if (bx1 > (int)g_fb_width)  bx1 = (int)g_fb_width;
-    g_paint_win = w;
-    /* 像素拷贝：圆角区域（四角圆外）不写画布，保留下层窗口/桌面内容（挖洞而非填黑）。
-     * 仅窗口最上/最下 WIN_RADIUS 行可能触及角邻域需逐像素判断；中间行无角邻域，整块拷贝。 */
+    /* 像素拷贝：直接整块拷贝应用像素（含应用自绘圆角四角背景），不做圆角挖洞，
+     * 避免覆盖应用已画好的圆角（否则四角被填黑/透黑，表现为黑边朝内）。 */
     for (int y = by0; y < by1; y++) {
-        const uint32_t *srow = w->pixels + (uint64_t)(y - y0) * ww;
-        uint32_t *drow = g_canvas + (uint64_t)y * g_stride;
-        int in_corner_row = (y >= y0 && y < y0 + WIN_RADIUS) ||
-                            (y >= wy1 - WIN_RADIUS && y < wy1);
-        if (!in_corner_row) {
-            memcpy(drow + bx0, srow + (bx0 - x0), (size_t)(bx1 - bx0) * 4);
-        } else {
-            for (int x = bx0; x < bx1; x++) {
-                if (wm_corner_cut(w, x, y)) continue;
-                drow[x] = srow[x - x0];
-            }
-        }
+        const uint32_t *s = w->pixels + (uint64_t)(y - y0) * ww + (uint32_t)(bx0 - x0);
+        uint32_t *d = g_canvas + (uint64_t)y * g_stride + (uint32_t)bx0;
+        memcpy(d, s, (size_t)(bx1 - bx0) * 4);
     }
     /* 窗口装饰（iSuki 新样式，纯几何无文字）：1px 边框 + 38px 标题栏 + 左侧三色交通灯 + 圆角(12) */
     uint32_t b = 1;
@@ -452,7 +419,7 @@ static void wm_paint_window(wm_window_t *w)
             wm_fill_disc((int32_t)x0 + 54, cy, 6, COL_TL_MAX);
         }
     }
-    /* 圆角效果由上面的像素/装饰挖洞（wm_corner_cut）实现，不再填黑四角。 */
+    /* 圆角由应用（libsui）在像素缓冲中绘制；本服务仅整块拷贝，不做圆角挖洞/填黑。 */
 }
 
 /* 重绘单个脏矩形：清黑 -> 重绘相交窗口 -> 仅拷贝该区域到帧缓冲 */

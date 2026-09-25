@@ -167,7 +167,7 @@ endif
 endif
 
 # ---- Ring3 系统服务（编译为 ELF，以字节流嵌入内核镜像，开机由内核直接装载） ----
-USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello suikitest
+USER_PROGS   := fs_server input_server display_server shell posixtest mouse_server net_server nettest curl_test curl_app_test dltest winhello suikitest isukidemo
 USER_CFLAGS  := -ffreestanding -nostdlib -std=gnu11 -Wall -Wextra -O2 -Wa,--noexecstack \
                 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mgeneral-regs-only \
                 -mcmodel=small -fno-pic -fno-pie -fstack-protector-strong -mstack-protector-guard=global \
@@ -326,7 +326,7 @@ $(BUILD)/apps/winhello.elf: $(BUILD)/apps/winhello.o $(BUILD)/user/gui.c.o $(USE
 # iSuki UI 控件库（libsui，依据 iSuki UI 界面库设计规范.md）
 # ========================================================================
 # 库源（按规范 16：每个源文件独立编译，最终静态链入使用方 ELF）
-SUI_SRCS := user/libsui/src/sui_core.c user/libsui/src/sui_widgets.c
+SUI_SRCS := user/libsui/src/sui_core.c user/libsui/src/sui_widgets.c user/libsui/src/sui_font.c user/libsui/src/sui_controls.c
 SUI_OBJS := $(patsubst %.c,$(BUILD)/%.c.o,$(SUI_SRCS))
 $(BUILD)/user/libsui/src/%.c.o: user/libsui/src/%.c
 	@mkdir -p $(dir $@)
@@ -341,6 +341,16 @@ $(BUILD)/user/suikitest.elf: $(BUILD)/user/suikitest.c.o $(SUI_OBJS) $(BUILD)/us
 		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
 		-o $@ $(BUILD)/user/suikitest.c.o $(SUI_OBJS) $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
 	@echo "==> libsui self-test $@ ($$(stat -c%s $@) bytes)"
+
+# isukidemo（iSukiUI 概念稿完整复刻演示：libsui 全部控件 + FreeType 中文渲染）
+$(BUILD)/user/isukidemo.c.o: user/apps/isukidemo.c
+	@mkdir -p $(dir $@)
+	$(USER_CC) $(USER_CFLAGS) -I user/libsui/include -c $< -o $@
+$(BUILD)/user/isukidemo.elf: $(BUILD)/user/isukidemo.c.o $(SUI_OBJS) $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) user/user.ld
+	$(USER_CC) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,--no-warn-rwx-segments -Wl,--no-warn-execstack -T user/user.ld \
+		-o $@ $(BUILD)/user/isukidemo.c.o $(SUI_OBJS) $(BUILD)/user/gui.c.o $(USER_LIB_OBJS) -lgcc
+	@echo "==> isukidemo $@ ($$(stat -c%s $@) bytes)"
 
 # ---- FreeType 静态库（字体服务 pchfnt/fontsrv 的字形光栅化引擎）----
 # 仅编入 TrueType 渲染必需模块（base/sfnt/truetype/smooth/raster/autofit/
@@ -1029,6 +1039,8 @@ $(ISO_SINGLE): $(KERNEL) grub/grub.cfg $(KDR_OBJS) $(MINIZ_LIB) \
 		echo "  iso-single: BIN/$$up.SKA <= $(BUILD)/apps/$$p.elf"; \
 		cp $(BUILD)/apps/$$p.elf $(ISODIR_SINGLE)/BIN/$$up.SKA; \
 	done
+	# iSukiUI 演示程序（依赖 libsui + FreeType；同时内嵌于内核由 boot 自动 spawn）
+	cp $(BUILD)/user/isukidemo.elf $(ISODIR_SINGLE)/BIN/ISUKIDEMO.SKA
 	@if [ -f $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello ]; then \
 		cp $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello $(ISODIR_SINGLE)/BIN/RUSTHELLO.SKA; \
 	fi
@@ -1094,7 +1106,9 @@ $(DISK): $(APP_ELFS) $(FONT_ELFS) $(LIBTEST_SL) $(LIBSUKI_GUI_SL) others_tests/m
 		echo "  disk: BIN/$$up.SKA  <= $(BUILD)/apps/$$p.elf"; \
 		mcopy -i $@ $(BUILD)/apps/$$p.elf ::BIN/$$up.SKA; \
 	done
-	# Rust 示例程序（make make-rust-env + cargo build 产物，见 results/step69.md）。
+	# iSukiUI 演示程序（依赖 libsui + FreeType；同时内嵌于内核由 boot 自动 spawn）
+	mcopy -i $@ $(BUILD)/user/isukidemo.elf ::BIN/ISUKIDEMO.SKA
+# Rust 示例程序（make make-rust-env + cargo build 产物，见 results/step69.md）。
 	# 仅当该 SukiOS ELF 已存在时放入镜像；缺失则跳过（不影响其余程序）。
 	@if [ -f $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello ]; then \
 		echo "  disk: BIN/RUSTHELLO.SKA <= $(RUST_DIR)/target/x86_64-sukios/debug/sukios-hello"; \

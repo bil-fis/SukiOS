@@ -88,6 +88,7 @@ extern const uint8_t user_curl_app_test_start[], user_curl_app_test_end[];
 extern const uint8_t user_dltest_start[], user_dltest_end[];
 extern const uint8_t user_winhello_start[], user_winhello_end[];
 extern const uint8_t user_suikitest_start[], user_suikitest_end[];
+extern const uint8_t user_isukidemo_start[], user_isukidemo_end[];
 
 /* 内核控制台服务：拥有 CONSOLE_PORT，接收文本消息并打印（阶段七演示） */
 static void console_srv(void *arg)
@@ -856,9 +857,15 @@ static void boot_late_init(void *arg)
     /* libsui 控件库端到端自检：spawn suikitest（libsui 创建窗口 + 控件 + OOL 合成）。
      * 验证「应用 -> WM_PORT -> 显示服务增量合成 -> 帧缓冲」全链路，输出经串口落盘。 */
     task_t *sp5 = task_create_user(user_suikitest_start,
-                     (size_t)(user_suikitest_end - user_suikitest_start),
-                     "SukiSuiTest");
+                    (size_t)(user_suikitest_end - user_suikitest_start),
+                    "SukiSuiTest");
     kprintf("[boot-dbg] suikitest spawn ret=%p\n", (void *)sp5);
+
+    /* iSukiUI 概念稿完整复刻演示：spawn isukidemo（libsui 全部控件 + FreeType 中文渲染）。 */
+    task_t *sp6 = task_create_user(user_isukidemo_start,
+                    (size_t)(user_isukidemo_end - user_isukidemo_start),
+                    "SukiIsukiDemo");
+    kprintf("[boot-dbg] isukidemo spawn ret=%p\n", (void *)sp6);
 
     /* 动态链接验证：spawn dltest（运行期 dlopen("/LIB/libtest.sl") + dlsym）。
      * 验证内核 elf.c 的 ET_DYN 模块加载/重定位/符号解析（dlopen 路径）。

@@ -111,13 +111,14 @@ static void button_draw(sui_widget_t *w, sui_canvas_t *c)
     (void)scale;
     sui_canvas_draw_text(c, tx, ty, w->text, fs, SUI_WEIGHT_MEDIUM, txt);
 }
-static void button_on_event(sui_widget_t *w, const sui_event_t *ev)
+static bool button_on_event(sui_widget_t *w, const sui_event_t *ev)
 {
-    if (!w->enabled) return;
+    if (!w->enabled) return false;
     sui_button_t *b = (sui_button_t *)w;
     if (ev->type == SUI_EVENT_CLICK && b->on_click) {
         b->on_click(w, b->user);
     }
+    return false;
 }
 static void button_measure(sui_widget_t *w)
 {
@@ -176,14 +177,15 @@ static void checkbox_draw(sui_widget_t *w, sui_canvas_t *c)
     sui_canvas_draw_text(c, w->abs_x + 22, w->abs_y + (16 - 8 * scale) / 2,
                          w->text, fs, SUI_WEIGHT_REGULAR, t->text_primary);
 }
-static void checkbox_on_event(sui_widget_t *w, const sui_event_t *ev)
+static bool checkbox_on_event(sui_widget_t *w, const sui_event_t *ev)
 {
-    if (!w->enabled) return;
+    if (!w->enabled) return false;
     sui_checkbox_t *cb = (sui_checkbox_t *)w;
     if (ev->type == SUI_EVENT_CLICK) {
         cb->checked = !cb->checked; cb->indeterminate = false;
         if (cb->on_change) cb->on_change(w, cb->checked, cb->user);
     }
+    return false;
 }
 static const sui_widget_vtable_t g_checkbox_vt = { "Checkbox", checkbox_draw, NULL, checkbox_on_event, NULL };
 
@@ -224,14 +226,15 @@ static void switch_draw(sui_widget_t *w, sui_canvas_t *c)
     int tx = s->on ? (w->abs_x + w->w - 2 - thumb) : (w->abs_x + 2);
     sui_canvas_fill_circle(c, tx + thumb / 2, w->abs_y + w->h / 2, thumb / 2, 0x00FFFFFFu);
 }
-static void switch_on_event(sui_widget_t *w, const sui_event_t *ev)
+static bool switch_on_event(sui_widget_t *w, const sui_event_t *ev)
 {
-    if (!w->enabled) return;
+    if (!w->enabled) return false;
     sui_switch_t *s = (sui_switch_t *)w;
     if (ev->type == SUI_EVENT_CLICK) {
         s->on = !s->on;
         if (s->on_change) s->on_change(w, s->on, s->user);
     }
+    return false;
 }
 static const sui_widget_vtable_t g_switch_vt = { "Switch", switch_draw, NULL, switch_on_event, NULL };
 
@@ -280,9 +283,9 @@ static void slider_draw(sui_widget_t *w, sui_canvas_t *c)
                              SUI_WEIGHT_REGULAR, t->text_secondary);
     }
 }
-static void slider_on_event(sui_widget_t *w, const sui_event_t *ev)
+static bool slider_on_event(sui_widget_t *w, const sui_event_t *ev)
 {
-    if (!w->enabled) return;
+    if (!w->enabled) return false;
     sui_slider_t *s = (sui_slider_t *)w;
     if ((ev->type == SUI_EVENT_MOUSE_DOWN || ev->type == SUI_EVENT_MOUSE_MOVE) && w->pressed) {
         int range = w->w - 16; if (range < 1) range = 1;
@@ -296,6 +299,7 @@ static void slider_on_event(sui_widget_t *w, const sui_event_t *ev)
             if (s->on_change) s->on_change(w, s->value, s->user);
         }
     }
+    return false;
 }
 static const sui_widget_vtable_t g_slider_vt = { "Slider", slider_draw, NULL, slider_on_event, NULL };
 
@@ -402,13 +406,13 @@ static void input_draw(sui_widget_t *w, sui_canvas_t *c)
         sui_canvas_draw_line(c, cx, w->abs_y + 6, cx, w->abs_y + w->h - 6, t->accent, 1);
     }
 }
-static void input_on_event(sui_widget_t *w, const sui_event_t *ev)
+static bool input_on_event(sui_widget_t *w, const sui_event_t *ev)
 {
     sui_input_t *ip = (sui_input_t *)w;
     if (ev->type == SUI_EVENT_CLICK) {
-        sui_widget_focus(w); return;
+        sui_widget_focus(w); return false;
     }
-    if (!w->enabled || !w->focused) return;
+    if (!w->enabled || !w->focused) return false;
     if (ev->type == SUI_EVENT_KEY_CHAR && ev->ch) {
         size_t len = sui_strlen(ip->text);
         if (!ip->readonly && len < sizeof(ip->text) - 1 && ev->ch >= 0x20 && ev->ch < 0x7F) {
@@ -424,6 +428,7 @@ static void input_on_event(sui_widget_t *w, const sui_event_t *ev)
             ip->on_submit(w, ip->text, ip->user);
         }
     }
+    return false;
 }
 static const sui_widget_vtable_t g_input_vt = { "Input", input_draw, NULL, input_on_event, NULL };
 

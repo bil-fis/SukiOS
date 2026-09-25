@@ -170,7 +170,7 @@ void sui_canvas_fill_rect(sui_canvas_t *c, int x, int y, int w, int h, uint32_t 
     if (x1 <= x0 || y1 <= y0) return;
     uint32_t col = SUI_FB(color);
     for (int j = y0; j < y1; j++) {
-        uint32_t *row = c->pixels + (uint64_t)j * c->width + x0;
+        uint32_t *row = c->pixels + (uint64_t)j * c->width;
         for (int i = x0; i < x1; i++) row[i] = col;
     }
 }
@@ -294,6 +294,9 @@ void sui_canvas_draw_text(sui_canvas_t *c, int x, int y, const char *text,
                           int font_size, int weight, uint32_t color)
 {
     if (!c || !text) return;
+    /* 优先委托 fontsrv 渲染（支持中文 / Unicode）；不可用则降级 ASCII 点阵。
+     * sui_font_draw 内部已处理 fontsrv 重试与降级，返回 0 表示成功合成到画布。 */
+    if (sui_font_draw(c, x, y, text, font_size, color) == 0) return;
     (void)weight;
     int scale = font_size <= 0 ? 1 : (font_size + 5) / 12;
     if (scale < 1) scale = 1;
@@ -308,6 +311,9 @@ void sui_canvas_draw_text(sui_canvas_t *c, int x, int y, const char *text,
 int sui_canvas_measure_text(sui_canvas_t *c, const char *text, int font_size, int weight)
 {
     (void)c; (void)weight;
+    /* 委托 fontsrv 测量；不可用则降级 ASCII 估算 */
+    int w = sui_font_measure(text, font_size);
+    if (w >= 0) return w;
     int scale = font_size <= 0 ? 1 : (font_size + 5) / 12;
     if (scale < 1) scale = 1;
     return (int)sui__strlen(text) * 8 * scale;
@@ -343,8 +349,15 @@ void sui_canvas_draw_focus_ring(sui_canvas_t *c, const sui_widget_t *w)
 {
     if (!c || !w) return;
     const sui_theme_t *t = sui_theme();
-    sui_canvas_stroke_rounded_rect(c, w->abs_x - 2, w->abs_y - 2, w->w + 4, w->h + 4,
-                                   w->corner_radius + 2, 2, t->accent);
+    /* 规范 / HTML：焦点环 = 3px 强调色（accent-soft）外扩描边。
+     * 用四条线段绘制（不擦除控件内部像素），四角不完美闭环但足够辨识。 */
+    int ox = w->abs_x - 3, oy = w->abs_y - 3, ow = w->w + 6, oh = w->h + 6;
+    int r = w->corner_radius + 3;
+    uint32_t col = t->accent_soft & 0x00FFFFFFu;   /* 取 RGB，不透明描边 */
+    sui_canvas_draw_line(c, ox + r, oy, ox + ow - r, oy, col, 3);
+    sui_canvas_draw_line(c, ox + r, oy + oh, ox + ow - r, oy + oh, col, 3);
+    sui_canvas_draw_line(c, ox, oy + r, ox, oy + oh - r, col, 3);
+    sui_canvas_draw_line(c, ox + ow, oy + r, ox + ow, oy + oh - r, col, 3);
 }
 
 /* =========================================================================
@@ -372,6 +385,23 @@ void sui_widget_destroy(sui_widget_t *w)
     while (w->first_child) sui_widget_destroy(w->first_child);
     if (w->parent) sui_widget_remove_child(w->parent, w);
     if (w->vtable && w->vtable->destroy) w->vtable->destroy(w);
+}
+
+sui_widget_t *sui_widget_create_ex(const sui_widget_vtable_t *vt, sui_widget_t *parent, size_t extra)
+{
+    sui_widget_t *w = (sui_widget_t *)sui__alloc(sizeof(sui_widget_t) + extra);
+    if (!w) return NULL;
+    memset(w, 0, sizeof(sui_widget_t) + extra);
+    w->vtable = vt;
+    w->visible = true; w->enabled = true; w->focusable = true; w->opacity = 1.0f;
+    w->corner_radius = SUI_RADIUS_CTRL;
+    w->layout.type = SUI_LAYOUT_ABSOLUTE;
+    w->constraint.min_w = w->constraint.min_h = 0;
+    w->constraint.max_w = w->constraint.max_h = 100000;
+    w->constraint.preferred_w = w->constraint.preferred_h = -1;
+    w->constraint.flex = 0;
+    if (parent) sui_widget_add_child(parent, w);
+    return w;
 }
 void sui_widget_destroy_recursive(sui_widget_t *w) { sui_widget_destroy(w); }
 
@@ -529,7 +559,7 @@ void sui_render(sui_widget_t *root, sui_canvas_t *canvas)
 /* =========================================================================
  * 事件分发（规范 7.5 / 13.2）
  * ====================================================================== */
-void sui_event_stop(sui_event_t *ev) { if (ev) ev->stopped = true; }
+void sui_event_stop(const sui_event_t *ev) { if (ev) ((sui_event_t *)ev)->stopped = true; }
 
 static sui_widget_t *g_hover = NULL;
 
@@ -583,6 +613,7 @@ int sui_init(sui_window_t *win)
 {
     (void)win;
     g_theme = g_theme_light;   /* 默认浅色主题 */
+    sui_font_init();           /* 加载字体（失败则降级 ASCII，不致命） */
     return 0;
 }
 
@@ -601,16 +632,25 @@ sui_window_t *sui_create_window(const char *title, int x, int y, int w, int h, b
     win->bg = SUI_FB(g_theme.window_bg);
     sui__strcpy(win->title, title ? title : "");
     win->running = true;
+    win->active  = true;
     win->root = sui_widget_create(NULL, NULL);
     if (!win->root) { SukiDestroyWindow(win->wk); return NULL; }
     win->root->w = w; win->root->h = h;
     win->root->focusable = false;
+    /* 浮层根（对话框 / 菜单），默认隐藏，绘制于最上层 */
+    win->overlay = sui_widget_create(NULL, NULL);
+    if (win->overlay) {
+        win->overlay->w = w; win->overlay->h = h;
+        win->overlay->visible = false; win->overlay->focusable = false;
+    }
     return win;
 }
 
 void sui_destroy_window(sui_window_t *win)
 {
     if (!win) return;
+    sui_font_unregister_all();   /* 让 fontsrv 解映射本窗口画布 */
+    if (win->overlay) sui_widget_destroy(win->overlay);
     if (win->root) sui_widget_destroy(win->root);
     if (win->wk) SukiDestroyWindow(win->wk);
     win->running = false;
@@ -639,24 +679,46 @@ void sui_render_window(sui_window_t *win)
     int client_y = 0;
     if (win->has_titlebar) {
         int th = t->titlebar_height;
-        sui_canvas_fill_rect(c, 0, 0, c->width, th, t->accent);
-        /* 交通灯（左起 3 个圆点） */
+        /* 标题栏底色 = 材质窗口底色（不再整条强调色填充），底边 1px stroke 分隔 */
+        sui_canvas_fill_rect(c, 0, 0, c->width, th, win->bg);
+        sui_canvas_fill_rect(c, 0, th - 1, c->width, 1, t->stroke_soft);
+        /* 交通灯：活动窗口彩色，失焦去饱和（规范 12.1） */
+        uint32_t tc_close = win->active ? SUI_TRAFFIC_CLOSE : 0x00BFBFBF;
+        uint32_t tc_min   = win->active ? SUI_TRAFFIC_MIN   : 0x00C8C8C8;
+        uint32_t tc_max   = win->active ? SUI_TRAFFIC_MAX   : 0x00BFBFBF;
         int cy = th / 2;
-        sui_canvas_fill_circle(c, 16, cy, 6, SUI_TRAFFIC_CLOSE);
-        sui_canvas_fill_circle(c, 34, cy, 6, SUI_TRAFFIC_MIN);
-        sui_canvas_fill_circle(c, 52, cy, 6, SUI_TRAFFIC_MAX);
-        /* 标题（居中） */
+        sui_canvas_fill_circle(c, 16, cy, 6, tc_close);
+        sui_canvas_fill_circle(c, 34, cy, 6, tc_min);
+        sui_canvas_fill_circle(c, 52, cy, 6, tc_max);
+        /* 标题居中：活动=text_primary，失焦=text_secondary */
+        uint32_t tcol = win->active ? t->text_primary : t->text_secondary;
         int tw = sui_canvas_measure_text(c, win->title, SUI_FONT_SUBTITLE, SUI_WEIGHT_MEDIUM);
         int tx = (c->width - tw) / 2;
         sui_canvas_draw_text(c, tx, cy - 6, win->title, SUI_FONT_SUBTITLE,
-                             SUI_WEIGHT_MEDIUM, 0x00FFFFFFu);
+                             SUI_WEIGHT_MEDIUM, tcol);
         client_y = th;
     }
+    /* 窗口外圈 1px stroke 边框（HTML: border 1px solid var(--stroke)） */
+    uint32_t bd = t->stroke;
+    sui_canvas_draw_line(c, 0, 0, c->width - 1, 0, bd, 1);
+    sui_canvas_draw_line(c, 0, c->height - 1, c->width - 1, c->height - 1, bd, 1);
+    sui_canvas_draw_line(c, 0, 0, 0, c->height - 1, bd, 1);
+    sui_canvas_draw_line(c, c->width - 1, 0, c->width - 1, c->height - 1, bd, 1);
     /* 客户区裁剪后渲染根控件 */
     sui_canvas_push_clip(c, 0, client_y, c->width, c->height - client_y);
     sui_layout_apply(win->root);
     sui_render(win->root, c);
     sui_canvas_pop_clip(c);
+    /* 浮层（对话框 / 菜单），绘制于最上层 */
+    if (win->overlay && win->overlay->visible) {
+        win->overlay->abs_x = 0; win->overlay->abs_y = 0;
+        win->overlay->w = c->width; win->overlay->h = c->height;
+        sui_layout_apply(win->overlay);
+        sui_render(win->overlay, c);
+    }
+    /* 通知（toast）绘制（controls.c 提供符号；不拦截事件） */
+    extern void sui_toast_paint(sui_window_t *, sui_canvas_t *);
+    sui_toast_paint(win, c);
     sui_canvas_destroy(c);
 }
 
@@ -687,6 +749,11 @@ bool sui_window_poll_event(sui_window_t *win, sui_event_t *out)
         case SUKI_EVENT_KEY_DOWN:    out->type = SUI_EVENT_KEY_DOWN;    break;
         case SUKI_EVENT_KEY_UP:      out->type = SUI_EVENT_KEY_UP;      break;
         case SUKI_EVENT_WINDOW_CLOSE:out->type = SUI_EVENT_WINDOW_CLOSE;break;
+        case SUKI_EVENT_WINDOW_FOCUS:
+            /* 窗口聚焦状态变化：记录 active 以驱动标题栏/交通灯失焦样式 */
+            win->active = true;
+            out->type = SUI_EVENT_NONE;  /* 内部事件，不传递给控件 */
+            break;
         default: out->type = SUI_EVENT_NONE; break;
     }
     out->x = (int)ke.u.mouse.x; out->y = (int)ke.u.mouse.y;
@@ -702,7 +769,11 @@ bool sui_window_step(sui_window_t *win, sui_event_t *out)
     if (!sui_window_poll_event(win, &ev)) return false;
     if (out) *out = ev;
     if (ev.type == SUI_EVENT_WINDOW_CLOSE) { win->running = false; return true; }
-    sui_dispatch_event(win->root, &ev);
+    /* 浮层（对话框/菜单）可见时，事件仅派发给浮层（模态拦截） */
+    if (win->overlay && win->overlay->visible)
+        sui_dispatch_event(win->overlay, &ev);
+    else
+        sui_dispatch_event(win->root, &ev);
     sui_render_window(win);
     sui_window_present(win, 0, 0, win->wk->w, win->wk->h);
     return true;

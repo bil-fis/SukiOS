@@ -291,12 +291,14 @@ struct sui_widget_vtable {
     const char *type_name;
     void (*draw)(sui_widget_t *, struct sui_canvas *);
     void (*measure)(sui_widget_t *);
-    void (*on_event)(sui_widget_t *, const struct sui_event *);
+    bool (*on_event)(sui_widget_t *, const struct sui_event *);
     void (*destroy)(sui_widget_t *);
 };
 typedef struct sui_widget_vtable sui_widget_vtable_t;
 
 sui_widget_t *sui_widget_create(const sui_widget_vtable_t *vt, sui_widget_t *parent);
+/* 分配 sizeo(sui_widget_t)+extra 字节（扩展控件用，避免越界覆盖相邻控件） */
+sui_widget_t *sui_widget_create_ex(const sui_widget_vtable_t *vt, sui_widget_t *parent, size_t extra);
 void sui_widget_destroy(sui_widget_t *w);
 void sui_widget_destroy_recursive(sui_widget_t *w);
 void sui_widget_add_child(sui_widget_t *parent, sui_widget_t *child);
@@ -387,7 +389,7 @@ typedef struct sui_event {
     int     value;      /* 通用数值（slider 0-100 / checkbox 0,1,2） */
 } sui_event_t;
 
-void sui_event_stop(sui_event_t *ev);
+void sui_event_stop(const sui_event_t *ev);
 void sui_dispatch_event(sui_widget_t *root, const sui_event_t *ev);
 
 /* =========================================================================
@@ -400,7 +402,9 @@ void sui_dispatch_event(sui_widget_t *root, const sui_event_t *ev);
 typedef struct sui_window {
     suki_window_t *wk;     /* 底层 libsuki_gui 窗口 */
     sui_widget_t  *root;   /* 根控件（覆盖整窗） */
+    sui_widget_t  *overlay;/* 浮层根（对话框/菜单/通知），默认 hidden，绘制于最上层 */
     bool running;
+    bool active;           /* 窗口是否处于活动（聚焦）状态，影响标题栏/交通灯样式 */
     sui_widget_t *focus;
     uint32_t bg;           /* 窗口背景色（RGB） */
     bool     has_titlebar;
@@ -511,6 +515,174 @@ typedef struct sui_input {
 sui_input_t *sui_input_create(sui_widget_t *parent, const char *placeholder);
 void sui_input_set_text(sui_input_t *i, const char *text);
 const char *sui_input_text(const sui_input_t *i);
+
+/* =========================================================================
+ * 12. 字体后端（委托 fontsrv 离屏渲染：libsui 不再自带 FreeType 合成器）
+ * ====================================================================== */
+int  sui_font_init(void);                       /* 加载默认字体（中/英 fallback） */
+void sui_font_set_default(const char *path);   /* 覆盖默认字体路径 */
+bool sui_font_ready(void);                      /* 字体是否就绪（否则降级 ASCII 点阵） */
+int  sui_font_draw(sui_canvas_t *c, int x, int y, const char *text, int size, uint32_t color);
+int  sui_font_measure(const char *text, int size);
+void sui_font_unregister_all(void);              /* 窗口销毁时解除画布注册（让 fontsrv 解映射） */
+
+/* =========================================================================
+ * 13. 扩展控件（补全控件库，复刻 iSuki UI 概念稿）
+ * ====================================================================== */
+/* 容器：面板 / 分区 */
+typedef struct sui_panel {
+    sui_widget_t base;
+    char title[64];
+} sui_panel_t;
+sui_panel_t *sui_panel_create(sui_widget_t *parent, const char *title);
+
+typedef struct sui_section {
+    sui_widget_t base;
+    char title[48];
+} sui_section_t;
+sui_section_t *sui_section_create(sui_widget_t *parent, const char *title);
+
+/* 侧边栏导航项 */
+typedef struct sui_navitem {
+    sui_widget_t base;
+    char label[48];
+    char icon;          /* 单字符图标（无 SVG 资产时用字符占位） */
+    char count[8];
+    bool active;
+    void (*on_click)(sui_widget_t *, void *);
+    void *user;
+} sui_navitem_t;
+sui_navitem_t *sui_navitem_create(sui_widget_t *parent, const char *label, char icon, const char *count);
+void sui_navitem_set_active(sui_navitem_t *n, bool a);
+void sui_navitem_on_click(sui_navitem_t *n, void (*fn)(sui_widget_t *, void *), void *user);
+
+/* 单选 */
+typedef struct sui_radio {
+    sui_widget_t base;
+    char label[48];
+    int  group;
+    bool checked;
+    void (*on_change)(sui_widget_t *, bool, void *);
+    void *user;
+} sui_radio_t;
+sui_radio_t *sui_radio_create(sui_widget_t *parent, const char *label, int group, bool checked);
+void sui_radio_set_checked(sui_radio_t *r, bool c);
+void sui_radio_on_change(sui_radio_t *r, void (*fn)(sui_widget_t *, bool, void *), void *user);
+
+/* 分段 */
+typedef struct sui_segmented {
+    sui_widget_t base;
+    char segments[8][24];
+    int  count;
+    int  selected;
+    void (*on_change)(sui_widget_t *, int, void *);
+    void *user;
+} sui_segmented_t;
+sui_segmented_t *sui_segmented_create(sui_widget_t *parent, const char **items, int count);
+void sui_segmented_set_selected(sui_segmented_t *s, int idx);
+void sui_segmented_on_change(sui_segmented_t *s, void (*fn)(sui_widget_t *, int, void *), void *user);
+
+/* 标签页 */
+typedef struct sui_tabs {
+    sui_widget_t base;
+    char tabs[8][24];
+    int  count;
+    int  selected;
+    void (*on_change)(sui_widget_t *, int, void *);
+    void *user;
+} sui_tabs_t;
+sui_tabs_t *sui_tabs_create(sui_widget_t *parent, const char **items, int count);
+void sui_tabs_set_selected(sui_tabs_t *t, int idx);
+void sui_tabs_on_change(sui_tabs_t *t, void (*fn)(sui_widget_t *, int, void *), void *user);
+
+/* 列表项 / 列表 */
+typedef struct sui_list_item {
+    char avatar_text[4];
+    uint32_t avatar_a, avatar_b;   /* 头像渐变两端色 */
+    char title[64];
+    char subtitle[64];
+    char badge[16];
+    int  badge_kind;              /* 0 accent / 1 gray / 2 green */
+} sui_list_item_t;
+typedef struct sui_list {
+    sui_widget_t base;
+    sui_list_item_t items[32];
+    int count;
+    int selected;
+    char filter[64];
+    void (*on_select)(sui_widget_t *, int, void *);
+    void *user;
+} sui_list_t;
+sui_list_t *sui_list_create(sui_widget_t *parent);
+int  sui_list_add(sui_list_t *l, const sui_list_item_t *item);
+void sui_list_set_filter(sui_list_t *l, const char *q);
+void sui_list_on_select(sui_list_t *l, void (*fn)(sui_widget_t *, int, void *), void *user);
+
+/* 提示条 */
+typedef enum { SUI_ALERT_INFO = 0, SUI_ALERT_WARN, SUI_ALERT_OK } sui_alert_kind_t;
+typedef struct sui_alert {
+    sui_widget_t base;
+    sui_alert_kind_t kind;
+    char title[64];
+    char body[192];
+} sui_alert_t;
+sui_alert_t *sui_alert_create(sui_widget_t *parent, sui_alert_kind_t kind, const char *title, const char *body);
+
+/* 头像 */
+typedef struct sui_avatar {
+    sui_widget_t base;
+    char text[4];
+    int  size;
+    uint32_t grad_a, grad_b;
+} sui_avatar_t;
+sui_avatar_t *sui_avatar_create(sui_widget_t *parent, const char *text, int size);
+void sui_avatar_set_gradient(sui_avatar_t *a, uint32_t ga, uint32_t gb);
+
+/* 徽标 */
+typedef enum { SUI_BADGE_ACCENT = 0, SUI_BADGE_GRAY, SUI_BADGE_GREEN } sui_badge_kind_t;
+typedef struct sui_badge {
+    sui_widget_t base;
+    sui_badge_kind_t kind;
+    char text[16];
+} sui_badge_t;
+sui_badge_t *sui_badge_create(sui_widget_t *parent, const char *text, sui_badge_kind_t kind);
+
+/* 多行输入 */
+typedef struct sui_textarea {
+    sui_widget_t base;
+    char text[512];
+    int  cursor;
+    char placeholder[64];
+    void (*on_change)(sui_widget_t *, const char *, void *);
+    void *user;
+} sui_textarea_t;
+sui_textarea_t *sui_textarea_create(sui_widget_t *parent, const char *placeholder);
+void sui_textarea_set_text(sui_textarea_t *t, const char *text);
+const char *sui_textarea_text(const sui_textarea_t *t);
+
+/* 下拉选择 */
+typedef struct sui_select {
+    sui_widget_t base;
+    char options[12][32];
+    int  count;
+    int  selected;
+    bool open;
+    void (*on_change)(sui_widget_t *, int, void *);
+    void *user;
+} sui_select_t;
+sui_select_t *sui_select_create(sui_widget_t *parent, const char **opts, int count);
+void sui_select_set_selected(sui_select_t *s, int idx);
+void sui_select_on_change(sui_select_t *s, void (*fn)(sui_widget_t *, int, void *), void *user);
+
+/* 浮层（overlay）与对话框 / 通知 */
+sui_widget_t *sui_window_overlay(sui_window_t *win);
+void sui_overlay_clear(sui_widget_t *overlay);
+typedef enum { SUI_TOAST_INFO = 0, SUI_TOAST_SUCCESS, SUI_TOAST_WARN } sui_toast_kind_t;
+void sui_toast_show(sui_window_t *win, sui_toast_kind_t kind, const char *title, const char *body);
+void sui_dialog_show(sui_window_t *win, const char *title, const char *body,
+                     const char *ok_label, const char *cancel_label,
+                     void (*on_ok)(void *), void *user);
+void sui_dialog_close(sui_window_t *win);
 
 #ifdef __cplusplus
 }

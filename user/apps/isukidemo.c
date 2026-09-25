@@ -509,15 +509,19 @@ int main(int argc, char **argv)
     u_print("[isukidemo] controls: button/input/textarea/checkbox/radio/switch/slider/");
     u_print("segmented/tabs/list/card/progress/alert/avatar/badge/select/dialog/toast OK\n");
 
-    /* 事件循环（有界，headless 下自然退出；图形环境持续交互） */
+    /* 事件循环：常驻运行，直至用户关闭窗口。
+     * libsui 在收到 SUI_EVENT_WINDOW_CLOSE 时会把 w->running 置 false
+     * （见 sui_core.c:771），故此处不再设 limit——此前 6000 步即自动退出，
+     * 现改为真正交互式常驻：图形环境持续运行，关闭窗口（标题栏 × / ESC）才退出。
+     * headless（无输入）下本循环持续 yield 不退出；自检信号已于上方 PASS 行输出，
+     * 回归仅据此判断，无需本程序主动 exit。 */
     sui_event_t ev;
-    int limit = 6000;
-    while (w->running && limit-- > 0) {
+    while (w->running) {
         if (!sui_window_step(w, &ev))
             sys_yield();
     }
 
-    u_print("[isukidemo] lifecycle complete, exiting\n");
+    u_print("[isukidemo] window closed, exiting\n");
     SukiDestroyWindow(w->wk);
     sys_exit(0);
     return 0;
